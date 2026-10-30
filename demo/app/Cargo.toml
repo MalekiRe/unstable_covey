@@ -1,0 +1,11 @@
+[package]
+name = "dispatch-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+static-ecs = { path = "../.." }
+demo-input = { path = "../input" }
+demo-analytics = { path = "../analytics" }
+demo-networking = { path = "../networking" }
