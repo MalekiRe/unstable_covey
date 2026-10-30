@@ -203,3 +203,54 @@ fn read_only_cursors_do_not_consume_subsequent_system_writes() {
         vec![vec![1], vec![], vec![2], vec![3], vec![]]
     );
 }
+
+#[test]
+fn parallel_writers_are_seen_exactly_once_by_readers_before_and_after_the_join() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Update;
+    let frames = 50;
+    let (before, after) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (seen_before, seen_after) = (before.clone(), after.clone());
+    WorkerPool::new(3).install(|| {
+        let mut world = World::<(Components<u32>, Components<u64>)>::default();
+        let entity = world.spawn();
+        world.insert(entity, 0_u32);
+        world.insert(entity, 0_u64);
+        let mut app = App::new(world)
+            .add_systems(Update, move |mut q: Query<&u32, Changed<u32>>| {
+                seen_before.fetch_add(q.iter_mut().count(), Ordering::SeqCst);
+            })
+            .add_systems(
+                Update,
+                (
+                    // The longer branch issues more ticks; the join must keep its clock.
+                    (
+                        |mut a: Single<&mut u32>| **a += 1,
+                        |mut a: Single<&mut u32>| **a += 1,
+                        |mut a: Single<&mut u32>| **a += 1,
+                    ),
+                    |mut b: Single<&mut u64>| **b += 1,
+                )
+                    .parallel(),
+            )
+            .add_systems(
+                Update,
+                move |mut a: Query<&u32, Changed<u32>>, mut b: Query<&u64, Changed<u64>>| {
+                    seen_after.fetch_add(
+                        a.iter_mut().count() + b.iter_mut().count(),
+                        Ordering::SeqCst,
+                    );
+                },
+            );
+        for _ in 0..frames {
+            app.emit(&Update);
+        }
+        assert_eq!(app.world.get::<u32>(entity), Some(&(3 * frames as u32)));
+    });
+    // The earlier reader sees the insertion, then each previous frame's write.
+    assert_eq!(before.load(Ordering::SeqCst), frames);
+    assert_eq!(after.load(Ordering::SeqCst), 2 * frames);
+}

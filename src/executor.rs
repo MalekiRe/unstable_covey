@@ -1,97 +1,130 @@
-//! Typed continuations run directly. Only a published branch crosses an erased
-//! thread boundary; there are no task IDs, ready queues, or dependency scans.
-use crate::plan::System;
+//! Persistent workers for typed continuations. Straight-line work is ordinary
+//! inlined code; only a published branch crosses threads through an erased entry.
 use std::{
     any::Any,
     cell::{Cell, UnsafeCell},
+    hint,
     marker::PhantomData,
     mem::MaybeUninit,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Condvar, LazyLock, Mutex, PoisonError,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
     },
-    thread::{self, JoinHandle, Thread},
+    thread::{self, JoinHandle},
 };
 
 type Panic = Box<dyn Any + Send>;
 thread_local! {
     static CURRENT: Cell<*const WorkerPool> = const { Cell::new(std::ptr::null()) };
-    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static SERIAL: Cell<bool> = const { Cell::new(false) };
 }
 static DEFAULT: LazyLock<WorkerPool> =
     LazyLock::new(|| WorkerPool::new(thread::available_parallelism().map_or(1, usize::from)));
 fn pool() -> &'static WorkerPool {
-    // Used only inside the install scope; never retained by an invocation.
+    // The installed pool outlives its install scope; invocations never escape it.
     CURRENT
         .with(|current| unsafe { current.get().as_ref() })
         .unwrap_or_else(|| &DEFAULT)
 }
-pub(crate) fn serial() -> bool {
-    ACTIVE.with(Cell::get) || pool().workers() == 1
+/// Whether a group with this static weight should use workers on this thread.
+/// Serial scopes are checked first, so serial execution never creates the pool.
+#[inline]
+pub(crate) fn parallel(weight: usize) -> bool {
+    !SERIAL.with(Cell::get) && {
+        let pool = pool();
+        pool.workers() > 1 && weight >= pool.min_parallel_work
+    }
+}
+/// Run with every nested group executing directly on this thread.
+pub(crate) fn serially<T>(body: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SERIAL.with(|serial| serial.set(self.0));
+        }
+    }
+    let _restore = Restore(SERIAL.with(|serial| serial.replace(true)));
+    body()
 }
 
+/// Idle iterations before a worker or waiting caller blocks.
+const SPIN: u32 = 1 << 12;
 const IDLE: usize = 0;
-const RESERVED: usize = 1;
-const READY: usize = 2;
-const RUNNING: usize = 3;
+const READY: usize = 1;
+const RUNNING: usize = 2;
 struct Branch {
     context: *const (),
-    call: unsafe fn(*const (), bool),
-    executed: bool,
+    call: unsafe fn(*const (), Flow, &AtomicUsize),
+    flow: Flow,
 }
 #[repr(align(64))]
 struct Slot {
     state: AtomicUsize,
     branch: UnsafeCell<MaybeUninit<Branch>>,
 }
-// RESERVED has one writer; READY -> RUNNING transfers the initialized branch
-// to exactly one reader. IDLE is published only after that reader returns.
+// IDLE -> RUNNING gives the owner or a publisher exclusive write access;
+// READY -> RUNNING transfers the initialized branch to exactly one reader.
 unsafe impl Sync for Slot {}
 unsafe impl Send for Slot {}
 impl Slot {
-    fn new() -> Self {
-        Self {
-            state: AtomicUsize::new(IDLE),
-            branch: UnsafeCell::new(MaybeUninit::uninit()),
-        }
-    }
     fn take(&self) -> Option<Branch> {
         self.state
             .compare_exchange(READY, RUNNING, Ordering::Acquire, Ordering::Relaxed)
             .ok()?;
         Some(unsafe { (*self.branch.get()).assume_init_read() })
     }
-    fn claim(&self) -> bool {
-        let Some(branch) = self.take() else {
-            return false;
-        };
-        unsafe {
-            (branch.call)(branch.context, branch.executed);
-        }
-        self.state.store(IDLE, Ordering::Release);
-        true
-    }
-    // The stealer holds its own slot RUNNING until this call returns. Transfer
-    // the invocation lease there, freeing the original worker immediately.
-    unsafe fn steal(&self) -> bool {
-        let Some(branch) = self.take() else {
-            return false;
-        };
-        self.state.store(IDLE, Ordering::Release);
-        unsafe {
-            (branch.call)(branch.context, branch.executed);
-        }
-        true
-    }
 }
 struct Shared {
     slots: Box<[Slot]>,
     closing: AtomicBool,
     started: AtomicUsize,
+    sleeping: AtomicBool,
+    lock: Mutex<()>,
+    wake: Condvar,
+}
+impl Shared {
+    /// Run one published branch as worker `me`: its own slot first, then steal.
+    fn help(&self, me: usize) -> bool {
+        let own = &self.slots[me];
+        // Branch entries release our slot themselves, before their lease.
+        if let Some(branch) = own.take() {
+            unsafe { (branch.call)(branch.context, branch.flow, &own.state) };
+            return true;
+        }
+        for offset in 1..self.slots.len() {
+            let other = &self.slots[(me + offset) % self.slots.len()];
+            if other.state.load(Ordering::Relaxed) != READY {
+                continue;
+            }
+            // Hold our own slot so nothing is published to us while busy.
+            if own
+                .state
+                .compare_exchange(IDLE, RUNNING, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                return true; // Work was just published to us.
+            }
+            let Some(branch) = other.take() else {
+                own.state.store(IDLE, Ordering::Release);
+                continue;
+            };
+            other.state.store(IDLE, Ordering::Release);
+            unsafe { (branch.call)(branch.context, branch.flow, &own.state) };
+            return true;
+        }
+        false
+    }
+    fn wake_caller(&self) {
+        fence(Ordering::SeqCst);
+        if self.sleeping.load(Ordering::Relaxed) {
+            drop(self.lock.lock().unwrap_or_else(PoisonError::into_inner));
+            self.wake.notify_one();
+        }
+    }
 }
 
-/// Persistent workers including the calling thread. No per-system jobs or queues.
+/// Persistent workers; the calling thread is worker 0.
 pub struct WorkerPool {
     shared: Arc<Shared>,
     threads: Vec<JoinHandle<()>>,
@@ -101,68 +134,48 @@ pub struct WorkerPool {
 impl WorkerPool {
     pub fn new(workers: usize) -> Self {
         assert!(workers > 0, "worker count must be positive");
-        let shared = Arc::new(Shared {
-            slots: (0..workers).map(|_| Slot::new()).collect(),
-            closing: AtomicBool::new(false),
-            started: AtomicUsize::new(0),
-        });
         let mut pool = Self {
-            shared,
+            shared: Arc::new(Shared {
+                slots: (0..workers)
+                    .map(|_| Slot {
+                        state: AtomicUsize::new(IDLE),
+                        branch: UnsafeCell::new(MaybeUninit::uninit()),
+                    })
+                    .collect(),
+                closing: AtomicBool::new(false),
+                started: AtomicUsize::new(0),
+                sleeping: AtomicBool::new(false),
+                lock: Mutex::new(()),
+                wake: Condvar::new(),
+            }),
             threads: Vec::with_capacity(workers - 1),
             submission: Mutex::new(()),
             min_parallel_work: 1,
         };
         for worker in 1..workers {
             let shared = pool.shared.clone();
-            pool.threads.push(
-                thread::Builder::new()
-                    .name(format!("ecs-{worker}"))
-                    .spawn(move || {
-                        let _ = thread::current();
-                        shared.started.fetch_add(1, Ordering::Release);
-                        loop {
-                            if shared.closing.load(Ordering::Acquire) {
-                                return;
-                            }
-                            if shared.slots[worker].claim() {
-                                continue;
-                            }
-                            // Only reserve capacity when a real branch can be stolen.
-                            // Idle scanners must not make an otherwise free worker
-                            // unavailable to a narrow prefix that is about to fork.
-                            let mut helped = false;
-                            for offset in 1..shared.slots.len() {
-                                let other = (worker + offset) % shared.slots.len();
-                                if shared.slots[other].state.load(Ordering::Relaxed) != READY {
-                                    continue;
-                                }
-                                if shared.slots[worker]
-                                    .state
-                                    .compare_exchange(
-                                        IDLE,
-                                        RUNNING,
-                                        Ordering::Acquire,
-                                        Ordering::Relaxed,
-                                    )
-                                    .is_ok()
-                                {
-                                    helped = unsafe { shared.slots[other].steal() };
-                                    shared.slots[worker].state.store(IDLE, Ordering::Release);
-                                }
-                                if helped {
-                                    break;
-                                }
-                            }
-                            if helped {
-                                continue;
-                            }
-                            // Publication precedes unpark; a token survives this window.
+            let thread = thread::Builder::new()
+                .name(format!("ecs-{worker}"))
+                .spawn(move || {
+                    shared.started.fetch_add(1, Ordering::Release);
+                    let mut idle = 0;
+                    while !shared.closing.load(Ordering::Acquire) {
+                        if shared.help(worker) {
+                            idle = 0;
+                        } else if idle < SPIN {
+                            idle += 1;
+                            hint::spin_loop();
+                        } else {
+                            idle = 0;
+                            // Publication precedes unpark; the token survives this window.
                             thread::park();
                         }
-                    })
-                    .expect("cannot start ECS worker"),
-            );
+                    }
+                })
+                .expect("cannot start ECS worker");
+            pool.threads.push(thread);
         }
+        // Worker startup allocates; finish it before the first measured frame.
         while pool.shared.started.load(Ordering::Acquire) != workers - 1 {
             thread::yield_now();
         }
@@ -172,7 +185,7 @@ impl WorkerPool {
         self.shared.slots.len()
     }
     /// Minimum static branch weight eligible for publication. Functions weigh
-    /// one; sequential groups sum their weights. This is not a timing estimate.
+    /// one; groups sum their children. This is not a timing estimate.
     pub fn with_min_parallel_work(mut self, minimum: usize) -> Self {
         self.min_parallel_work = minimum;
         self
@@ -200,11 +213,11 @@ impl Drop for WorkerPool {
     }
 }
 
-/// A compile-time projection. It never borrows an ancestor containing another
-/// executing child. Implementations are internal to the sealed system tree.
+/// A compile-time path to one child of the invocation root.
 #[doc(hidden)]
 pub trait Project<R> {
     type Target;
+    /// Preferred worker for branches starting here; stable across frames.
     const KEY: usize = 0;
     /// # Safety
     /// Root is live and the selected child is exclusively owned by this path.
@@ -230,282 +243,320 @@ pub trait Fields {
     unsafe fn right(this: *mut Self) -> *mut Self::Right;
 }
 #[doc(hidden)]
+pub trait Inner {
+    type Inner;
+    /// # Safety
+    /// The wrapper allocation is live; only the wrapped value may be borrowed.
+    unsafe fn inner(this: *mut Self) -> *mut Self::Inner;
+}
+#[doc(hidden)]
 pub struct First<P>(PhantomData<P>);
 #[doc(hidden)]
 pub struct Second<P>(PhantomData<P>);
-impl<R, P: Project<R>> Project<R> for First<P>
-where
-    P::Target: Fields,
-{
+#[doc(hidden)]
+pub struct Within<P>(PhantomData<P>);
+impl<R, P: Project<R, Target: Fields>> Project<R> for First<P> {
     type Target = <P::Target as Fields>::Left;
     const KEY: usize = P::KEY.wrapping_mul(2).wrapping_add(1);
     unsafe fn get(root: *mut R) -> *mut Self::Target {
         unsafe { P::Target::left(P::get(root)) }
     }
 }
-impl<R, P: Project<R>> Project<R> for Second<P>
-where
-    P::Target: Fields,
-{
+impl<R, P: Project<R, Target: Fields>> Project<R> for Second<P> {
     type Target = <P::Target as Fields>::Right;
     const KEY: usize = P::KEY.wrapping_mul(2).wrapping_add(2);
     unsafe fn get(root: *mut R) -> *mut Self::Target {
         unsafe { P::Target::right(P::get(root)) }
     }
 }
+impl<R, P: Project<R, Target: Inner>> Project<R> for Within<P> {
+    type Target = <P::Target as Inner>::Inner;
+    const KEY: usize = P::KEY;
+    unsafe fn get(root: *mut R) -> *mut Self::Target {
+        unsafe { P::Target::inner(P::get(root)) }
+    }
+}
 
+/// A path's Lamport change clock (latest tick it has observed or issued) and
+/// whether any system on it ran, packed into one register.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct Flow(u64);
+impl Flow {
+    #[inline(always)]
+    pub(crate) fn new(clock: u64, ran: bool) -> Self {
+        Self(clock << 1 | ran as u64)
+    }
+    #[inline(always)]
+    pub(crate) fn clock(self) -> u64 {
+        self.0 >> 1
+    }
+    #[inline(always)]
+    pub(crate) fn ran(self) -> bool {
+        self.0 & 1 != 0
+    }
+}
+
+/// The next outlined continuation, returned instead of called so stack depth
+/// stays constant however many joins a frame passes through.
+#[doc(hidden)]
+pub struct Tail<S, R>(Option<(Entry<S, R>, Flow)>);
+type Entry<S, R> = unsafe fn(&Context<'_, S, R>, Flow) -> Tail<S, R>;
+impl<S, R> Tail<S, R> {
+    pub(crate) const DONE: Self = Self(None);
+    /// Continue with K's single shared out-of-line copy.
+    #[inline(always)]
+    pub(crate) fn to<K: Continue<S, R>>(flow: Flow) -> Self {
+        Self(Some((outlined::<S, R, K>, flow)))
+    }
+    #[inline(always)]
+    pub(crate) fn or(self, other: Self) -> Self {
+        Self(self.0.or(other.0))
+    }
+}
+#[inline(never)]
+unsafe fn outlined<S, R, K: Continue<S, R>>(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+    unsafe { K::resume(context, flow) }
+}
+/// Run K's shared outlined copy and every continuation it hands back.
+#[inline]
+pub(crate) unsafe fn run<S, R, K: Continue<S, R>>(context: &Context<'_, S, R>, flow: Flow) {
+    let mut tail = Tail::to::<K>(flow);
+    while let Some((entry, flow)) = tail.0 {
+        tail = unsafe { entry(context, flow) };
+    }
+}
+
+/// What runs after a region finishes.
 #[doc(hidden)]
 pub trait Continue<S, R> {
     /// # Safety
     /// Every predecessor of this continuation has relinquished its accesses.
-    unsafe fn resume(context: &Context<'_, S, R>, executed: bool);
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R>;
 }
+/// Enter the system at P, then K.
 #[doc(hidden)]
 pub struct Then<P, K>(PhantomData<(P, K)>);
-impl<S: Send + Sync, R: Send, P: Project<R>, K: Continue<S, R>> Continue<S, R> for Then<P, K>
-where
-    P::Target: System<S>,
+impl<S: Send + Sync, R: Send, P: Project<R, Target: crate::System<S>>, K: Continue<S, R>>
+    Continue<S, R> for Then<P, K>
 {
     #[inline(always)]
-    unsafe fn resume(context: &Context<'_, S, R>, executed: bool) {
-        if context.cancelled() {
-            return;
-        }
-        unsafe {
-            P::Target::enter::<R, P, K>(context, executed);
-        }
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        unsafe { <P::Target as crate::System<S>>::enter::<R, P, K>(context, flow) }
     }
 }
-struct Done;
+/// K reachable from several sites, emitted once out of line.
+#[doc(hidden)]
+pub struct Outlined<K>(PhantomData<K>);
+impl<S, R, K: Continue<S, R>> Continue<S, R> for Outlined<K> {
+    #[inline(always)]
+    unsafe fn resume(_: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        Tail::to::<K>(flow)
+    }
+}
+#[doc(hidden)]
+pub struct Done;
 impl<S, R> Continue<S, R> for Done {
-    unsafe fn resume(context: &Context<'_, S, R>, executed: bool) {
-        context.executed.store(executed, Ordering::Relaxed);
-        context.done.store(true, Ordering::Release);
-        context.caller.unpark();
+    #[inline(always)]
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        context.result.store(flow.0, Ordering::Relaxed);
+        Tail::DONE
     }
 }
 
-/// Storage exists only at a potential cross-worker join. Local fork fallbacks
-/// bypass it entirely. The high bit carries the OR of executed predecessors.
+/// A join whose predecessors may finish on different workers: remaining
+/// arrivals in the low half of `count`, executed arrivals above, and the
+/// latest clock among arrivals.
 #[doc(hidden)]
 #[derive(Default)]
-pub struct Join(AtomicUsize);
+pub struct Join {
+    count: AtomicU64,
+    clock: AtomicU64,
+}
 impl Join {
+    #[inline]
     pub(crate) fn reset(&self, arrivals: usize) {
-        self.0.store(arrivals, Ordering::Relaxed);
+        self.count.store(arrivals as u64, Ordering::Relaxed);
+        self.clock.store(0, Ordering::Relaxed);
     }
-    pub(crate) fn arrive(&self, executed: bool) -> Option<bool> {
-        const FLAG: usize = 1 << (usize::BITS - 1);
-        // Each arrival decrements the count. Setting the result bit and consuming
-        // the count are one operation; no per-system completion flag is needed.
-        let old = self
-            .0
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                Some((old - 1) | if executed { FLAG } else { 0 })
-            })
-            .unwrap();
-        ((old & !FLAG) == 1).then_some(executed || old & FLAG != 0)
+    /// The merged flow, for the last arrival only.
+    #[inline]
+    pub(crate) fn arrive(&self, flow: Flow) -> Option<Flow> {
+        self.clock.fetch_max(flow.clock(), Ordering::Relaxed);
+        // Remaining is at least one, so the low half never borrows.
+        let delta = if flow.ran() { (1 << 32) - 1 } else { u64::MAX };
+        // AcqRel orders every arrival's clock before the last arrival's load.
+        let old = self.count.fetch_add(delta, Ordering::AcqRel);
+        (old as u32 == 1).then(|| {
+            Flow::new(
+                self.clock.load(Ordering::Relaxed),
+                flow.ran() || old >> 32 != 0,
+            )
+        })
     }
 }
 
+/// One invocation: the root, its world, and branch leases.
 #[doc(hidden)]
 pub struct Context<'a, S, R> {
     pub(crate) nodes: *mut R,
     pub(crate) world: *mut S,
+    pub(crate) event: *const (),
     pool: &'a WorkerPool,
-    caller: Thread,
-    done: AtomicBool,
-    executed: AtomicBool,
+    /// Live leases: the root path plus every published, unfinished branch.
+    pending: AtomicUsize,
+    result: AtomicU64,
     cancelled: AtomicBool,
     panic: Mutex<Vec<Panic>>,
 }
-// The typed paths transfer ownership of disjoint children. Static access proofs
-// and generated joins order world accesses. Invocation storage outlives all slots.
+// Typed paths hand disjoint children to branches; static access checks and
+// joins order world accesses. The context outlives every lease.
 unsafe impl<S: Send + Sync, R: Send> Sync for Context<'_, S, R> {}
-impl<S, R> Context<'_, S, R> {
-    #[inline]
-    pub(crate) fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
-    }
-    fn fail(&self, payload: Panic) {
-        self.panic.lock().unwrap().push(payload);
-        self.cancelled.store(true, Ordering::Release);
-        self.caller.unpark();
+impl<S: Send + Sync, R: Send> Context<'_, S, R> {
+    /// Publish C to an idle worker. False means run it here instead.
+    #[inline(always)]
+    pub(crate) fn offer<C: Continue<S, R>>(&self, flow: Flow, weight: usize, key: usize) -> bool {
+        let branch = Branch {
+            context: std::ptr::from_ref(self).cast(),
+            call: invoke::<S, R, C>,
+            flow,
+        };
+        weight >= self.pool.min_parallel_work
+            && self
+                .pool
+                .publish(branch, key, &self.cancelled, &self.pending)
     }
 }
-impl<'a, S: Send + Sync, R: Send> Context<'a, S, R> {
-    #[inline]
-    pub(crate) fn reserve<P: Project<R>>(
+impl WorkerPool {
+    // Shared by every fork site; only the branch entry is monomorphized.
+    fn publish(
         &self,
-        weight: usize,
-    ) -> Option<Reservation<'_, 'a, S, R>> {
-        if weight < self.pool.min_parallel_work || self.cancelled() {
-            return None;
+        branch: Branch,
+        key: usize,
+        cancelled: &AtomicBool,
+        pending: &AtomicUsize,
+    ) -> bool {
+        if cancelled.load(Ordering::Relaxed) {
+            return false;
         }
-        let slots = &self.pool.shared.slots;
+        let slots = &self.shared.slots;
         for offset in 0..slots.len() {
-            let worker = P::KEY.wrapping_add(offset) % slots.len();
-            if slots[worker]
-                .state
-                .compare_exchange(IDLE, RESERVED, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
+            let worker = key.wrapping_add(offset) % slots.len();
+            let slot = &slots[worker];
+            // Load first: when every worker is busy, a fork costs no atomic writes.
+            if slot.state.load(Ordering::Relaxed) != IDLE
+                || slot
+                    .state
+                    .compare_exchange(IDLE, RUNNING, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
             {
-                return Some(Reservation {
-                    context: self,
-                    worker,
-                    published: false,
-                });
+                continue;
             }
+            unsafe { (*slot.branch.get()).write(branch) };
+            // The publisher holds a lease, so pending cannot reach zero first.
+            pending.fetch_add(1, Ordering::Relaxed);
+            slot.state.store(READY, Ordering::Release);
+            if worker == 0 {
+                self.shared.wake_caller();
+            } else {
+                self.threads[worker - 1].thread().unpark();
+            }
+            return true;
         }
-        None
-    }
-    #[inline]
-    pub(crate) fn offer<P, K>(&self, executed: bool, weight: usize) -> bool
-    where
-        P: Project<R>,
-        P::Target: System<S>,
-        K: Continue<S, R>,
-    {
-        if let Some(reservation) = self.reserve::<P>(weight) {
-            reservation.publish::<P, K>(executed);
-            true
-        } else {
-            false
-        }
+        false
     }
 }
-pub(crate) struct Reservation<'c, 'p, S, R> {
-    context: &'c Context<'p, S, R>,
-    worker: usize,
-    published: bool,
-}
-impl<S: Send + Sync, R: Send> Reservation<'_, '_, S, R> {
-    pub(crate) fn publish<P, K>(mut self, executed: bool)
-    where
-        P: Project<R>,
-        P::Target: System<S>,
-        K: Continue<S, R>,
-    {
-        let slot = &self.context.pool.shared.slots[self.worker];
-        unsafe {
-            (*slot.branch.get()).write(Branch {
-                context: std::ptr::from_ref(self.context).cast(),
-                call: invoke::<S, R, P, K>,
-                executed,
-            });
-        }
-        self.published = true;
-        slot.state.store(READY, Ordering::Release);
-        if self.worker == 0 {
-            self.context.caller.unpark();
-        } else {
-            self.context.pool.threads[self.worker - 1].thread().unpark();
-        }
-    }
-}
-impl<S, R> Drop for Reservation<'_, '_, S, R> {
-    fn drop(&mut self) {
-        if !self.published {
-            self.context.pool.shared.slots[self.worker]
-                .state
-                .store(IDLE, Ordering::Release);
-        }
-    }
-}
-unsafe fn invoke<S: Send + Sync, R: Send, P: Project<R>, K: Continue<S, R>>(
+/// Run a branch while holding `slot`. The slot is released before the lease,
+/// so a finished invocation leaves every worker it used available again.
+unsafe fn invoke<S: Send + Sync, R: Send, C: Continue<S, R>>(
     pointer: *const (),
-    executed: bool,
-) where
-    P::Target: System<S>,
-{
+    flow: Flow,
+    slot: &AtomicUsize,
+) {
     let context = unsafe { &*pointer.cast::<Context<'_, S, R>>() };
-    struct Restore(bool);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            ACTIVE.with(|active| active.set(self.0));
+    // Shared outlives this call: every worker thread owns an Arc to it.
+    let shared: &Shared = &context.pool.shared;
+    if !context.cancelled.load(Ordering::Relaxed) {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            serially(|| unsafe { run::<S, R, C>(context, flow) })
+        }));
+        if let Err(payload) = result {
+            context
+                .panic
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(payload);
+            context.cancelled.store(true, Ordering::Relaxed);
         }
     }
-    let _restore = Restore(ACTIVE.with(|active| active.replace(true)));
-    if context.cancelled() {
-        return;
-    }
-    let result = catch_unwind(AssertUnwindSafe(|| unsafe {
-        P::Target::enter::<R, P, K>(context, executed)
-    }));
-    if let Err(payload) = result {
-        context.fail(payload);
+    slot.store(IDLE, Ordering::Release);
+    // The context may be freed once the last lease is released.
+    if context.pending.fetch_sub(1, Ordering::AcqRel) == 1 {
+        shared.wake_caller();
     }
 }
 
-pub(crate) unsafe fn execute<S: Send + Sync, R: System<S> + Send>(
+/// Run continuation C from the root as one invocation, starting from `flow`.
+/// Resumes the first panic after every lease is released.
+pub(crate) unsafe fn execute<S: Send + Sync, R: Send, C: Continue<S, R>>(
     nodes: *mut R,
     world: *mut S,
-) -> Option<()> {
-    if !R::HAS_PARALLEL || serial() || R::WEIGHT < pool().min_parallel_work {
-        return unsafe { (&mut *nodes).run_serial_unchecked(world) }.map(|_| ());
-    }
+    event: *const (),
+    flow: Flow,
+) -> Flow {
     let pool = pool();
-    let submission = pool.submission.lock().unwrap();
+    let submission = pool
+        .submission
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     let context = Context {
         nodes,
         world,
+        event,
         pool,
-        caller: thread::current(),
-        done: AtomicBool::new(false),
-        executed: AtomicBool::new(false),
+        pending: AtomicUsize::new(1),
+        result: AtomicU64::new(flow.0),
         cancelled: AtomicBool::new(false),
         panic: Mutex::new(Vec::new()),
     };
-    pool.shared.slots[0].state.store(RUNNING, Ordering::Relaxed);
-    unsafe {
-        invoke::<S, R, Root, Done>(std::ptr::from_ref(&context).cast(), false);
-    }
-    pool.shared.slots[0].state.store(IDLE, Ordering::Release);
-    loop {
-        // Caller participation also steals an assigned but unstarted branch.
-        if pool.shared.slots[0].claim() {
-            continue;
-        }
-        let mut helped = false;
-        if pool.shared.slots[0]
-            .state
-            .compare_exchange(IDLE, RUNNING, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            for slot in &pool.shared.slots[1..] {
-                if unsafe { slot.steal() } {
-                    helped = true;
-                    break;
-                }
-            }
-            pool.shared.slots[0].state.store(IDLE, Ordering::Release);
-        }
-        if helped {
-            continue;
-        }
-        if context.done.load(Ordering::Acquire) || context.cancelled.load(Ordering::Acquire) {
-            if pool
-                .shared
-                .slots
-                .iter()
-                .all(|slot| slot.state.load(Ordering::Acquire) == IDLE)
-            {
-                break;
-            }
-            // Completion precedes callback return. Do not park waiting for an
-            // acknowledgement that has no new work to publish or wake us for.
-            thread::yield_now();
+    let shared = &*pool.shared;
+    shared.slots[0].state.store(RUNNING, Ordering::Relaxed);
+    let root = std::ptr::from_ref(&context).cast();
+    unsafe { invoke::<S, R, C>(root, flow, &shared.slots[0].state) };
+    let mut idle = 0;
+    while context.pending.load(Ordering::Acquire) != 0 {
+        if shared.help(0) {
+            idle = 0;
+        } else if idle < SPIN {
+            idle += 1;
+            hint::spin_loop();
         } else {
-            thread::park();
+            idle = 0;
+            shared.sleeping.store(true, Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+            let mut guard = shared.lock.lock().unwrap_or_else(PoisonError::into_inner);
+            while context.pending.load(Ordering::Acquire) != 0
+                && shared.slots[0].state.load(Ordering::Acquire) != READY
+            {
+                guard = shared
+                    .wake
+                    .wait(guard)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            drop(guard);
+            shared.sleeping.store(false, Ordering::Relaxed);
         }
     }
-    let executed = context.executed.load(Ordering::Relaxed);
-    let mut payloads = context.panic.into_inner().unwrap();
+    let result = Flow(context.result.load(Ordering::Relaxed));
+    let mut payloads = context
+        .panic
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
     drop(submission);
     if !payloads.is_empty() {
         let first = payloads.swap_remove(0);
         drop(payloads);
         resume_unwind(first);
     }
-    executed.then_some(())
+    result
 }

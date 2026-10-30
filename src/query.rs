@@ -565,7 +565,7 @@ impl<S: Storage> World<S> {
         let now = if D::Access::WRITES {
             self.change_tick()
         } else {
-            unsafe { Self::read_tick(self) }
+            self.latest_tick()
         };
         let mut query = unsafe { Query::from_world(self, ChangeWindow { last: 0, now }) };
         query.matching = candidate::<D, F>(&query.indices, &query.filter, &self.component_tables)

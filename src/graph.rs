@@ -2,7 +2,8 @@
 //! concrete Rust continuations; only potential cross-worker joins have state.
 use crate::{
     access::{Access, Conflict, Same},
-    executor::{Context, Continue, Fields, First, Join, Project, Second},
+    executor::{self, Context, Continue, Fields, First, Flow, Inner, Join, Project, Second},
+    executor::{Tail, Then, Within, run},
     plan::{self, IntoSystems, System},
 };
 use std::marker::PhantomData;
@@ -204,33 +205,47 @@ impl<S, All, A: BuildRows<S, All>, B: BuildRows<S, All>> BuildRows<S, All> for P
     const COUNT: usize = A::COUNT + B::COUNT;
     const ROWS: Rows = Rows::Pair(&A::ROWS, &B::ROWS, A::COUNT);
 }
+/// Nodes per `ready(...)` graph; nest graphs as nodes for larger schedules.
+pub const MAX_NODES: usize = 128;
+const MAX: usize = MAX_NODES;
 
-// All allocations below are compiler constants, not initialization/frame work.
-struct Topology<const N: usize, const M: usize> {
-    edges: [bool; M],
-    rank: [usize; N],
-    incoming: [usize; N],
-    outgoing: [usize; N],
-    join: [usize; N],
-    first: [usize; N],
-    work: [usize; N],
+/// Compiler-evaluated graph structure; nothing here exists at run time.
+#[doc(hidden)]
+pub struct Topology {
+    /// Transitively reduced: `edges[node * MAX + parent]`.
+    edges: [bool; MAX * MAX],
+    rank: [usize; MAX],
+    incoming: [usize; MAX],
+    outgoing: [usize; MAX],
+    /// Join index of nodes with several predecessors.
+    join: [usize; MAX],
+    /// The successor continued inline: the heaviest single-predecessor child.
+    local: [usize; MAX],
+    /// Static weight of a node plus its inline chain.
+    work: [usize; MAX],
+    /// Arrivals per join, including the final join when several nodes end.
+    arrivals: [usize; MAX],
+    joins: usize,
     root: usize,
     tails: usize,
-    joins: usize,
     parallel: bool,
 }
-impl<const N: usize, const M: usize> Topology<N, M> {
-    const fn compile(rows: &Rows) -> Self {
-        let mut edges = [false; M];
-        let mut remaining = [0; N];
-        let mut order = [0; N];
+impl Topology {
+    const fn compile(rows: &Rows, n: usize) -> Self {
+        assert!(
+            n <= MAX,
+            "ready graph exceeds MAX_NODES; nest graphs instead"
+        );
+        let mut edges = [false; MAX * MAX];
+        let mut remaining = [0; MAX];
+        let mut order = [0; MAX];
         let mut used = 0;
         let mut node = 0;
-        while node < N {
+        while node < n {
             let mut parent = 0;
-            while parent < N {
-                edges[node * N + parent] = rows.row(node).0.get(parent).0;
-                remaining[node] += edges[node * N + parent] as usize;
+            while parent < n {
+                edges[node * MAX + parent] = rows.row(node).0.get(parent).0;
+                remaining[node] += edges[node * MAX + parent] as usize;
                 parent += 1;
             }
             if remaining[node] == 0 {
@@ -242,8 +257,8 @@ impl<const N: usize, const M: usize> Topology<N, M> {
         let mut cursor = 0;
         while cursor < used {
             node = 0;
-            while node < N {
-                if edges[node * N + order[cursor]] {
+            while node < n {
+                if edges[node * MAX + order[cursor]] {
                     remaining[node] -= 1;
                     if remaining[node] == 0 {
                         order[used] = node;
@@ -254,33 +269,34 @@ impl<const N: usize, const M: usize> Topology<N, M> {
             }
             cursor += 1;
         }
-        assert!(used == N, "dependency graph contains a cycle");
-        let mut rank = [0; N];
+        assert!(used == n, "dependency graph contains a cycle");
+        // Unordered conflicting nodes follow topological order.
+        let mut rank = [0; MAX];
         cursor = 0;
-        while cursor < N {
+        while cursor < n {
             node = order[cursor];
             rank[node] = cursor;
             let mut before = 0;
             while before < cursor {
                 let parent = order[before];
                 if rows.row(node).0.get(parent).1 || rows.row(parent).0.get(node).1 {
-                    edges[node * N + parent] = true;
+                    edges[node * MAX + parent] = true;
                 }
                 before += 1;
             }
             cursor += 1;
         }
-        // Transitive reduction happens once in const evaluation, never at run time.
+        // Transitive reduction: keep only edges that are not implied.
         let mut ancestors = edges;
         cursor = 0;
-        while cursor < N {
+        while cursor < n {
             node = order[cursor];
             let mut parent = 0;
-            while parent < N {
-                if edges[node * N + parent] {
+            while parent < n {
+                if edges[node * MAX + parent] {
                     let mut ancestor = 0;
-                    while ancestor < N {
-                        ancestors[node * N + ancestor] |= ancestors[parent * N + ancestor];
+                    while ancestor < n {
+                        ancestors[node * MAX + ancestor] |= ancestors[parent * MAX + ancestor];
                         ancestor += 1;
                     }
                 }
@@ -290,76 +306,74 @@ impl<const N: usize, const M: usize> Topology<N, M> {
         }
         let original = edges;
         node = 0;
-        while node < N {
+        while node < n {
             let mut parent = 0;
-            while parent < N {
-                if original[node * N + parent] {
-                    let mut via = 0;
-                    while via < N {
-                        if original[node * N + via] && ancestors[via * N + parent] {
-                            edges[node * N + parent] = false;
-                            break;
-                        }
-                        via += 1;
+            while parent < n {
+                let mut via = 0;
+                while original[node * MAX + parent] && via < n {
+                    if original[node * MAX + via] && ancestors[via * MAX + parent] {
+                        edges[node * MAX + parent] = false;
                     }
+                    via += 1;
                 }
                 parent += 1;
             }
             node += 1;
         }
-        let mut incoming = [0; N];
-        let mut outgoing = [0; N];
-        let mut roots = 0;
-        let mut parallel = false;
-        let mut join = [usize::MAX; N];
+        let mut incoming = [0; MAX];
+        let mut outgoing = [0; MAX];
+        let mut join = [usize::MAX; MAX];
+        let mut arrivals = [0; MAX];
         let mut joins = 0;
+        let mut roots = 0;
         node = 0;
-        while node < N {
+        while node < n {
             let mut parent = 0;
-            while parent < N {
-                incoming[node] += edges[node * N + parent] as usize;
-                outgoing[parent] += edges[node * N + parent] as usize;
+            while parent < n {
+                incoming[node] += edges[node * MAX + parent] as usize;
+                outgoing[parent] += edges[node * MAX + parent] as usize;
                 parent += 1;
             }
-            if incoming[node] == 0 {
-                roots += 1;
-            }
+            roots += (incoming[node] == 0) as usize;
             if incoming[node] > 1 {
                 join[node] = joins;
+                arrivals[joins] = incoming[node];
                 joins += 1;
             }
             node += 1;
         }
-        let mut work = [0; N];
-        let mut first = [usize::MAX; N];
+        let mut local = [usize::MAX; MAX];
+        let mut work = [0; MAX];
         let mut tails = 0;
-        cursor = N;
+        let mut parallel = roots > 1;
+        cursor = n;
         while cursor > 0 {
             cursor -= 1;
             node = order[cursor];
             parallel |= outgoing[node] > 1;
+            tails += (outgoing[node] == 0) as usize;
             let mut child = 0;
-            let mut longest = 0;
-            while child < N {
-                if edges[child * N + node] {
-                    if first[node] == usize::MAX || work[child] > work[first[node]] {
-                        first[node] = child;
-                    }
-                    // A published branch owns its chain only until the next join.
-                    if incoming[child] == 1 && work[child] > longest {
-                        longest = work[child];
-                    }
+            while child < n {
+                if edges[child * MAX + node]
+                    && incoming[child] == 1
+                    && (local[node] == usize::MAX || work[child] > work[local[node]])
+                {
+                    local[node] = child;
                 }
                 child += 1;
             }
-            if first[node] == usize::MAX {
-                tails += 1;
+            work[node] = rows.row(node).1;
+            if local[node] != usize::MAX {
+                work[node] = work[node].saturating_add(work[local[node]]);
             }
-            work[node] = rows.row(node).1.saturating_add(longest);
+        }
+        if tails > 1 {
+            arrivals[joins] = tails;
+            joins += 1;
         }
         let mut root = order[0];
         node = 0;
-        while node < N {
+        while node < n {
             if incoming[node] == 0 && work[node] > work[root] {
                 root = node;
             }
@@ -371,46 +385,15 @@ impl<const N: usize, const M: usize> Topology<N, M> {
             incoming,
             outgoing,
             join,
-            first,
+            local,
             work,
+            arrivals,
+            joins,
             root,
             tails,
-            joins,
-            parallel: parallel || roots > 1,
+            parallel,
         }
     }
-}
-#[doc(hidden)]
-pub struct View {
-    edges: &'static [bool],
-    rank: &'static [usize],
-    incoming: &'static [usize],
-    outgoing: &'static [usize],
-    join: &'static [usize],
-    first: &'static [usize],
-    work: &'static [usize],
-    root: usize,
-    tails: usize,
-    joins: usize,
-    parallel: bool,
-}
-struct Compiled<S, N>(PhantomData<fn() -> (S, N)>);
-impl<S, N: Nodes<S> + BuildRows<S, N>> Compiled<S, N> {
-    const TABLE: Topology<{ core::gca!(N::LEN) }, { core::gca!(N::CELLS) }> =
-        Topology::compile(&N::ROWS);
-    const VIEW: View = View {
-        edges: &Self::TABLE.edges,
-        rank: &Self::TABLE.rank,
-        incoming: &Self::TABLE.incoming,
-        outgoing: &Self::TABLE.outgoing,
-        join: &Self::TABLE.join,
-        first: &Self::TABLE.first,
-        work: &Self::TABLE.work,
-        root: Self::TABLE.root,
-        tails: Self::TABLE.tails,
-        joins: Self::TABLE.joins,
-        parallel: Self::TABLE.parallel,
-    };
 }
 
 #[doc(hidden)]
@@ -428,33 +411,17 @@ impl<I: Index, A: Nodes<S>, S> Index for Offset<I, A, S> {
 }
 
 #[doc(hidden)]
-pub trait Spec<S>: Sized {
+pub trait Spec<S>: Sized + Inner<Inner = Self::Nodes> {
     type Nodes: Nodes<S>;
-    const VIEW: View;
+    const TOPOLOGY: Topology;
     /// # Safety
-    /// The graph allocation is live. Only raw child fields may be projected.
-    unsafe fn nodes(this: *mut Self) -> *mut Self::Nodes;
-    /// # Safety
-    /// Index is a compiled join index in this live graph.
+    /// The graph allocation is live and index is a compiled join index.
     unsafe fn join(this: *mut Self, index: usize) -> *const Join;
 }
-struct Contents<P, S>(PhantomData<fn() -> (P, S)>);
-impl<R, P: Project<R>, S> Project<R> for Contents<P, S>
-where
-    P::Target: Spec<S>,
-{
-    type Target = <P::Target as Spec<S>>::Nodes;
-    const KEY: usize = P::KEY;
-    unsafe fn get(root: *mut R) -> *mut Self::Target {
-        unsafe { P::Target::nodes(P::get(root)) }
-    }
-}
-struct Value<P>(PhantomData<P>);
-impl<R, P: Project<R, Target = Entry<L, F, D>>, L, F, D> Project<R> for Value<P> {
-    type Target = F;
-    const KEY: usize = P::KEY;
-    unsafe fn get(root: *mut R) -> *mut F {
-        unsafe { &raw mut (*P::get(root)).system }
+impl<L, F, D> Inner for Entry<L, F, D> {
+    type Inner = F;
+    unsafe fn inner(this: *mut Self) -> *mut F {
+        unsafe { &raw mut (*this).system }
     }
 }
 impl<A, B> Fields for Pair<A, B> {
@@ -467,46 +434,36 @@ impl<A, B> Fields for Pair<A, B> {
         unsafe { &raw mut (*this).1 }
     }
 }
+/// Node I has finished: release its successors, or arrive at the graph's end.
 struct Finished<G, I, K>(PhantomData<(G, I, K)>);
-impl<S: Send + Sync, R: Send, G: Project<R>, I: Index, K: Continue<S, R>> Continue<S, R>
-    for Finished<G, I, K>
-where
-    G::Target: Spec<S>,
+/// Run node I at path P, then release its successors.
+type Step<P, G, I, K> = Then<Within<P>, Finished<G, I, K>>;
+impl<S: Send + Sync, R: Send, G: Project<R, Target: Spec<S>>, I: Index, K: Continue<S, R>>
+    Continue<S, R> for Finished<G, I, K>
 {
     #[inline(always)]
-    unsafe fn resume(context: &Context<'_, S, R>, executed: bool) {
-        if const {
-            G::Target::VIEW.outgoing[I::VALUE] > 1
-                || (G::Target::VIEW.first[I::VALUE] != usize::MAX
-                    && G::Target::VIEW.incoming[G::Target::VIEW.first[I::VALUE]] > 1)
-        } && context.cancelled()
-        {
-            return;
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        // Early-return constant guards: rustc skips instantiating dead arms.
+        if const { G::Target::TOPOLOGY.outgoing[I::VALUE] > 0 } {
+            // Publish or run side paths before continuing the inline successor.
+            return unsafe {
+                <G::Target as Spec<S>>::Nodes::release::<R, Within<G>, G, Zero, I, K, true>(
+                    context, flow,
+                );
+                <G::Target as Spec<S>>::Nodes::release::<R, Within<G>, G, Zero, I, K, false>(
+                    context, flow,
+                )
+            };
         }
-        if const { <G::Target as Spec<S>>::VIEW.first[I::VALUE] == usize::MAX } {
-            if const { <G::Target as Spec<S>>::VIEW.tails == 1 } {
-                unsafe {
-                    K::resume(context, executed);
-                }
-            } else {
-                let join =
-                    unsafe { &*G::Target::join(G::get(context.nodes), G::Target::VIEW.joins) };
-                if let Some(executed) = join.arrive(executed) {
-                    unsafe {
-                        K::resume(context, executed);
-                    }
-                }
-            }
-        } else {
-            // Publish side paths before entering the retained concrete successor.
-            unsafe {
-                <G::Target as Spec<S>>::Nodes::release::<R, Contents<G, S>, G, Zero, I, K, true>(
-                    context, executed,
-                );
-                <G::Target as Spec<S>>::Nodes::release::<R, Contents<G, S>, G, Zero, I, K, false>(
-                    context, executed,
-                );
-            }
+        if const { G::Target::TOPOLOGY.tails == 1 } {
+            return unsafe { K::resume(context, flow) };
+        }
+        // Inline constants are evaluated even in branches folded away.
+        let last = const { G::Target::TOPOLOGY.joins.wrapping_sub(1) };
+        let join = unsafe { &*G::Target::join(G::get(context.nodes), last) };
+        match join.arrive(flow) {
+            Some(flow) => Tail::to::<K>(flow),
+            None => Tail::DONE,
         }
     }
 }
@@ -515,50 +472,59 @@ mod sealed {
     impl<L, F, D> Sealed for super::Entry<L, F, D> {}
     impl<A, B> Sealed for super::Pair<A, B> {}
 }
+/// Each node's code is emitted once: inline at its unique local site, or in
+/// one out-of-line entry shared by publication, fallback, and join arrival.
 #[doc(hidden)]
 pub trait Nodes<S>: sealed::Sealed + Sized {
     type Access: Access;
     const LEN: usize;
-    const CELLS: usize = Self::LEN * Self::LEN;
     const WEIGHT: usize;
     const HAS_PARALLEL: bool;
     /// # Safety
-    /// Paths select disjoint graph entries and compiled dependencies grant access.
+    /// The graph was just reset; P selects these entries within graph G.
     unsafe fn roots<
         R: Send,
         P: Project<R, Target = Self>,
-        G: Project<R>,
+        G: Project<R, Target: Spec<S>>,
         I: Index,
         K: Continue<S, R>,
         const REMOTE: bool,
     >(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
-        S: Send + Sync,
-        G::Target: Spec<S>;
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync;
     /// # Safety
-    /// The predecessor has finished; each edge releases exactly once.
+    /// Node From has finished; each edge releases exactly once.
     unsafe fn release<
         R: Send,
         P: Project<R, Target = Self>,
-        G: Project<R>,
+        G: Project<R, Target: Spec<S>>,
         I: Index,
         From: Index,
         K: Continue<S, R>,
         const REMOTE: bool,
     >(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
-        S: Send + Sync,
-        G::Target: Spec<S>;
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync;
     /// # Safety
-    /// The graph owns the world exclusively and Stage is a compiled order position.
-    unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(nodes: *mut Self, world: *mut S) -> bool;
+    /// The graph and world are exclusive; Stage is a compiled order position.
+    unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(
+        nodes: *mut Self,
+        world: *mut S,
+        clock: &mut u64,
+    ) -> bool;
     /// # Safety
-    /// The graph and world are exclusive; this tree supplies the finite stage list.
-    unsafe fn ordered<G: Spec<S>, Stage: Index>(nodes: *mut G::Nodes, world: *mut S) -> bool;
+    /// The graph and world are exclusive; this tree supplies the stage list.
+    unsafe fn ordered<G: Spec<S>, Stage: Index>(
+        nodes: *mut G::Nodes,
+        world: *mut S,
+        clock: &mut u64,
+    ) -> bool;
 }
 impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     type Access = F::Access;
@@ -569,85 +535,96 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     unsafe fn roots<
         R: Send,
         P: Project<R, Target = Self>,
-        G: Project<R>,
+        G: Project<R, Target: Spec<S>>,
         I: Index,
         K: Continue<S, R>,
         const REMOTE: bool,
     >(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
         S: Send + Sync,
-        G::Target: Spec<S>,
     {
         if const {
-            G::Target::VIEW.incoming[I::VALUE] == 0 && (G::Target::VIEW.root != I::VALUE) == REMOTE
+            G::Target::TOPOLOGY.incoming[I::VALUE] != 0
+                || (G::Target::TOPOLOGY.root != I::VALUE) != REMOTE
         } {
-            if context.cancelled() {
-                return;
-            }
-            if !REMOTE
-                || !context
-                    .offer::<Value<P>, Finished<G, I, K>>(executed, G::Target::VIEW.work[I::VALUE])
-            {
-                unsafe {
-                    F::enter::<R, Value<P>, Finished<G, I, K>>(context, executed);
-                }
-            }
+            return Tail::DONE;
         }
+        if !REMOTE {
+            return unsafe { F::enter::<R, Within<P>, Finished<G, I, K>>(context, flow) };
+        }
+        let work = const { G::Target::TOPOLOGY.work[I::VALUE] };
+        if !context.offer::<Step<P, G, I, K>>(flow, work, P::KEY) {
+            unsafe { run::<S, R, Step<P, G, I, K>>(context, flow) }
+        }
+        Tail::DONE
     }
     #[inline(always)]
     unsafe fn release<
         R: Send,
         P: Project<R, Target = Self>,
-        G: Project<R>,
+        G: Project<R, Target: Spec<S>>,
         I: Index,
         From: Index,
         K: Continue<S, R>,
         const REMOTE: bool,
     >(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
         S: Send + Sync,
-        G::Target: Spec<S>,
     {
         if const {
-            G::Target::VIEW.edges[I::VALUE * G::Target::VIEW.incoming.len() + From::VALUE]
-                && (G::Target::VIEW.first[From::VALUE] != I::VALUE) == REMOTE
+            !G::Target::TOPOLOGY.edges[I::VALUE * MAX + From::VALUE]
+                || (G::Target::TOPOLOGY.local[From::VALUE] != I::VALUE) != REMOTE
         } {
-            let executed = if const { G::Target::VIEW.incoming[I::VALUE] > 1 } {
-                let join = unsafe {
-                    &*G::Target::join(G::get(context.nodes), G::Target::VIEW.join[I::VALUE])
-                };
-                match join.arrive(executed) {
-                    Some(executed) => executed,
-                    None => return,
-                }
-            } else {
-                executed
-            };
-            if !REMOTE
-                || !context
-                    .offer::<Value<P>, Finished<G, I, K>>(executed, G::Target::VIEW.work[I::VALUE])
-            {
-                unsafe {
-                    F::enter::<R, Value<P>, Finished<G, I, K>>(context, executed);
-                }
+            return Tail::DONE;
+        }
+        let mut flow = flow;
+        if const { G::Target::TOPOLOGY.incoming[I::VALUE] > 1 } {
+            let index = const { G::Target::TOPOLOGY.join[I::VALUE] };
+            let join = unsafe { &*G::Target::join(G::get(context.nodes), index) };
+            match join.arrive(flow) {
+                Some(all) => flow = all,
+                None => return Tail::DONE,
             }
         }
+        if !REMOTE {
+            return unsafe { F::enter::<R, Within<P>, Finished<G, I, K>>(context, flow) };
+        }
+        let work = const { G::Target::TOPOLOGY.work[I::VALUE] };
+        // Without an inline successor this thread continues here; otherwise
+        // side paths run here only when no worker takes them. Graph size
+        // bounds this nesting.
+        if !(const { G::Target::TOPOLOGY.local[From::VALUE] != usize::MAX }
+            && context.offer::<Step<P, G, I, K>>(flow, work, P::KEY))
+        {
+            unsafe { run::<S, R, Step<P, G, I, K>>(context, flow) }
+        }
+        Tail::DONE
     }
     #[inline(always)]
-    unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(nodes: *mut Self, world: *mut S) -> bool {
-        if const { G::VIEW.rank[I::VALUE] == Stage::VALUE } {
-            unsafe { (*nodes).system.run_serial_unchecked(world) }.is_some()
+    unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(
+        nodes: *mut Self,
+        world: *mut S,
+        clock: &mut u64,
+    ) -> bool {
+        if const { G::TOPOLOGY.rank[I::VALUE] == Stage::VALUE } {
+            unsafe { (*nodes).system.run_unchecked(world, clock) }.is_some()
         } else {
             false
         }
     }
     #[inline(always)]
-    unsafe fn ordered<G: Spec<S>, Stage: Index>(nodes: *mut G::Nodes, world: *mut S) -> bool {
-        unsafe { G::Nodes::serial::<G, Zero, Stage>(nodes, world) }
+    unsafe fn ordered<G: Spec<S>, Stage: Index>(
+        nodes: *mut G::Nodes,
+        world: *mut S,
+        clock: &mut u64,
+    ) -> bool {
+        unsafe { G::Nodes::serial::<G, Zero, Stage>(nodes, world, clock) }
     }
 }
 impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
@@ -659,55 +636,78 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
     unsafe fn roots<
         R: Send,
         P: Project<R, Target = Self>,
-        G: Project<R>,
+        G: Project<R, Target: Spec<S>>,
         I: Index,
         K: Continue<S, R>,
         const REMOTE: bool,
     >(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
         S: Send + Sync,
-        G::Target: Spec<S>,
     {
         unsafe {
-            A::roots::<R, First<P>, G, I, K, REMOTE>(context, executed);
-            B::roots::<R, Second<P>, G, Offset<I, A, S>, K, REMOTE>(context, executed);
+            A::roots::<R, First<P>, G, I, K, REMOTE>(context, flow).or(B::roots::<
+                R,
+                Second<P>,
+                G,
+                Offset<I, A, S>,
+                K,
+                REMOTE,
+            >(context, flow))
         }
     }
     #[inline(always)]
     unsafe fn release<
         R: Send,
         P: Project<R, Target = Self>,
-        G: Project<R>,
+        G: Project<R, Target: Spec<S>>,
         I: Index,
         From: Index,
         K: Continue<S, R>,
         const REMOTE: bool,
     >(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
         S: Send + Sync,
-        G::Target: Spec<S>,
     {
         unsafe {
-            A::release::<R, First<P>, G, I, From, K, REMOTE>(context, executed);
-            B::release::<R, Second<P>, G, Offset<I, A, S>, From, K, REMOTE>(context, executed);
+            A::release::<R, First<P>, G, I, From, K, REMOTE>(context, flow).or(B::release::<
+                R,
+                Second<P>,
+                G,
+                Offset<I, A, S>,
+                From,
+                K,
+                REMOTE,
+            >(
+                context, flow
+            ))
         }
     }
     #[inline(always)]
-    unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(nodes: *mut Self, world: *mut S) -> bool {
+    unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(
+        nodes: *mut Self,
+        world: *mut S,
+        clock: &mut u64,
+    ) -> bool {
         unsafe {
-            A::serial::<G, I, Stage>(&raw mut (*nodes).0, world)
-                | B::serial::<G, Offset<I, A, S>, Stage>(&raw mut (*nodes).1, world)
+            A::serial::<G, I, Stage>(&raw mut (*nodes).0, world, clock)
+                | B::serial::<G, Offset<I, A, S>, Stage>(&raw mut (*nodes).1, world, clock)
         }
     }
     #[inline(always)]
-    unsafe fn ordered<G: Spec<S>, Stage: Index>(nodes: *mut G::Nodes, world: *mut S) -> bool {
+    unsafe fn ordered<G: Spec<S>, Stage: Index>(
+        nodes: *mut G::Nodes,
+        world: *mut S,
+        clock: &mut u64,
+    ) -> bool {
         unsafe {
-            A::ordered::<G, Stage>(nodes, world)
-                | B::ordered::<G, Offset<Stage, A, S>>(nodes, world)
+            A::ordered::<G, Stage>(nodes, world, clock)
+                | B::ordered::<G, Offset<Stage, A, S>>(nodes, world, clock)
         }
     }
 }
@@ -718,6 +718,12 @@ pub struct ReadyGraph<N> {
     joins: Box<[(Join, usize)]>,
 }
 impl<N> plan::sealed::Sealed for ReadyGraph<N> {}
+impl<N> Inner for ReadyGraph<N> {
+    type Inner = N;
+    unsafe fn inner(this: *mut Self) -> *mut N {
+        unsafe { &raw mut (*this).nodes }
+    }
+}
 #[doc(hidden)]
 pub struct ReadyMarker<M>(PhantomData<M>);
 impl<S: Send + Sync, T: IntoNodes<S, M>, M> IntoSystems<S, ReadyMarker<M>> for GraphConfig<T>
@@ -732,28 +738,20 @@ where
                 "invalid graph: duplicate/missing labels or invalid system access"
             );
         }
-        let view = &Compiled::<S, T::Nodes>::VIEW;
-        let mut joins = Vec::with_capacity(view.joins + usize::from(view.tails > 1));
-        for &incoming in view.incoming {
-            if incoming > 1 {
-                joins.push((Join::default(), incoming));
-            }
-        }
-        if view.tails > 1 {
-            joins.push((Join::default(), view.tails));
-        }
+        let joins = const { <ReadyGraph<T::Nodes> as Spec<S>>::TOPOLOGY.joins };
+        let arrivals = const { <ReadyGraph<T::Nodes> as Spec<S>>::TOPOLOGY.arrivals };
         ReadyGraph {
             nodes: self.0.into_nodes(),
-            joins: joins.into_boxed_slice(),
+            joins: arrivals[..joins]
+                .iter()
+                .map(|&arrivals| (Join::default(), arrivals))
+                .collect(),
         }
     }
 }
 impl<S, N: Nodes<S> + BuildRows<S, N>> Spec<S> for ReadyGraph<N> {
     type Nodes = N;
-    const VIEW: View = Compiled::<S, N>::VIEW;
-    unsafe fn nodes(this: *mut Self) -> *mut N {
-        unsafe { &raw mut (*this).nodes }
-    }
+    const TOPOLOGY: Topology = Topology::compile(&N::ROWS, N::LEN);
     unsafe fn join(this: *mut Self, index: usize) -> *const Join {
         unsafe { &raw const (*(*this).joins.as_ptr().add(index)).0 }
     }
@@ -762,38 +760,29 @@ impl<S: Send + Sync, N: Nodes<S> + BuildRows<S, N> + Send> System<S> for ReadyGr
     type Access = N::Access;
     type Output = ();
     const VALID: bool = <N as BuildRows<S, N>>::VALID;
-    const HAS_PARALLEL: bool = Compiled::<S, N>::VIEW.parallel || N::HAS_PARALLEL;
+    const HAS_PARALLEL: bool = Self::TOPOLOGY.parallel || N::HAS_PARALLEL;
     const WEIGHT: usize = N::WEIGHT;
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) {
-        if context.cancelled() {
-            return;
-        }
-        if !Self::HAS_PARALLEL {
-            let result =
-                unsafe { (&mut *P::get(context.nodes)).run_serial_unchecked(context.world) }
-                    .is_some();
-            unsafe {
-                K::resume(context, executed | result);
-            }
-            return;
+        flow: Flow,
+    ) -> Tail<S, R> {
+        if const { !Self::HAS_PARALLEL } {
+            return unsafe { plan::direct::<S, R, Self, P, K>(context, flow) };
         }
         for (join, arrivals) in unsafe { &(*P::get(context.nodes)).joins }.iter() {
             join.reset(*arrivals);
         }
         unsafe {
-            N::roots::<R, Contents<P, S>, P, Zero, K, true>(context, executed);
-            N::roots::<R, Contents<P, S>, P, Zero, K, false>(context, executed);
+            N::roots::<R, Within<P>, P, Zero, K, true>(context, flow);
+            N::roots::<R, Within<P>, P, Zero, K, false>(context, flow)
         }
     }
-    unsafe fn run_unchecked(&mut self, world: *mut S) -> Option<()> {
-        unsafe { crate::executor::execute(self, world) }
-    }
-    #[inline]
-    unsafe fn run_serial_unchecked(&mut self, world: *mut S) -> Option<()> {
-        unsafe { N::ordered::<Self, Zero>(&raw mut self.nodes, world) }.then_some(())
+    unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
+        if const { !Self::HAS_PARALLEL } || !executor::parallel(Self::WEIGHT) {
+            let ran = unsafe { N::ordered::<Self, Zero>(&raw mut self.nodes, world, clock) };
+            return ran.then_some(());
+        }
+        unsafe { plan::invocation(self, world, clock) }
     }
 }

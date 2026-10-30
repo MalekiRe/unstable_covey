@@ -259,7 +259,8 @@ pub struct World<S: Storage> {
     dense: Vec<Store>,
     archetypes: Vec<Archetype>,
     bundles: S::BundleCache,
-    clock: AtomicU64,
+    /// The latest issued change tick; systems carry their own copy during a frame.
+    clock: u64,
     schema: PhantomData<S>,
 }
 impl<S: Storage> Default for World<S> {
@@ -286,7 +287,7 @@ impl<S: Storage> World<S> {
             dense: Vec::new(),
             archetypes: Vec::new(),
             bundles: Default::default(),
-            clock: AtomicU64::new(1),
+            clock: 0,
             schema: PhantomData,
         };
         world.add_table(vec![false; S::LEN]);
@@ -826,26 +827,24 @@ impl<S: Storage> World<S> {
         drop(finish);
         true
     }
+    /// Issue the next change tick under exclusive access.
     pub(crate) fn change_tick(&mut self) -> u64 {
-        let clock = self.clock.get_mut();
-        let tick = *clock;
-        *clock = tick.checked_add(1).expect("world change clock exhausted");
-        tick
+        self.clock = crate::change::next(self.clock);
+        self.clock
+    }
+    pub(crate) fn latest_tick(&self) -> u64 {
+        self.clock
     }
 }
 impl<S: Storage> SystemWorld for World<S> {
     unsafe fn world_id(world: *mut Self) -> u64 {
         unsafe { (*world).id }
     }
-    unsafe fn next_tick(world: *mut Self) -> u64 {
-        unsafe { &(*world).clock }
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |tick| {
-                tick.checked_add(1)
-            })
-            .expect("world change clock exhausted")
+    unsafe fn clock(world: *mut Self) -> u64 {
+        unsafe { (*world).clock }
     }
-    unsafe fn read_tick(world: *mut Self) -> u64 {
-        unsafe { &(*world).clock }.load(Ordering::Relaxed) - 1
+    unsafe fn set_clock(world: *mut Self, latest: u64) {
+        unsafe { (*world).clock = latest }
     }
 }
 mod bundle_sealed {

@@ -124,15 +124,36 @@ impl ChangeWindow {
     }
 }
 
+/// Issue the tick after `latest`. Ticks stay below 2^63 so a frame's flow can
+/// pack its executed bit beside the clock.
+#[inline]
+pub(crate) fn next(latest: u64) -> u64 {
+    assert!(latest < u64::MAX >> 1, "world change clock exhausted");
+    latest + 1
+}
+
+/// Change ticks form a Lamport clock: systems receive the clock along their
+/// continuation, writers issue the next tick, and joins take the maximum.
+/// Conflicting systems are always ordered, so no shared counter is needed.
 #[doc(hidden)]
 pub trait SystemWorld {
     /// # Safety
     /// The pointer is live; only immutable world identity is accessed.
     unsafe fn world_id(world: *mut Self) -> u64;
+    /// The latest issued tick.
     /// # Safety
-    /// The pointer is live; only the world's atomic clock is accessed.
-    unsafe fn next_tick(world: *mut Self) -> u64;
+    /// The pointer is live and no system holds the world.
+    unsafe fn clock(world: *mut Self) -> u64;
     /// # Safety
-    /// The pointer is live; only the world's atomic clock is accessed.
-    unsafe fn read_tick(world: *mut Self) -> u64;
+    /// The pointer is live and no system holds the world.
+    unsafe fn set_clock(world: *mut Self, latest: u64);
+}
+impl SystemWorld for () {
+    unsafe fn world_id(_: *mut Self) -> u64 {
+        u64::MAX
+    }
+    unsafe fn clock(_: *mut Self) -> u64 {
+        0
+    }
+    unsafe fn set_clock(_: *mut Self, _: u64) {}
 }

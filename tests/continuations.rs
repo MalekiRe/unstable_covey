@@ -277,3 +277,115 @@ fn simultaneous_callers_keep_worlds_and_invocation_lifetimes_separate() {
         }
     });
 }
+
+#[test]
+fn cancelled_invocations_return_only_after_every_published_branch_finishes() {
+    // One branch panics while its sibling keeps forking. emit must not return
+    // while any published branch can still run (and touch freed invocation state).
+    let iterations = if cfg!(miri) { 3 } else { 300 };
+    WorkerPool::new(4).install(|| {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let count = |ran: &Arc<AtomicUsize>| {
+            let ran = ran.clone();
+            move || {
+                ran.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let mut app = App::new(World::new(())).add_systems(
+            Update,
+            (
+                || panic!("cancel"),
+                (
+                    (count(&ran), count(&ran)).parallel(),
+                    (count(&ran), count(&ran)).parallel(),
+                    (count(&ran), count(&ran)).parallel(),
+                ),
+            )
+                .parallel(),
+        );
+        for _ in 0..iterations {
+            let emitted =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.emit(&Update)));
+            assert!(emitted.is_err());
+            let settled = ran.load(Ordering::SeqCst);
+            for _ in 0..100 {
+                std::thread::yield_now();
+            }
+            assert_eq!(ran.load(Ordering::SeqCst), settled);
+        }
+    });
+}
+
+#[test]
+fn later_registrations_observe_every_branch_of_earlier_parallel_ones() {
+    WorkerPool::new(3).install(|| {
+        let mut world = World::<(Components<u32>, Components<u64>)>::default();
+        let entity = world.spawn();
+        world.insert(entity, 0_u32);
+        world.insert(entity, 0_u64);
+        let mut app = App::new(world)
+            .add_systems(
+                Update,
+                (
+                    |mut a: Single<&mut u32>| {
+                        std::thread::yield_now();
+                        **a += 1;
+                    },
+                    |mut b: Single<&mut u64>| **b += 1,
+                )
+                    .parallel(),
+            )
+            .add_systems(Update, |a: Single<&u32>, b: Single<&u64>| {
+                assert_eq!(u64::from(**a), **b)
+            })
+            .add_systems(
+                Update,
+                (
+                    |mut a: Single<&mut u32>| **a += 1,
+                    |mut b: Single<&mut u64>| {
+                        std::thread::yield_now();
+                        **b += 1;
+                    },
+                )
+                    .parallel(),
+            );
+        for _ in 0..200 {
+            app.emit(&Update);
+        }
+        assert_eq!(app.world.get::<u32>(entity), Some(&400));
+        assert_eq!(app.world.get::<u64>(entity), Some(&400));
+    });
+}
+
+#[test]
+fn non_send_systems_and_listeners_still_run_parallel_groups() {
+    use std::{cell::Cell, rc::Rc};
+    let local = Rc::new(Cell::new(0));
+    let (system, listener) = (local.clone(), local.clone());
+    WorkerPool::new(2).install(|| {
+        let mut world = World::<(Components<u32>, Components<u64>)>::default();
+        let entity = world.spawn();
+        world.insert(entity, 0_u32);
+        world.insert(entity, 0_u64);
+        let mut app = App::new(world)
+            .add_systems(
+                Update,
+                (
+                    move || system.set(system.get() + 1),
+                    (
+                        |mut a: Single<&mut u32>| **a += 1,
+                        |mut b: Single<&mut u64>| **b += 1,
+                    )
+                        .parallel(),
+                ),
+            )
+            .on(move |_: &Update, world: &mut World<_>| {
+                listener.set(listener.get() + *world.get::<u32>(entity).unwrap());
+            });
+        for _ in 0..3 {
+            app.emit(&Update);
+        }
+        assert_eq!(app.world.get::<u64>(entity), Some(&3));
+    });
+    assert_eq!(local.get(), 3 + (1 + 2 + 3));
+}

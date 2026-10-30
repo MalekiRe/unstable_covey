@@ -1,25 +1,23 @@
 use crate::access::{Access, Conflict, Exclusive, ValidAccess};
 use crate::change::{ChangeWindow, SystemWorld};
-use crate::executor::{Context, Continue, Fields, First, Join, Project, Second, Then};
+use crate::executor::{
+    self, Context, Continue, Done, Fields, First, Flow, Join, Outlined, Project, Root, Second,
+    Tail, Then,
+};
 use crate::param::Param;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) mod sealed {
     pub trait Sealed {}
 }
 
-/// Parallel remains the default; serial execution never initializes workers.
+/// `Serial` runs every nested group on the calling thread without workers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ExecutionMode {
     #[default]
     Parallel,
     Serial,
-}
-impl ExecutionMode {
-    #[inline]
-    pub(crate) fn serial(self, parallel: bool) -> bool {
-        self == Self::Serial || !parallel || crate::executor::serial()
-    }
 }
 
 /// A concrete, access-described system. Implementations are sealed.
@@ -27,51 +25,37 @@ pub trait System<S>: sealed::Sealed + Sized {
     type Access: Access;
     type Output;
     const VALID: bool;
+    #[doc(hidden)]
     const HAS_PARALLEL: bool = false;
     #[doc(hidden)]
     const WEIGHT: usize = 1;
-    /// Enter a concrete path and resume its concrete successor.
+    /// Run this system inside an invocation, then its continuation.
     /// # Safety
     /// The path uniquely owns this system and all its declared world accesses.
     #[doc(hidden)]
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
         S: Send + Sync,
     {
-        let result =
-            unsafe { (&mut *P::get(context.nodes)).run_serial_unchecked(context.world) }.is_some();
-        unsafe {
-            K::resume(context, executed | result);
-        }
+        unsafe { direct::<S, R, Self, P, K>(context, flow) }
     }
     /// Returns None if parameters or a condition skip execution. Groups attempt
-    /// every child and return Some(()) if any child executes.
+    /// every child and return Some(()) if any child executes. `clock` is the
+    /// latest change tick on this path; writers advance it.
     /// # Safety
     /// VALID must hold; world must be live and its declared access must not
     /// conflict with any other active borrow. State and captures are exclusive.
-    unsafe fn run_unchecked(&mut self, world: *mut S) -> Option<Self::Output>;
-
-    /// Direct execution without worker dispatch or worker-count inspection.
-    /// # Safety
-    /// The same validity, access, and lifetime requirements as run_unchecked apply.
-    #[inline]
-    unsafe fn run_serial_unchecked(&mut self, world: *mut S) -> Option<Self::Output> {
-        unsafe { self.run_unchecked(world) }
-    }
+    unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<Self::Output>;
 
     #[inline]
-    fn run(&mut self, world: &mut S) -> Option<Self::Output> {
-        self.run_with_mode(world, ExecutionMode::Parallel)
-    }
-    #[inline]
-    fn run_serial(&mut self, world: &mut S) -> Option<Self::Output> {
-        self.run_with_mode(world, ExecutionMode::Serial)
-    }
-    #[inline]
-    fn run_with_mode(&mut self, world: &mut S, mode: ExecutionMode) -> Option<Self::Output> {
+    fn run(&mut self, world: &mut S) -> Option<Self::Output>
+    where
+        S: SystemWorld,
+    {
         const {
             assert!(
                 Self::VALID,
@@ -80,12 +64,64 @@ pub trait System<S>: sealed::Sealed + Sized {
         }
         // SAFETY: compile-time validation plus exclusive ownership of the world.
         unsafe {
-            if mode.serial(Self::HAS_PARALLEL) {
-                self.run_serial_unchecked(world)
-            } else {
-                self.run_unchecked(world)
-            }
+            let mut clock = S::clock(world);
+            let output = Entry::entry(self, world, &mut clock);
+            S::set_clock(world, clock);
+            output
         }
+    }
+    /// Run every nested group directly on this thread.
+    #[inline]
+    fn run_serial(&mut self, world: &mut S) -> Option<Self::Output>
+    where
+        S: SystemWorld,
+    {
+        executor::serially(|| self.run(world))
+    }
+}
+#[inline(always)]
+pub(crate) unsafe fn direct<S, R, T: System<S>, P: Project<R, Target = T>, K: Continue<S, R>>(
+    context: &Context<'_, S, R>,
+    flow: Flow,
+) -> Tail<S, R> {
+    let mut clock = flow.clock();
+    let ran = unsafe { (*P::get(context.nodes)).run_unchecked(context.world, &mut clock) };
+    unsafe { K::resume(context, Flow::new(clock, flow.ran() | ran.is_some())) }
+}
+/// Run a group root as one invocation, advancing the caller's clock.
+#[inline]
+pub(crate) unsafe fn invocation<S: Send + Sync, G: System<S> + Send>(
+    group: &mut G,
+    world: *mut S,
+    clock: &mut u64,
+) -> Option<()> {
+    let root = std::ptr::from_mut(group);
+    let start = Flow::new(*clock, false);
+    let end = unsafe {
+        executor::execute::<S, G, Then<Root, Done>>(root, world, std::ptr::null(), start)
+    };
+    *clock = end.clock();
+    end.ran().then_some(())
+}
+
+/// Lowers a whole thread-safe tree into one invocation. Trees with non-Send
+/// systems still run, with each parallel group as its own invocation.
+trait Entry<S>: System<S> {
+    unsafe fn entry(&mut self, world: *mut S, clock: &mut u64) -> Option<Self::Output>;
+}
+impl<S, T: System<S>> Entry<S> for T {
+    #[inline]
+    default unsafe fn entry(&mut self, world: *mut S, clock: &mut u64) -> Option<Self::Output> {
+        unsafe { self.run_unchecked(world, clock) }
+    }
+}
+impl<S: Send + Sync, T: System<S, Output = ()> + Send> Entry<S> for T {
+    #[inline]
+    unsafe fn entry(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
+        if const { !Self::HAS_PARALLEL } || !executor::parallel(Self::WEIGHT) {
+            return unsafe { self.run_unchecked(world, clock) };
+        }
+        unsafe { invocation(self, world, clock) }
     }
 }
 
@@ -125,9 +161,10 @@ macro_rules! function {
             type Output = R;
             const VALID: bool = <Self::Access as ValidAccess>::VALID $(&& $p::VALID)*;
             #[inline]
-            unsafe fn run_unchecked(&mut self, _world: *mut S) -> Option<R> {
+            unsafe fn run_unchecked(&mut self, _world: *mut S, clock: &mut u64) -> Option<R> {
                 let world_id = unsafe { S::world_id(_world) };
-                let now = unsafe { if Self::Access::WRITES { S::next_tick(_world) } else { S::read_tick(_world) } };
+                // Lamport clock: writers issue the next tick on their own path.
+                let now = if Self::Access::WRITES { crate::change::next(*clock) } else { *clock };
                 let window = ChangeWindow { last: if world_id == self.last_world { self.last_run } else { 0 }, now };
                 // Fetch every parameter before committing the cursor. Invalid
                 // Single parameters therefore preserve the previous window.
@@ -135,6 +172,7 @@ macro_rules! function {
                 let result = (self.function)($(_args.$i),*);
                 self.last_run = window.now;
                 self.last_world = world_id;
+                *clock = window.now;
                 Some(result)
             }
         }
@@ -147,7 +185,8 @@ function!(A 0, B 1, C 2);
 function!(A 0, B 1, C 2, D 3);
 
 pub struct Sequential<A, B>(A, B);
-pub struct Concurrent<A, B>(A, B, Join);
+/// The flag records whether B was published for the current invocation.
+pub struct Concurrent<A, B>(A, B, Join, AtomicBool);
 pub struct Conditional<P, C>(P, C);
 impl<A, B> sealed::Sealed for Sequential<A, B> {}
 impl<A, B> sealed::Sealed for Concurrent<A, B> {}
@@ -159,7 +198,7 @@ impl<A, B> Sequential<A, B> {
 }
 impl<A, B> Concurrent<A, B> {
     fn new(a: A, b: B) -> Self {
-        Self(a, b, Join::default())
+        Self(a, b, Join::default(), AtomicBool::new(false))
     }
 }
 
@@ -181,23 +220,6 @@ fields!(Sequential);
 fields!(Concurrent);
 fields!(Conditional);
 
-struct Joined<P, K>(PhantomData<(P, K)>);
-impl<S, R, A, B, P, K> Continue<S, R> for Joined<P, K>
-where
-    P: Project<R, Target = Concurrent<A, B>>,
-    K: Continue<S, R>,
-{
-    #[inline(always)]
-    unsafe fn resume(context: &Context<'_, S, R>, executed: bool) {
-        let join = unsafe { &(*P::get(context.nodes)).2 };
-        if let Some(executed) = join.arrive(executed) {
-            unsafe {
-                K::resume(context, executed);
-            }
-        }
-    }
-}
-
 impl<S, A: System<S, Output = ()>, B: System<S, Output = ()>> System<S> for Sequential<A, B> {
     type Access = (A::Access, B::Access);
     type Output = ();
@@ -207,37 +229,67 @@ impl<S, A: System<S, Output = ()>, B: System<S, Output = ()>> System<S> for Sequ
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
         S: Send + Sync,
     {
-        if context.cancelled() {
-            return;
+        // A constant guard keeps rustc from instantiating the parallel arm for
+        // plain sequences, whose chains would otherwise hit the recursion limit.
+        if const { !Self::HAS_PARALLEL } {
+            return unsafe { direct::<S, R, Self, P, K>(context, flow) };
         }
-        if !Self::HAS_PARALLEL {
-            let result =
-                unsafe { (&mut *P::get(context.nodes)).run_serial_unchecked(context.world) }
-                    .is_some();
-            unsafe {
-                K::resume(context, executed | result);
-            }
+        unsafe { A::enter::<R, First<P>, Then<Second<P>, K>>(context, flow) }
+    }
+    #[inline]
+    unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
+        // SAFETY: the first child finishes before the second begins.
+        let left = unsafe { self.0.run_unchecked(world, clock) };
+        let right = unsafe { self.1.run_unchecked(world, clock) };
+        left.or(right)
+    }
+}
+
+/// A's continuation: arrive at the join if B was published, else run B here.
+struct Fork<P, K>(PhantomData<(P, K)>);
+/// B's continuation, shared by the published and local paths.
+struct Joined<P, K>(PhantomData<(P, K)>);
+impl<S, R, A, B, P, K> Continue<S, R> for Fork<P, K>
+where
+    S: Send + Sync,
+    R: Send,
+    A: System<S, Output = ()> + Send,
+    B: System<S, Output = ()> + Send,
+    A::Access: Conflict<B::Access>,
+    P: Project<R, Target = Concurrent<A, B>>,
+    K: Continue<S, R>,
+{
+    #[inline(always)]
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        // Borrow only the coordination fields; children may be borrowed elsewhere.
+        if unsafe { &(*P::get(context.nodes)).3 }.load(Ordering::Relaxed) {
+            unsafe { Joined::<P, K>::resume(context, flow) }
         } else {
-            unsafe {
-                A::enter::<R, First<P>, Then<Second<P>, K>>(context, executed);
-            }
+            // B runs after A here, so it continues A's clock.
+            Tail::to::<Then<Second<P>, Joined<P, K>>>(flow)
         }
     }
-    #[inline]
-    unsafe fn run_unchecked(&mut self, world: *mut S) -> Option<()> {
-        // SAFETY: the first invocation ends before the second begins.
-        let (left, right) = unsafe { (self.0.run_unchecked(world), self.1.run_unchecked(world)) };
-        left.or(right)
-    }
-    #[inline]
-    unsafe fn run_serial_unchecked(&mut self, world: *mut S) -> Option<()> {
-        let left = unsafe { self.0.run_serial_unchecked(world) };
-        let right = unsafe { self.1.run_serial_unchecked(world) };
-        left.or(right)
+}
+impl<S, R, A, B, P, K> Continue<S, R> for Joined<P, K>
+where
+    P: Project<R, Target = Concurrent<A, B>>,
+    K: Continue<S, R>,
+{
+    #[inline(always)]
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        let node = unsafe { P::get(context.nodes) };
+        if !unsafe { &(*node).3 }.load(Ordering::Relaxed) {
+            Tail::to::<K>(flow)
+        } else if let Some(flow) = unsafe { &(*node).2 }.arrive(flow) {
+            Tail::to::<K>(flow)
+        } else {
+            Tail::DONE
+        }
     }
 }
 
@@ -255,31 +307,25 @@ where
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) {
-        if context.cancelled() {
-            return;
+        flow: Flow,
+    ) -> Tail<S, R> {
+        let node = unsafe { P::get(context.nodes) };
+        let published = unsafe { &(*node).3 };
+        unsafe { &(*node).2 }.reset(2);
+        // Set before publication: the thief's continuation reads it.
+        published.store(true, Ordering::Relaxed);
+        let branch = Flow::new(flow.clock(), false);
+        if !context.offer::<Then<Second<P>, Joined<P, K>>>(branch, B::WEIGHT, Second::<P>::KEY) {
+            published.store(false, Ordering::Relaxed);
         }
-        if let Some(reservation) = context.reserve::<Second<P>>(B::WEIGHT) {
-            unsafe { &(*P::get(context.nodes)).2 }.reset(2);
-            reservation.publish::<Second<P>, Joined<P, K>>(false);
-            unsafe {
-                A::enter::<R, First<P>, Joined<P, K>>(context, executed);
-            }
-        } else {
-            // No job, join counter, or shared completion operation on this path.
-            unsafe {
-                A::enter::<R, First<P>, Then<Second<P>, K>>(context, executed);
-            }
+        unsafe { A::enter::<R, First<P>, Fork<P, K>>(context, flow) }
+    }
+    unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
+        if executor::parallel(Self::WEIGHT) {
+            return unsafe { invocation(self, world, clock) };
         }
-    }
-    unsafe fn run_unchecked(&mut self, world: *mut S) -> Option<()> {
-        unsafe { crate::executor::execute(self, world) }
-    }
-    #[inline]
-    unsafe fn run_serial_unchecked(&mut self, world: *mut S) -> Option<()> {
-        let left = unsafe { self.0.run_serial_unchecked(world) };
-        let right = unsafe { self.1.run_serial_unchecked(world) };
+        let left = unsafe { self.0.run_unchecked(world, clock) };
+        let right = unsafe { self.1.run_unchecked(world, clock) };
         left.or(right)
     }
 }
@@ -288,42 +334,36 @@ impl<S, P: System<S, Output = ()>, C: System<S, Output = bool>> System<S> for Co
     type Access = (P::Access, C::Access);
     type Output = ();
     const VALID: bool = P::VALID && C::VALID && !C::Access::WRITES;
-    const HAS_PARALLEL: bool = P::HAS_PARALLEL || C::HAS_PARALLEL;
+    const HAS_PARALLEL: bool = P::HAS_PARALLEL;
     const WEIGHT: usize = P::WEIGHT + C::WEIGHT;
     #[inline(always)]
     unsafe fn enter<R: Send, Path: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
-        executed: bool,
-    ) where
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
         S: Send + Sync,
     {
-        if context.cancelled() {
-            return;
+        if const { !Self::HAS_PARALLEL } {
+            return unsafe { direct::<S, R, Self, Path, K>(context, flow) };
         }
         let condition = unsafe { &mut *Second::<Path>::get(context.nodes) };
-        if unsafe { condition.run_serial_unchecked(context.world) } == Some(true) {
-            unsafe {
-                P::enter::<R, First<Path>, K>(context, executed);
-            }
+        let mut clock = flow.clock();
+        let run = unsafe { condition.run_unchecked(context.world, &mut clock) } == Some(true);
+        let flow = Flow::new(clock, flow.ran());
+        // Both outcomes share one out-of-line K.
+        if run {
+            unsafe { P::enter::<R, First<Path>, Outlined<K>>(context, flow) }
         } else {
-            unsafe {
-                K::resume(context, executed);
-            }
-        }
-    }
-    unsafe fn run_unchecked(&mut self, world: *mut S) -> Option<()> {
-        // SAFETY: condition finishes before body; the combined access is exposed
-        // to enclosing parallel groups. Skipping does not reset either state.
-        if unsafe { self.1.run_unchecked(world) } == Some(true) {
-            unsafe { self.0.run_unchecked(world) }
-        } else {
-            None
+            Tail::to::<K>(flow)
         }
     }
     #[inline]
-    unsafe fn run_serial_unchecked(&mut self, world: *mut S) -> Option<()> {
-        if unsafe { self.1.run_serial_unchecked(world) } == Some(true) {
-            unsafe { self.0.run_serial_unchecked(world) }
+    unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
+        // SAFETY: condition finishes before body; the combined access is exposed
+        // to enclosing parallel groups. Skipping does not reset either state.
+        if unsafe { self.1.run_unchecked(world, clock) } == Some(true) {
+            unsafe { self.0.run_unchecked(world, clock) }
         } else {
             None
         }
@@ -336,13 +376,18 @@ pub fn exclusive<F>(function: F) -> ExclusiveSystem<F> {
     ExclusiveSystem(function)
 }
 impl<F> sealed::Sealed for ExclusiveSystem<F> {}
-impl<S, F: FnMut(&mut S)> System<S> for ExclusiveSystem<F> {
+impl<S: SystemWorld, F: FnMut(&mut S)> System<S> for ExclusiveSystem<F> {
     type Access = Exclusive;
     type Output = ();
     const VALID: bool = true;
-    unsafe fn run_unchecked(&mut self, world: *mut S) -> Option<()> {
-        // SAFETY: Exclusive access conflicts with all other world accesses.
-        (self.0)(unsafe { &mut *world });
+    unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
+        // SAFETY: Exclusive access conflicts with all other world accesses, so
+        // the world's own clock may follow this path's clock meanwhile.
+        unsafe {
+            S::set_clock(world, *clock);
+            (self.0)(&mut *world);
+            *clock = S::clock(world);
+        }
         Some(())
     }
 }
@@ -366,7 +411,7 @@ where
         self.into_function()
     }
 }
-impl<S, F: FnMut(&mut S)> IntoSystems<S, Ready> for ExclusiveSystem<F> {
+impl<S: SystemWorld, F: FnMut(&mut S)> IntoSystems<S, Ready> for ExclusiveSystem<F> {
     type Systems = Self;
     fn into_systems(self) -> Self {
         self

@@ -1,5 +1,8 @@
 use std::marker::PhantomData;
 
+use crate::change::SystemWorld;
+use crate::executor::{self, Context, Continue, Done, Fields, First, Flow, Inner, Project, Root};
+use crate::executor::{Second, Tail, Within, serially};
 use crate::plan::ExecutionMode;
 use crate::{IntoSystems, Storage, System, World};
 
@@ -14,11 +17,29 @@ pub struct On<E: 'static, H> {
 }
 
 pub trait Handle<E, S> {
+    #[doc(hidden)]
     const HAS_PARALLEL: bool = false;
+    #[doc(hidden)]
+    const WEIGHT: usize = 1;
     fn handle(&mut self, event: &E, state: &mut S);
-    #[inline]
-    fn handle_in<const SERIAL: bool>(&mut self, event: &E, state: &mut S) {
-        self.handle(event, state);
+    /// Handle within a frame invocation, then continue with K. The handler has
+    /// exclusive world access, so the world clock follows this path meanwhile.
+    /// # Safety
+    /// Every earlier handler has finished; the context event has type E.
+    #[doc(hidden)]
+    #[inline(always)]
+    unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld,
+    {
+        unsafe {
+            S::set_clock(context.world, flow.clock());
+            (*P::get(context.nodes)).handle(&*context.event.cast::<E>(), &mut *context.world);
+            K::resume(context, Flow::new(S::clock(context.world), flow.ran()))
+        }
     }
 }
 
@@ -56,78 +77,215 @@ pub fn system<E: 'static, S, F: FnMut(&E, &mut S)>(callback: F) -> On<E, F> {
 pub struct Run<P>(P);
 pub type Scheduled<E, P> = On<E, Run<P>>;
 
-impl<E, S, P: System<S, Output = ()>> Handle<E, S> for Run<P> {
+impl<P> Inner for Run<P> {
+    type Inner = P;
+    unsafe fn inner(this: *mut Self) -> *mut P {
+        unsafe { &raw mut (*this).0 }
+    }
+}
+impl<E: 'static, H> Inner for On<E, H> {
+    type Inner = H;
+    unsafe fn inner(this: *mut Self) -> *mut H {
+        unsafe { &raw mut (*this).handler }
+    }
+}
+impl<H, T> Fields for Cons<H, T> {
+    type Left = H;
+    type Right = T;
+    unsafe fn left(this: *mut Self) -> *mut H {
+        unsafe { &raw mut (*this).0 }
+    }
+    unsafe fn right(this: *mut Self) -> *mut T {
+        unsafe { &raw mut (*this).1 }
+    }
+}
+
+impl<E, S: SystemWorld, P: System<S, Output = ()>> Handle<E, S> for Run<P> {
     const HAS_PARALLEL: bool = P::HAS_PARALLEL;
+    const WEIGHT: usize = P::WEIGHT;
     #[inline]
     fn handle(&mut self, _: &E, state: &mut S) {
         let _ = self.0.run(state);
     }
-    #[inline]
-    fn handle_in<const SERIAL: bool>(&mut self, _: &E, state: &mut S) {
+    #[inline(always)]
+    unsafe fn enter<R: Send, Path: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld,
+    {
         const {
             assert!(P::VALID, "invalid system access");
         }
-        unsafe {
-            if SERIAL {
-                let _ = self.0.run_serial_unchecked(state);
-            } else {
-                let _ = self.0.run_unchecked(state);
-            }
-        }
+        unsafe { P::enter::<R, Within<Path>, K>(context, flow) }
     }
 }
 
 pub trait MaybeHandle<E: 'static, S> {
+    #[doc(hidden)]
     const HAS_PARALLEL: bool;
+    #[doc(hidden)]
+    const WEIGHT: usize;
     fn maybe_handle(&mut self, event: &E, state: &mut S);
-    fn maybe_handle_in<const SERIAL: bool>(&mut self, event: &E, state: &mut S);
+    /// # Safety
+    /// As `Handle::enter`.
+    #[doc(hidden)]
+    unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld;
 }
 
 // The essential specialization: unequal event types do nothing.
 impl<E: 'static, S, H> MaybeHandle<E, S> for H {
     default const HAS_PARALLEL: bool = false;
+    default const WEIGHT: usize = 0;
     #[inline]
     default fn maybe_handle(&mut self, _: &E, _: &mut S) {}
-    #[inline]
-    default fn maybe_handle_in<const SERIAL: bool>(&mut self, _: &E, _: &mut S) {}
+    #[inline(always)]
+    default unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld,
+    {
+        unsafe { K::resume(context, flow) }
+    }
 }
 
 impl<E: 'static, S, H: Handle<E, S>> MaybeHandle<E, S> for On<E, H> {
     const HAS_PARALLEL: bool = H::HAS_PARALLEL;
+    const WEIGHT: usize = H::WEIGHT;
     #[inline]
     fn maybe_handle(&mut self, event: &E, state: &mut S) {
         self.handler.handle(event, state);
     }
-    #[inline]
-    fn maybe_handle_in<const SERIAL: bool>(&mut self, event: &E, state: &mut S) {
-        self.handler.handle_in::<SERIAL>(event, state);
+    #[inline(always)]
+    unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld,
+    {
+        unsafe { H::enter::<R, Within<P>, K>(context, flow) }
     }
 }
 
+/// Registration-order dispatch. A frame runs every matching handler as one
+/// sequence of continuations: no barrier between registrations.
 pub trait Dispatch<E: 'static, S> {
+    #[doc(hidden)]
     const HAS_PARALLEL: bool = false;
+    #[doc(hidden)]
+    const WEIGHT: usize = 0;
     fn dispatch(&mut self, event: &E, state: &mut S);
-    fn dispatch_in<const SERIAL: bool>(&mut self, event: &E, state: &mut S);
+    /// # Safety
+    /// As `Handle::enter`.
+    #[doc(hidden)]
+    unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld;
 }
 
 impl<E: 'static, S> Dispatch<E, S> for Nil {
     #[inline]
     fn dispatch(&mut self, _: &E, _: &mut S) {}
-    #[inline]
-    fn dispatch_in<const SERIAL: bool>(&mut self, _: &E, _: &mut S) {}
+    #[inline(always)]
+    unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld,
+    {
+        unsafe { K::resume(context, flow) }
+    }
+}
+
+/// After the earlier registrations, run the head handler at P.
+struct Next<E, P, K>(PhantomData<fn(E)>, PhantomData<(P, K)>);
+impl<E: 'static, S, R, P, K> Continue<S, R> for Next<E, P, K>
+where
+    S: Send + Sync + SystemWorld,
+    R: Send,
+    P: Project<R, Target: MaybeHandle<E, S>>,
+    K: Continue<S, R>,
+{
+    #[inline(always)]
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        unsafe { P::Target::maybe_enter::<R, P, K>(context, flow) }
+    }
 }
 
 impl<E: 'static, S, H: MaybeHandle<E, S>, T: Dispatch<E, S>> Dispatch<E, S> for Cons<H, T> {
     const HAS_PARALLEL: bool = H::HAS_PARALLEL || T::HAS_PARALLEL;
+    const WEIGHT: usize = H::WEIGHT + T::WEIGHT;
     #[inline]
     fn dispatch(&mut self, event: &E, state: &mut S) {
         self.1.dispatch(event, state);
         self.0.maybe_handle(event, state);
     }
+    #[inline(always)]
+    unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld,
+    {
+        unsafe { T::enter::<R, Second<P>, Next<E, First<P>, K>>(context, flow) }
+    }
+}
+
+/// The root continuation of a frame invocation.
+struct Frame<E, K>(PhantomData<fn() -> (E, K)>);
+impl<E: 'static, S, R, K> Continue<S, R> for Frame<E, K>
+where
+    S: Send + Sync + SystemWorld,
+    R: Dispatch<E, S> + Send,
+    K: Continue<S, R>,
+{
+    #[inline(always)]
+    unsafe fn resume(context: &Context<'_, S, R>, flow: Flow) -> Tail<S, R> {
+        unsafe { R::enter::<R, Root, K>(context, flow) }
+    }
+}
+/// Thread-safe listener lists run a frame as one invocation; others run each
+/// parallel registration as its own invocation.
+trait Emit<E: 'static, S>: Dispatch<E, S> {
+    fn emit(&mut self, event: &E, state: &mut S);
+}
+impl<E: 'static, S, L: Dispatch<E, S>> Emit<E, S> for L {
     #[inline]
-    fn dispatch_in<const SERIAL: bool>(&mut self, event: &E, state: &mut S) {
-        self.1.dispatch_in::<SERIAL>(event, state);
-        self.0.maybe_handle_in::<SERIAL>(event, state);
+    default fn emit(&mut self, event: &E, state: &mut S) {
+        self.dispatch(event, state);
+    }
+}
+impl<E, S, L> Emit<E, S> for L
+where
+    E: 'static + Sync,
+    S: Send + Sync + SystemWorld,
+    L: Dispatch<E, S> + Send,
+{
+    #[inline]
+    fn emit(&mut self, event: &E, state: &mut S) {
+        if const { !L::HAS_PARALLEL } || !executor::parallel(L::WEIGHT) {
+            return self.dispatch(event, state);
+        }
+        let event = std::ptr::from_ref(event).cast();
+        unsafe {
+            let start = Flow::new(S::clock(state), false);
+            let end = executor::execute::<S, L, Frame<E, Done>>(self, state, event, start);
+            S::set_clock(state, end.clock());
+        }
     }
 }
 
@@ -153,24 +311,17 @@ impl<S, L, A: Install<S, L>, B: Install<S, A::Output>> Install<S, L> for (A, B) 
 
 /// Event-only dispatcher; listeners and their captures live inline.
 #[derive(Default)]
-pub struct Bus<L = Nil>(L, ExecutionMode);
+pub struct Bus<L = Nil>(L);
 
 impl Bus {
     pub fn new() -> Self {
-        Self(Nil, ExecutionMode::Parallel)
+        Self(Nil)
     }
 }
 
 impl<L> Bus<L> {
-    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
-        self.1 = mode;
-        self
-    }
-    pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
-        self.1 = mode;
-    }
     pub fn install<P: Install<(), L>>(self, plugin: P) -> Bus<P::Output> {
-        Bus(plugin.install(self.0), self.1)
+        Bus(plugin.install(self.0))
     }
 
     pub fn on<E: 'static, F: FnMut(&E)>(self, callback: F) -> Bus<Cons<Subscribe<E, F>, L>> {
@@ -190,11 +341,7 @@ impl<L> Bus<L> {
     where
         L: Dispatch<E, ()>,
     {
-        if self.1.serial(L::HAS_PARALLEL) {
-            self.0.dispatch_in::<true>(event, &mut ());
-        } else {
-            self.0.dispatch_in::<false>(event, &mut ());
-        }
+        self.0.dispatch(event, &mut ());
     }
 }
 
@@ -265,15 +412,15 @@ impl<S: Storage, L> App<S, L> {
         })
     }
 
+    /// Runs every handler registered for E, in registration order.
     #[inline]
     pub fn emit<E: 'static>(&mut self, event: &E)
     where
         L: Dispatch<E, World<S>>,
     {
-        if self.execution_mode.serial(L::HAS_PARALLEL) {
-            self.listeners.dispatch_in::<true>(event, &mut self.world);
-        } else {
-            self.listeners.dispatch_in::<false>(event, &mut self.world);
+        match self.execution_mode {
+            ExecutionMode::Parallel => self.listeners.emit(event, &mut self.world),
+            ExecutionMode::Serial => serially(|| self.listeners.dispatch(event, &mut self.world)),
         }
     }
 }

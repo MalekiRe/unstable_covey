@@ -1,4 +1,4 @@
-#![feature(specialization, gca_min_const_items, gca_const_items)]
+#![feature(specialization)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod access;
@@ -21,7 +21,7 @@ pub use dispatch::{
 };
 pub use executor::WorkerPool;
 pub use filter::{Added, Changed, Or, With, Without};
-pub use graph::{GraphConfig, Node, ReadyGraph, node, ready};
+pub use graph::{GraphConfig, MAX_NODES, Node, ReadyGraph, node, ready};
 pub use param::Local;
 pub use plan::{ExecutionMode, IntoSystemConfigs, IntoSystems, System, exclusive};
 pub use query::{ContiguousError, Query, QueryChunks, Single};
@@ -34,3 +34,7 @@ pub mod prelude {
     };
 }
 pub use storage::{Bundle, BundleSlot, Components, Entity, Sparse, Storage, World};
+
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
