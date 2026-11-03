@@ -1,5 +1,6 @@
 use static_ecs::prelude::*;
 struct Update;
+impl Schedule for Update {}
 fn alias(mut query: Query<(&mut u32, &u32)>) {
     for (mut write, read) in &mut query {
         *write += *read;

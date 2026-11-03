@@ -8,8 +8,9 @@
 use std::marker::PhantomData;
 
 use crate::command::CommandQueue;
+use crate::dispatch::schedule;
 use crate::filter::QueryFilter;
-use crate::hook::{Hook, HookList, OnReplace, on_replace};
+use crate::hook::{Batch, Hook, HookList, OnReplace};
 use crate::lookup::ComponentLookup;
 use crate::plan::FunctionSystem;
 use crate::query::QueryState;
@@ -57,7 +58,7 @@ pub(crate) fn pair_index<R: Relation, S: ComponentLookup<PairOf<R>>>() -> usize 
 pub struct Fragment<R>(PhantomData<fn() -> R>);
 impl<R: Relation, S: Storage + ComponentLookup<PairOf<R>>> HookList<S> for Fragment<R> {
     const VALID: bool = <S as ComponentLookup<PairOf<R>>>::COUNT == 1;
-    unsafe fn fire<E: crate::Event>(_: *mut Self, _: *mut World<S>) {}
+    unsafe fn fire<E: crate::Event>(_: *mut Self, _: *mut World<S>, _: &[Entity]) {}
     fn register<Root: HookList<S>>(_: &mut [[Option<crate::hook::Entry<S>>; crate::hook::KINDS]]) {}
     fn relations(relations: &mut Vec<(usize, bool)>) {
         if R::FRAGMENTING {
@@ -471,13 +472,13 @@ type Cleanup<R, S> = for<'a, 'b, 'c, 'd> fn(
 type CleanupSystem<R, S> = FunctionSystem<
     Cleanup<R, S>,
     (
-        Trigger<'static>,
         Query<'static, &'static mut Relates<R>>,
         Query<'static, &'static mut Sources<R>>,
         Commands<'static, S>,
     ),
-    ((), QueryState, QueryState, CommandQueue<S>),
+    (QueryState, QueryState, CommandQueue<S>),
     (),
+    Batch,
 >;
 /// The hooks and registration keeping relation `R` consistent in world `S`.
 pub type RelationHooks<R, S> = (
@@ -501,9 +502,15 @@ where
 {
     pair_index::<R, S>();
     (
-        on_replace::<Relates<R>, _, _>(source_gone::<R, S> as Cleanup<R, S>),
+        schedule(
+            OnReplace::<Relates<R>>::new(),
+            source_gone::<R, S> as Cleanup<R, S>,
+        ),
         (
-            on_replace::<Sources<R>, _, _>(target_gone::<R, S> as Cleanup<R, S>),
+            schedule(
+                OnReplace::<Sources<R>>::new(),
+                target_gone::<R, S> as Cleanup<R, S>,
+            ),
             Fragment(PhantomData),
         ),
     )

@@ -2,6 +2,7 @@ use static_ecs::prelude::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 struct Update;
+impl Schedule for Update {}
 struct Tag;
 struct Other;
 struct Global;

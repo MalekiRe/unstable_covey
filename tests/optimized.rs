@@ -12,6 +12,7 @@ use std::{
 #[derive(Debug, PartialEq)]
 struct Tag(u32);
 struct Update;
+impl Schedule for Update {}
 
 #[test]
 fn remaining_cardinality_and_count_span_archetypes() {

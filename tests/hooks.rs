@@ -13,17 +13,25 @@ fn value_of(query: &mut Query<(Entity, &Health)>, entity: Entity) -> u32 {
 #[test]
 fn hooks_compose_in_registration_order_and_distinguish_add_insert_and_replace() {
     let mut app = App::new()
-        .on_add::<Health, _, _>(|trigger: Trigger, mut log: Single<&mut Log>| {
-            log.0.push(format!("add {}", trigger.len()));
-        })
-        .on_insert::<Health, _, _>(
+        .add_systems(
+            OnAdd::<Health>,
+            |trigger: Trigger, mut log: Single<&mut Log>| {
+                log.0.push(format!("add {}", trigger.len()));
+            },
+        )
+        .add_systems(
+            OnInsert::<Health>,
             |trigger: Trigger, mut health: Query<(Entity, &Health)>, mut log: Single<&mut Log>| {
                 let value = value_of(&mut health, trigger[0]);
                 log.0.push(format!("insert {value}"));
             },
         )
-        .on_insert::<Health, _, _>(|mut log: Single<&mut Log>| log.0.push("insert again".into()))
-        .on_replace::<Health, _, _>(
+        .add_systems(
+            OnInsert::<Health>,
+            |_: Trigger, mut log: Single<&mut Log>| log.0.push("insert again".into()),
+        )
+        .add_systems(
+            OnReplace::<Health>,
             |trigger: Trigger, mut health: Query<(Entity, &Health)>, mut log: Single<&mut Log>| {
                 let value = value_of(&mut health, trigger[0]);
                 log.0.push(format!("replace {value}"));
@@ -49,7 +57,8 @@ fn hooks_compose_in_registration_order_and_distinguish_add_insert_and_replace() 
 #[test]
 fn removal_and_despawn_hooks_see_the_value_before_it_goes() {
     let mut app = App::new()
-        .on_remove::<Health, _, _>(
+        .add_systems(
+            OnRemove::<Health>,
             |trigger: Trigger, mut health: Query<(Entity, &Health)>, mut log: Single<&mut Log>| {
                 for &entity in trigger.iter() {
                     let value = value_of(&mut health, entity);
@@ -76,9 +85,12 @@ fn removal_and_despawn_hooks_see_the_value_before_it_goes() {
 #[test]
 fn batch_spawns_fire_each_hook_once_with_every_entity() {
     let mut app = App::new()
-        .on_add::<Health, _, _>(|trigger: Trigger, mut log: Single<&mut Log>| {
-            log.0.push(format!("add {}", trigger.len()));
-        })
+        .add_systems(
+            OnAdd::<Health>,
+            |trigger: Trigger, mut log: Single<&mut Log>| {
+                log.0.push(format!("add {}", trigger.len()));
+            },
+        )
         .build();
     let log = app.world.spawn_bundle((Log::default(),));
     let spawned = app.world.spawn_batch((0..100).map(|i| (Health(i),)));
@@ -89,16 +101,23 @@ fn batch_spawns_fire_each_hook_once_with_every_entity() {
 #[test]
 fn hook_commands_apply_before_the_structural_operation_returns() {
     struct Update;
+    impl Schedule for Update {}
     let mut app = App::new()
-        .on_add::<Health, _, _>(|trigger: Trigger, mut commands: Commands<_>| {
-            for &entity in trigger.iter() {
-                commands.insert(entity, (Marker,));
-            }
-        })
+        .add_systems(
+            OnAdd::<Health>,
+            |trigger: Trigger, mut commands: Commands<_>| {
+                for &entity in trigger.iter() {
+                    commands.insert(entity, (Marker,));
+                }
+            },
+        )
         // A hook reacting to the first hook's commands, in the same flush.
-        .on_add::<Marker, _, _>(|trigger: Trigger, mut log: Single<&mut Log>| {
-            log.0.push(format!("marked {}", trigger.len()));
-        })
+        .add_systems(
+            OnAdd::<Marker>,
+            |trigger: Trigger, mut log: Single<&mut Log>| {
+                log.0.push(format!("marked {}", trigger.len()));
+            },
+        )
         .add_systems(Update, |mut commands: Commands<_>| {
             commands.spawn((Health(9),));
         })

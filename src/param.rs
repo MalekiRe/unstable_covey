@@ -4,7 +4,6 @@ use crate::access::{Access, Filtered, QueryAccess, ValidAccess};
 use crate::change::{ChangeWindow, SystemWorld};
 use crate::command::{CommandQueue, Commands};
 use crate::filter::{FilterFor, QueryFilter};
-use crate::hook::Trigger;
 use crate::query::{FetchQuery, QueryData, QueryState};
 use crate::{Query, Single, Storage, World};
 
@@ -26,7 +25,6 @@ mod sealed {
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Query<'_, D, F> {}
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Single<'_, D, F> {}
     impl<S: super::Storage> Sealed for super::Commands<'_, S> {}
-    impl Sealed for super::Trigger<'_> {}
 }
 
 /// What a parameter accesses and yields, independent of any world type.
@@ -126,21 +124,5 @@ unsafe impl<S: Storage> Param<World<S>> for Commands<'_, S> {
     }
     fn defer(queue: &mut CommandQueue<S>, world: &mut CommandQueue<S>) {
         world.append(queue);
-    }
-}
-impl ParamShape for Trigger<'_> {
-    type Access = ();
-    type State = ();
-    type Item<'a> = Trigger<'a>;
-}
-// SAFETY: reads the running hook's entity slice, set by the world around it.
-unsafe impl<S: Storage> Param<World<S>> for Trigger<'_> {
-    const VALID: bool = true;
-    unsafe fn fetch<'a>(
-        world: *mut World<S>,
-        _: &'a mut (),
-        _: ChangeWindow,
-    ) -> Option<Trigger<'a>> {
-        Some(Trigger(unsafe { World::trigger(world) }))
     }
 }

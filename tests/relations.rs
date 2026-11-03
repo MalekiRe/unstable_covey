@@ -139,6 +139,7 @@ fn one_to_one_displaces_previous_partners_and_unlinks_on_removal() {
 #[test]
 fn commands_relate_freshly_spawned_entities() {
     struct Update;
+    impl Schedule for Update {}
     let mut app = App::new()
         .relation::<ChildOf, _>()
         .add_systems(Update, |mut commands: Commands<_>| {
@@ -351,6 +352,7 @@ fn linked_fragmenting_relations_despawn_subtrees_and_terminate_on_cycles() {
 #[test]
 fn fragmenting_queries_read_targets_and_subtrees_inside_systems() {
     struct Update;
+    impl Schedule for Update {}
     struct Log(Vec<(u32, Option<u32>)>, usize);
     let mut app = App::new()
         .relation::<InSquad, _>()

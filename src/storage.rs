@@ -351,18 +351,8 @@ pub struct World<S: Storage> {
     /// Commands from hooks and finished systems, applied by `flush`.
     queue: CommandQueue<S>,
     flushing: bool,
-    /// The entities the running hook fired for.
-    trigger: Fired,
     hooks: Option<HookTable<S>>,
     schema: PhantomData<S>,
-}
-/// A hook's entity slice; only read while that hook runs.
-#[derive(Clone, Copy)]
-struct Fired(*const Entity, usize);
-unsafe impl Send for Fired {}
-unsafe impl Sync for Fired {}
-impl Fired {
-    const NONE: Self = Self(NonNull::dangling().as_ptr(), 0);
 }
 impl<S: Storage> Default for World<S> {
     fn default() -> Self {
@@ -396,7 +386,6 @@ impl<S: Storage> World<S> {
             reserved: AtomicU32::new(0),
             queue: CommandQueue::default(),
             flushing: false,
-            trigger: Fired::NONE,
             hooks: None,
             schema: PhantomData,
         };
@@ -421,15 +410,6 @@ impl<S: Storage> World<S> {
             hooks.entry(index, <E::Kind as Kind>::INDEX).is_some()
         })
     }
-    /// The running hook's entities; empty outside hooks.
-    /// # Safety
-    /// The pointer is live; reads only the trigger field.
-    pub(crate) unsafe fn trigger<'a>(world: *mut Self) -> &'a [Entity] {
-        unsafe {
-            let Fired(entities, len) = (*world).trigger;
-            std::slice::from_raw_parts(entities, len)
-        }
-    }
     /// Run the hooks for event `E` on `entities`: one indirect call when any
     /// hook listens, nothing otherwise.
     #[inline]
@@ -443,7 +423,8 @@ impl<S: Storage> World<S> {
         let index = <S as ComponentLookup<E::Component>>::INDEX;
         if let Some((entry, list)) = hooks.entry(index, <E::Kind as Kind>::INDEX) {
             let world: *mut Self = self;
-            unsafe { Self::firing(world, entities, || entry(list, world)) };
+            // SAFETY: hooks reach the world only through `world`.
+            unsafe { entry(list, world, entities) };
         }
     }
     /// Run kind `K` hooks for every hooked component the entity's table has,
@@ -463,26 +444,9 @@ impl<S: Storage> World<S> {
                 }
                 let hooks = (*world).hooks.as_ref().unwrap_unchecked();
                 if let Some((entry, list)) = hooks.entry(index, K::INDEX) {
-                    Self::firing(world, &[entity], || entry(list, world));
+                    entry(list, world, &[entity]);
                 }
             }
-        }
-    }
-    /// Expose `entities` as the trigger while hooks run, even if one unwinds.
-    /// # Safety
-    /// Every world access during `run` goes through `world`.
-    unsafe fn firing(world: *mut Self, entities: &[Entity], run: impl FnOnce()) {
-        struct Reset(*mut Fired);
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                unsafe { *self.0 = Fired::NONE };
-            }
-        }
-        unsafe {
-            let trigger = &raw mut (*world).trigger;
-            *trigger = Fired(entities.as_ptr(), entities.len());
-            let _reset = Reset(trigger);
-            run();
         }
     }
     /// Apply queued commands until none remain, breadth first: commands

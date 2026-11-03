@@ -5,7 +5,7 @@ use crate::{
     access::{Access, Conflict, Same},
     executor::{self, Context, Continue, Fields, First, Flow, Inner, Join, Project, Second},
     executor::{Tail, Then, Within, run},
-    plan::{self, IntoSystems, Shape, System},
+    plan::{self, Input, IntoSystems, Shape, System},
 };
 use std::marker::PhantomData;
 
@@ -42,11 +42,11 @@ pub struct Entry<L, F, D> {
 #[doc(hidden)]
 pub struct Pair<A, B>(A, B);
 #[doc(hidden)]
-pub trait IntoNodes<M> {
+pub trait IntoNodes<K: Input, M> {
     type Nodes;
     fn into_nodes(self) -> Self::Nodes;
 }
-impl<L, F: IntoSystems<M>, M, D> IntoNodes<M> for Node<L, F, D> {
+impl<K: Input, L, F: IntoSystems<K, M>, M, D> IntoNodes<K, M> for Node<L, F, D> {
     type Nodes = Entry<L, F::Systems, D>;
     fn into_nodes(self) -> Self::Nodes {
         Entry {
@@ -55,14 +55,17 @@ impl<L, F: IntoSystems<M>, M, D> IntoNodes<M> for Node<L, F, D> {
         }
     }
 }
-impl<A: IntoNodes<AM>, B: IntoNodes<BM>, AM, BM> IntoNodes<(AM, BM)> for (A, B) {
+impl<K: Input, A: IntoNodes<K, AM>, B: IntoNodes<K, BM>, AM, BM> IntoNodes<K, (AM, BM)> for (A, B) {
     type Nodes = Pair<A::Nodes, B::Nodes>;
     fn into_nodes(self) -> Self::Nodes {
         Pair(self.0.into_nodes(), self.1.into_nodes())
     }
 }
-impl<A: IntoNodes<AM>, B: IntoNodes<BM>, C: IntoNodes<CM>, AM, BM, CM> IntoNodes<(AM, BM, CM)>
-    for (A, B, C)
+impl<K: Input, A, B, C, AM, BM, CM> IntoNodes<K, (AM, BM, CM)> for (A, B, C)
+where
+    A: IntoNodes<K, AM>,
+    B: IntoNodes<K, BM>,
+    C: IntoNodes<K, CM>,
 {
     type Nodes = Pair<A::Nodes, Pair<B::Nodes, C::Nodes>>;
     fn into_nodes(self) -> Self::Nodes {
@@ -72,8 +75,12 @@ impl<A: IntoNodes<AM>, B: IntoNodes<BM>, C: IntoNodes<CM>, AM, BM, CM> IntoNodes
         )
     }
 }
-impl<A: IntoNodes<AM>, B: IntoNodes<BM>, C: IntoNodes<CM>, D: IntoNodes<DM>, AM, BM, CM, DM>
-    IntoNodes<(AM, BM, CM, DM)> for (A, B, C, D)
+impl<K: Input, A, B, C, D, AM, BM, CM, DM> IntoNodes<K, (AM, BM, CM, DM)> for (A, B, C, D)
+where
+    A: IntoNodes<K, AM>,
+    B: IntoNodes<K, BM>,
+    C: IntoNodes<K, CM>,
+    D: IntoNodes<K, DM>,
 {
     type Nodes = Pair<A::Nodes, Pair<B::Nodes, Pair<C::Nodes, D::Nodes>>>;
     fn into_nodes(self) -> Self::Nodes {
@@ -464,18 +471,21 @@ mod sealed {
 #[doc(hidden)]
 pub trait NodeList: sealed::Sealed + Sized {
     type Access: Access;
+    type In: Input;
     const LEN: usize;
     const WEIGHT: usize;
     const HAS_PARALLEL: bool;
 }
 impl<L, F: Shape<Output = ()>, D> NodeList for Entry<L, F, D> {
     type Access = F::Access;
+    type In = F::In;
     const LEN: usize = 1;
     const WEIGHT: usize = F::WEIGHT;
     const HAS_PARALLEL: bool = F::HAS_PARALLEL;
 }
-impl<A: NodeList, B: NodeList> NodeList for Pair<A, B> {
+impl<A: NodeList, B: NodeList<In = A::In>> NodeList for Pair<A, B> {
     type Access = (A::Access, B::Access);
+    type In = A::In;
     const LEN: usize = A::LEN + B::LEN;
     const WEIGHT: usize = A::WEIGHT + B::WEIGHT;
     const HAS_PARALLEL: bool = A::HAS_PARALLEL || B::HAS_PARALLEL;
@@ -521,6 +531,7 @@ pub trait Nodes<S>: NodeList {
     /// The graph and world are exclusive; Stage is a compiled order position.
     unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(
         nodes: *mut Self,
+        input: *const (),
         world: *mut S,
         clock: &mut u64,
     ) -> bool;
@@ -528,6 +539,7 @@ pub trait Nodes<S>: NodeList {
     /// The graph and world are exclusive; this tree supplies the stage list.
     unsafe fn ordered<G: Spec<S>, Stage: Index>(
         nodes: *mut G::Nodes,
+        input: *const (),
         world: *mut S,
         clock: &mut u64,
     ) -> bool;
@@ -616,11 +628,12 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     #[inline(always)]
     unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(
         nodes: *mut Self,
+        input: *const (),
         world: *mut S,
         clock: &mut u64,
     ) -> bool {
         if const { G::TOPOLOGY.rank[I::VALUE] == Stage::VALUE } {
-            unsafe { (*nodes).system.run_unchecked(world, clock) }.is_some()
+            unsafe { (*nodes).system.run_unchecked(input, world, clock) }.is_some()
         } else {
             false
         }
@@ -628,10 +641,11 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     #[inline(always)]
     unsafe fn ordered<G: Spec<S>, Stage: Index>(
         nodes: *mut G::Nodes,
+        input: *const (),
         world: *mut S,
         clock: &mut u64,
     ) -> bool {
-        unsafe { G::Nodes::serial::<G, Zero, Stage>(nodes, world, clock) }
+        unsafe { G::Nodes::serial::<G, Zero, Stage>(nodes, input, world, clock) }
     }
     fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
     where
@@ -640,7 +654,7 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
         self.system.defer(queue);
     }
 }
-impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
+impl<S, A: Nodes<S>, B: Nodes<S> + NodeList<In = A::In>> Nodes<S> for Pair<A, B> {
     const VALID: bool = A::VALID && B::VALID;
     #[inline(always)]
     unsafe fn roots<
@@ -701,23 +715,25 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
     #[inline(always)]
     unsafe fn serial<G: Spec<S>, I: Index, Stage: Index>(
         nodes: *mut Self,
+        input: *const (),
         world: *mut S,
         clock: &mut u64,
     ) -> bool {
         unsafe {
-            A::serial::<G, I, Stage>(&raw mut (*nodes).0, world, clock)
-                | B::serial::<G, Offset<I, A>, Stage>(&raw mut (*nodes).1, world, clock)
+            A::serial::<G, I, Stage>(&raw mut (*nodes).0, input, world, clock)
+                | B::serial::<G, Offset<I, A>, Stage>(&raw mut (*nodes).1, input, world, clock)
         }
     }
     #[inline(always)]
     unsafe fn ordered<G: Spec<S>, Stage: Index>(
         nodes: *mut G::Nodes,
+        input: *const (),
         world: *mut S,
         clock: &mut u64,
     ) -> bool {
         unsafe {
-            A::ordered::<G, Stage>(nodes, world, clock)
-                | B::ordered::<G, Offset<Stage, A>>(nodes, world, clock)
+            A::ordered::<G, Stage>(nodes, input, world, clock)
+                | B::ordered::<G, Offset<Stage, A>>(nodes, input, world, clock)
         }
     }
     fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
@@ -746,9 +762,9 @@ impl<N: NodeList + BuildRows<N>> ReadyGraph<N> {
 }
 #[doc(hidden)]
 pub struct ReadyMarker<M>(PhantomData<M>);
-impl<T: IntoNodes<M>, M> IntoSystems<ReadyMarker<M>> for GraphConfig<T>
+impl<K: Input, T: IntoNodes<K, M>, M> IntoSystems<K, ReadyMarker<M>> for GraphConfig<T>
 where
-    T::Nodes: NodeList + BuildRows<T::Nodes>,
+    T::Nodes: NodeList<In = K> + BuildRows<T::Nodes>,
 {
     type Systems = ReadyGraph<T::Nodes>;
     fn into_systems(self) -> Self::Systems {
@@ -779,6 +795,7 @@ impl<S, N: Nodes<S> + BuildRows<N>> Spec<S> for ReadyGraph<N> {
 impl<N: NodeList + BuildRows<N>> Shape for ReadyGraph<N> {
     type Access = N::Access;
     type Output = ();
+    type In = N::In;
     const HAS_PARALLEL: bool = Self::COMPILED.parallel || N::HAS_PARALLEL;
     const WEIGHT: usize = N::WEIGHT;
 }
@@ -800,12 +817,18 @@ impl<S: Send + Sync, N: Nodes<S> + BuildRows<N> + Send> System<S> for ReadyGraph
             N::roots::<R, Within<P>, P, Zero, K, false>(context, flow)
         }
     }
-    unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
+    unsafe fn run_unchecked(
+        &mut self,
+        input: *const (),
+        world: *mut S,
+        clock: &mut u64,
+    ) -> Option<()> {
         if const { !Self::HAS_PARALLEL } || !executor::parallel(Self::WEIGHT) {
-            let ran = unsafe { N::ordered::<Self, Zero>(&raw mut self.nodes, world, clock) };
+            let nodes = &raw mut self.nodes;
+            let ran = unsafe { N::ordered::<Self, Zero>(nodes, input, world, clock) };
             return ran.then_some(());
         }
-        unsafe { plan::invocation(self, world, clock) }
+        unsafe { plan::invocation(self, input, world, clock) }
     }
     fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
     where

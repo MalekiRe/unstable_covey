@@ -15,20 +15,28 @@ use std::ptr::NonNull;
 
 use crate::access::{Access, Same};
 use crate::change::SystemWorld;
-use crate::dispatch::{Cons, Nil};
+use crate::dispatch::{Cons, Lifecycle, Nil, Schedule};
 use crate::executor::Fields;
 use crate::lookup::ComponentLookup;
-use crate::plan::{IntoSystems, Shape, System};
+use crate::plan::{Input, Shape, System, Takes};
 use crate::{Entity, Storage, World, executor};
 
-/// After `T` is added to entities that lacked it.
-pub struct OnAdd<T>(PhantomData<fn(T)>);
-/// After `T` is written, whether added or replaced.
-pub struct OnInsert<T>(PhantomData<fn(T)>);
-/// Before an existing `T` is overwritten, removed, or despawned.
-pub struct OnReplace<T>(PhantomData<fn(T)>);
-/// Before `T` is removed or its entity despawned.
-pub struct OnRemove<T>(PhantomData<fn(T)>);
+/// Lifecycle label: after `T` is added to entities that lacked it.
+pub struct OnAdd<T>(pub PhantomData<fn(T)>);
+/// Lifecycle label: after `T` is written, whether added or replaced.
+pub struct OnInsert<T>(pub PhantomData<fn(T)>);
+/// Lifecycle label: before an existing `T` is overwritten, removed, or
+/// despawned, while the old value is still readable.
+pub struct OnReplace<T>(pub PhantomData<fn(T)>);
+/// Lifecycle label: before `T` is removed or its entity despawned.
+pub struct OnRemove<T>(pub PhantomData<fn(T)>);
+
+/// Lifecycle labels' input family: the affected entities, as a `Trigger`.
+pub struct Batch;
+impl Input for Batch {
+    type Item<'a> = Trigger<'a>;
+}
+impl Takes for Batch {}
 
 #[doc(hidden)]
 pub struct Add;
@@ -57,6 +65,21 @@ macro_rules! events {
             type Component = T;
             type Kind = $kind;
         }
+        impl<T: 'static> Schedule for $event<T> {
+            type In = Batch;
+            type Route = Lifecycle;
+        }
+        impl<T> $event<T> {
+            /// The label, for `add_systems`.
+            pub const fn new() -> Self {
+                Self(PhantomData)
+            }
+        }
+        impl<T> Default for $event<T> {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
         impl Kind for $kind {
             const INDEX: usize = $index;
             type Of<T: 'static> = $event<T>;
@@ -67,6 +90,7 @@ events!(OnAdd Add 0, OnInsert Insert 1, OnReplace Replace 2, OnRemove Remove 3);
 pub(crate) const KINDS: usize = 4;
 
 /// The entities a hook fired for: one per structural call, all of a batch.
+#[derive(Clone, Copy)]
 pub struct Trigger<'a>(pub(crate) &'a [Entity]);
 impl Deref for Trigger<'_> {
     type Target = [Entity];
@@ -80,8 +104,8 @@ pub struct Hook<E, P> {
     systems: P,
     event: PhantomData<fn(E)>,
 }
-impl<E: Event, P: Shape<Output = ()>> Hook<E, P> {
-    fn new(systems: P) -> Self {
+impl<E, P: Shape<Output = ()>> Hook<E, P> {
+    pub(crate) fn new(systems: P) -> Self {
         const {
             assert!(
                 !P::Access::EXCLUSIVE,
@@ -94,19 +118,8 @@ impl<E: Event, P: Shape<Output = ()>> Hook<E, P> {
         }
     }
 }
-macro_rules! constructors {
-    ($($name:ident $event:ident),*) => {$(
-        /// An installable hook, e.g. from a plugin; see the builder method of
-        /// the same name.
-        pub fn $name<T: 'static, P: IntoSystems<M>, M>(systems: P) -> Hook<$event<T>, P::Systems> {
-            Hook::new(systems.into_systems())
-        }
-    )*};
-}
-constructors!(on_add OnAdd, on_insert OnInsert, on_replace OnReplace, on_remove OnRemove);
-
 /// Runs every hook of one event in an erased hook list.
-pub(crate) type Entry<S> = unsafe fn(*mut u8, *mut World<S>);
+pub(crate) type Entry<S> = unsafe fn(*mut u8, *mut World<S>, &[Entity]);
 
 /// Every registered hook, statically dispatched by event type.
 pub trait HookList<S: Storage> {
@@ -116,7 +129,7 @@ pub trait HookList<S: Storage> {
     /// # Safety
     /// `this` is the world's hook list; the world is live and its other parts
     /// are accessed only through `world`; no structural change happens.
-    unsafe fn fire<E: Event>(this: *mut Self, world: *mut World<S>);
+    unsafe fn fire<E: Event>(this: *mut Self, world: *mut World<S>, entities: &[Entity]);
     /// Point the table entry of every registered event at `Root`'s runner.
     fn register<Root: HookList<S>>(table: &mut [[Option<Entry<S>>; KINDS]]);
     /// Fragmenting relations as (pair id, linked).
@@ -126,17 +139,17 @@ impl<S: Storage> HookList<S> for Nil {
     const VALID: bool = true;
     const EMPTY: bool = true;
     #[inline(always)]
-    unsafe fn fire<E: Event>(_: *mut Self, _: *mut World<S>) {}
+    unsafe fn fire<E: Event>(_: *mut Self, _: *mut World<S>, _: &[Entity]) {}
     fn register<Root: HookList<S>>(_: &mut [[Option<Entry<S>>; KINDS]]) {}
 }
 impl<S: Storage, A: HookList<S>, B: HookList<S>> HookList<S> for Cons<A, B> {
     const VALID: bool = A::VALID && B::VALID;
     #[inline(always)]
-    unsafe fn fire<E: Event>(this: *mut Self, world: *mut World<S>) {
+    unsafe fn fire<E: Event>(this: *mut Self, world: *mut World<S>, entities: &[Entity]) {
         // Registration order: the tail holds earlier hooks.
         unsafe {
-            B::fire::<E>(Cons::right(this), world);
-            A::fire::<E>(Cons::left(this), world);
+            B::fire::<E>(Cons::right(this), world, entities);
+            A::fire::<E>(Cons::left(this), world, entities);
         }
     }
     fn register<Root: HookList<S>>(table: &mut [[Option<Entry<S>>; KINDS]]) {
@@ -152,21 +165,22 @@ impl<S, E, P> HookList<S> for Hook<E, P>
 where
     S: Storage + ComponentLookup<E::Component>,
     E: Event,
-    P: System<World<S>, Output = ()>,
+    P: System<World<S>, Output = (), In = Batch>,
 {
     const VALID: bool = P::VALID && <S as ComponentLookup<E::Component>>::COUNT == 1;
     #[inline(always)]
-    unsafe fn fire<F: Event>(this: *mut Self, world: *mut World<S>) {
+    unsafe fn fire<F: Event>(this: *mut Self, world: *mut World<S>, entities: &[Entity]) {
         if const { <F as Same<E>>::VALUE } {
-            unsafe { run(this, world) };
+            unsafe { run(this, world, entities) };
         }
     }
     fn register<Root: HookList<S>>(table: &mut [[Option<Entry<S>>; KINDS]]) {
         unsafe fn every<S: Storage, Root: HookList<S>, E: Event>(
             hooks: *mut u8,
             world: *mut World<S>,
+            entities: &[Entity],
         ) {
-            unsafe { Root::fire::<E>(hooks.cast(), world) };
+            unsafe { Root::fire::<E>(hooks.cast(), world, entities) };
         }
         table[<S as ComponentLookup<E::Component>>::INDEX][E::Kind::INDEX] =
             Some(every::<S, Root, E>);
@@ -175,14 +189,17 @@ where
 /// Run a hook serially on the world's clock, then move its commands to the
 /// world's queue.
 #[inline(never)]
-unsafe fn run<S: Storage, E, P: System<World<S>, Output = ()>>(
+unsafe fn run<S: Storage, E, P: System<World<S>, Output = (), In = Batch>>(
     this: *mut Hook<E, P>,
     world: *mut World<S>,
+    entities: &[Entity],
 ) {
     unsafe {
         let systems = &mut (*this).systems;
+        let trigger = Trigger(entities);
+        let input = (&raw const trigger).cast();
         let mut clock = World::clock(world);
-        executor::serially(|| systems.run_unchecked(world, &mut clock));
+        executor::serially(|| systems.run_unchecked(input, world, &mut clock));
         World::set_clock(world, clock);
         systems.defer(&mut *World::queue(world));
     }

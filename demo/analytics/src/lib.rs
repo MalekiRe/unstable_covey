@@ -1,11 +1,11 @@
 use demo_input::Click;
-use static_ecs::{Callback, On, system};
+use static_ecs::{Listener, schedule};
 
-/// Generic over the world: the app that installs it fixes `W` at `build`.
-pub fn plugin<W>(total: &mut u32) -> On<Click, Callback<impl FnMut(&Click, &mut W) + '_>> {
+/// A plugin is a registration value; it never names the app's world.
+pub fn plugin(total: &mut u32) -> Listener<Click, impl FnMut(&Click) + '_> {
     let mut count = 0;
-    system(move |event: &Click, _: &mut W| {
+    schedule(Click, move |click: &Click| {
         count += 1;
-        *total += event.x * count;
+        *total += click.0 * count;
     })
 }

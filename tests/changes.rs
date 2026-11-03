@@ -213,6 +213,7 @@ fn parallel_writers_are_seen_exactly_once_by_readers_before_and_after_the_join()
         atomic::{AtomicUsize, Ordering},
     };
     struct Update;
+    impl Schedule for Update {}
     let frames = 50;
     let (before, after) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (seen_before, seen_after) = (before.clone(), after.clone());

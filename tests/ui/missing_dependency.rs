@@ -1,5 +1,6 @@
 use static_ecs::prelude::*;
 struct Update;
+impl Schedule for Update {}
 struct A;
 struct Missing;
 fn main() {

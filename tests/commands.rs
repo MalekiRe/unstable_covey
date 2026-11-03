@@ -3,6 +3,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Update;
+impl Schedule for Update {}
 struct Spawner;
 #[derive(Debug, PartialEq)]
 struct Value(u32);
@@ -123,17 +124,18 @@ fn a_panicking_command_drops_every_remaining_command_exactly_once() {
             DROPS.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let mut system = static_ecs::IntoSystems::into_systems(|mut commands: Commands<_>| {
-        let first = Counted;
-        commands.queue(move |_| drop(first));
-        commands.queue(|_| panic!("command failed"));
-        let (second, third) = (Counted, Counted);
-        commands.queue(move |_| drop(second));
-        commands.queue(move |_| drop(third));
-    });
+    let mut system =
+        static_ecs::IntoSystems::<NoInput, _>::into_systems(|mut commands: Commands<_>| {
+            let first = Counted;
+            commands.queue(move |_| drop(first));
+            commands.queue(|_| panic!("command failed"));
+            let (second, third) = (Counted, Counted);
+            commands.queue(move |_| drop(second));
+            commands.queue(move |_| drop(third));
+        });
     let mut world = World::<()>::default();
     let result = catch_unwind(AssertUnwindSafe(|| {
-        static_ecs::System::run(&mut system, &mut world)
+        static_ecs::System::run(&mut system, NoInput, &mut world)
     }));
     assert!(result.is_err());
     assert_eq!(DROPS.load(Ordering::Relaxed), 3);

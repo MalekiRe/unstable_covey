@@ -9,6 +9,7 @@ struct Running(bool);
 struct Active;
 struct Global;
 struct Update;
+impl Schedule for Update {}
 
 fn integrate(
     mut query: Query<(&mut Position, &Velocity), With<Active>>,

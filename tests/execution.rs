@@ -9,6 +9,7 @@ use std::{
     time::Duration,
 };
 struct Update;
+impl Schedule for Update {}
 struct A;
 struct B;
 struct C;

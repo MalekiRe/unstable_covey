@@ -1,19 +1,22 @@
 use demo_input::Click;
-use static_ecs::{Callback, On, system};
+use static_ecs::{Listener, Ref, Schedule, schedule};
 
-// Introduced here: neither the app nor analytics knows this type.
-pub struct PacketReceived {
-    pub bytes: usize,
+// Introduced here: neither the app nor analytics knows this label.
+pub struct PacketReceived(pub usize);
+impl Schedule for PacketReceived {
+    type In = Ref<Self>;
 }
 
-pub type Plugin<C, P> = (On<Click, Callback<C>>, On<PacketReceived, Callback<P>>);
+pub type Plugin<C, P> = (Listener<Click, C>, Listener<PacketReceived, P>);
 
-pub fn plugin<'a, W>(
+pub fn plugin<'a>(
     clicks: &'a mut u32,
     bytes: &'a mut usize,
-) -> Plugin<impl FnMut(&Click, &mut W) + 'a, impl FnMut(&PacketReceived, &mut W) + 'a> {
+) -> Plugin<impl FnMut(&Click) + 'a, impl FnMut(&PacketReceived) + 'a> {
     (
-        system(move |_: &Click, _: &mut W| *clicks += 1),
-        system(move |packet: &PacketReceived, _: &mut W| *bytes += packet.bytes),
+        schedule(Click, move |_: &Click| *clicks += 1),
+        schedule(PacketReceived, move |packet: &PacketReceived| {
+            *bytes += packet.0
+        }),
     )
 }

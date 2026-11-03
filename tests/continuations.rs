@@ -4,6 +4,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 struct Update;
+impl Schedule for Update {}
 struct Prefix;
 struct Fork;
 struct Join;
@@ -385,9 +386,12 @@ fn non_send_systems_and_listeners_still_run_parallel_groups() {
                         .parallel(),
                 ),
             )
-            .on(move |_: &Update, world: &mut World<_>| {
-                listener.set(listener.get() + **world.single::<&u32>().unwrap());
-            })
+            .add_systems(
+                Update,
+                exclusive(move |world: &mut World<_>| {
+                    listener.set(listener.get() + **world.single::<&u32>().unwrap());
+                }),
+            )
             .build();
         let entity = app.world.spawn_bundle((0_u32, 0_u64));
         for _ in 0..3 {

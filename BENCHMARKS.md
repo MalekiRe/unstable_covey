@@ -160,6 +160,26 @@ Frame times are within run-to-run variation (the −7.4% row included); final
 states match in all 60 processes. Table creation now also compares pairs and
 maintains the pair index, visible as +0.5 ms init at 4,096 actors.
 
+## Schedule inputs (`3476d77` → current)
+
+Systems now receive their label's input through the frame, and `add_systems`
+is the only registration path. The simulation's systems are unchanged apart
+from `impl Schedule for Update {}`. Five alternating repetitions per row
+(`schedules-paired.json`):
+
+| Actors | Workers | Before ms | After ms | Change | Init before/after ms |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0662 | 0.0672 | +1.5% | 1.1 / 1.5 |
+| 0 | 4 | 0.0237 | 0.0237 | +0.1% | 0.7 / 1.0 |
+| 4,096 | 1 | 1.246 | 1.237 | −0.7% | 3.2 / 3.6 |
+| 4,096 | 4 | 1.012 | 1.001 | −1.0% | 2.5 / 3.0 |
+| 100,000 | 1 | 99.9 | 99.9 | −0.0% | 129 / 129 |
+| 100,000 | 4 | 82.8 | 82.7 | −0.0% | 110 / 110 |
+
+Frame times are within run-to-run variation; final states match in all 60
+processes. Initialization (build plus the first frame) is 0.3–0.5 ms slower in
+the small cases, consistently across repetitions.
+
 ## Blended microbenchmark
 
 `blend_*`: 4,096 tiny systems in four parallel lanes plus a small simulation over

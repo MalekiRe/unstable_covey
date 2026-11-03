@@ -3,18 +3,114 @@ use std::marker::PhantomData;
 use crate::change::SystemWorld;
 use crate::executor::{self, Context, Continue, Done, Fields, First, Flow, Inner, Project, Root};
 use crate::executor::{Second, Tail, Within, serially};
-use crate::hook::{self, Event, Hook, HookList, OnAdd, OnInsert, OnRemove, OnReplace};
+use crate::hook::{Event, Hook, HookList};
 use crate::lookup::ComponentLookup;
-use crate::plan::{ExecutionMode, Shape, run_now};
+use crate::plan::{ExecutionMode, FunctionSystem, Input, NoInput, Ref, Shape, run_now};
 use crate::relation::{self, Fragment, PairOf, Relates, Relation, RelationHooks, Sources};
 use crate::vocab::{Declaration, Insert, Uses};
 use crate::{Components, IntoSystems, Storage, System, World};
+
+/// A schedule label: what `add_systems` registers under and `emit` runs.
+/// `In` is what every system under it takes first: `NoInput` (nothing, the
+/// default) or `Ref<Self>` (the emitted value). Lifecycle labels such as
+/// `OnInsert<T>` hand their systems a `Trigger`.
+/// ```
+/// use static_ecs::prelude::*;
+/// struct Update;
+/// impl Schedule for Update {}
+/// struct Damage(u32);
+/// impl Schedule for Damage {
+///     type In = Ref<Self>;
+/// }
+/// ```
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a schedule label",
+    note = "implement `Schedule` for it: `impl Schedule for {Self} {{}}`, or `type In = Ref<Self>;` to hand systems the emitted value"
+)]
+pub trait Schedule: Sized + 'static {
+    type In: Input = NoInput;
+    /// Who fires the label: `emit`, or the world's structural operations.
+    #[doc(hidden)]
+    type Route: Route = Emitted;
+}
+/// Where a label's systems live.
+#[doc(hidden)]
+pub trait Route {
+    type Place<E: Schedule, P: Shape<Output = (), In = E::In>>;
+    fn place<E: Schedule, P: Shape<Output = (), In = E::In>>(systems: P) -> Self::Place<E, P>;
+}
+/// Fired by `App::emit`: systems join the app's frame.
+#[doc(hidden)]
+pub struct Emitted;
+impl Route for Emitted {
+    type Place<E: Schedule, P: Shape<Output = (), In = E::In>> = Scheduled<E, P>;
+    fn place<E: Schedule, P: Shape<Output = (), In = E::In>>(systems: P) -> Scheduled<E, P> {
+        On {
+            handler: Run(systems),
+            marker: PhantomData,
+        }
+    }
+}
+/// Fired by the world itself: systems join its hook table.
+#[doc(hidden)]
+pub struct Lifecycle;
+impl Route for Lifecycle {
+    type Place<E: Schedule, P: Shape<Output = (), In = E::In>> = Hook<E, P>;
+    fn place<E: Schedule, P: Shape<Output = (), In = E::In>>(systems: P) -> Hook<E, P> {
+        Hook::new(systems)
+    }
+}
+/// Systems `P` placed under label `E`.
+pub type Placed<E, P> = <<E as Schedule>::Route as Route>::Place<E, P>;
+/// Builds a label's input from the emitted value.
+#[doc(hidden)]
+pub trait FromEvent<E>: Input {
+    fn of(event: &E) -> Self::Item<'_>;
+}
+impl<E> FromEvent<E> for NoInput {
+    fn of(_: &E) -> NoInput {
+        NoInput
+    }
+}
+impl<E: 'static> FromEvent<E> for Ref<E> {
+    fn of(event: &E) -> &E {
+        event
+    }
+}
+
+/// The unit label, for apps with one schedule.
+impl Schedule for () {}
+
+/// Names a schedule label `E`: the label value itself (`Update`), or a tuple
+/// struct's constructor (`Damage`, `OnInsert::<ChildOf>`), so payload and
+/// lifecycle labels need no dummy value.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a schedule label",
+    note = "implement `Schedule` for the label type: `impl Schedule for Update {{}}`"
+)]
+pub trait Label<E, M> {}
+impl<E: Schedule> Label<E, ()> for E {}
+impl<E: Schedule, A, F: FnOnce(A) -> E> Label<E, fn(A)> for F {}
+impl<E: Schedule, A, B, F: FnOnce(A, B) -> E> Label<E, fn(A, B)> for F {}
+impl<E: Schedule, A, B, C, F: FnOnce(A, B, C) -> E> Label<E, fn(A, B, C)> for F {}
+
+/// An installable registration, e.g. returned by a plugin:
+/// `.install(schedule(Click, count_clicks))` equals
+/// `.add_systems(Click, count_clicks)`.
+pub fn schedule<E, X, LM, P, M>(_: X, systems: P) -> Placed<E, P::Systems>
+where
+    E: Schedule,
+    X: Label<E, LM>,
+    P: IntoSystems<E::In, M>,
+{
+    <E::Route as Route>::place::<E, P::Systems>(systems.into_systems())
+}
 
 #[derive(Default)]
 pub struct Nil;
 pub struct Cons<H, T>(H, T);
 
-/// Keep E visible across crate boundaries; only hide the callback implementation.
+/// Keep E visible across crate boundaries; only hide the systems.
 pub struct On<E: 'static, H> {
     handler: H,
     marker: PhantomData<fn(E)>,
@@ -28,7 +124,10 @@ pub trait Handle<E, S> {
     /// Valid for world S: storage resolves and accesses do not alias.
     #[doc(hidden)]
     const VALID: bool = true;
-    fn handle(&mut self, event: &E, state: &mut S);
+    /// # Safety
+    /// `input` points at a live item of `E`'s input family.
+    #[doc(hidden)]
+    unsafe fn handle(&mut self, input: *const (), state: &mut S);
     /// Move commands recorded by `handle`/`enter` to the world's queue.
     #[doc(hidden)]
     fn defer(&mut self, _queue: &mut <S as SystemWorld>::Queue)
@@ -36,47 +135,23 @@ pub trait Handle<E, S> {
         S: SystemWorld,
     {
     }
-    /// Handle within a frame invocation, then continue with K. The handler has
-    /// exclusive world access, so the world clock follows this path meanwhile.
+    /// Handle within a frame invocation, then continue with K.
     /// # Safety
-    /// Every earlier handler has finished; the context event has type E.
+    /// Every earlier handler has finished; the context input belongs to `E`.
     #[doc(hidden)]
-    #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
         flow: Flow,
     ) -> Tail<S, R>
     where
-        S: Send + Sync + SystemWorld,
-    {
-        unsafe {
-            S::set_clock(context.world, flow.clock());
-            (*P::get(context.nodes)).handle(&*context.event.cast::<E>(), &mut *context.world);
-            K::resume(context, Flow::new(S::clock(context.world), flow.ran()))
-        }
-    }
-}
-
-/// A payload handler with exclusive world access.
-pub struct Callback<F>(F);
-impl<E, S, F: FnMut(&E, &mut S)> Handle<E, S> for Callback<F> {
-    #[inline]
-    fn handle(&mut self, event: &E, state: &mut S) {
-        (self.0)(event, state);
-    }
-}
-
-/// An installable payload handler. Annotate the world as `&mut World<_>`, or
-/// make a plugin generic over it.
-pub fn system<E: 'static, F>(callback: F) -> On<E, Callback<F>> {
-    On {
-        handler: Callback(callback),
-        marker: PhantomData,
-    }
+        S: Send + Sync + SystemWorld;
 }
 
 pub struct Run<P>(P);
 pub type Scheduled<E, P> = On<E, Run<P>>;
+/// A world-free function `F` registered under payload label `E`, e.g. a
+/// plugin's `fn plugin(...) -> Listener<Click, impl FnMut(&Click)>`.
+pub type Listener<E, F> = Scheduled<E, FunctionSystem<F, (), (), (), Ref<E>>>;
 
 impl<P> Inner for Run<P> {
     type Inner = P;
@@ -101,13 +176,13 @@ impl<H, T> Fields for Cons<H, T> {
     }
 }
 
-impl<E, S: SystemWorld, P: System<S, Output = ()>> Handle<E, S> for Run<P> {
+impl<E: Schedule, S: SystemWorld, P: System<S, Output = (), In = E::In>> Handle<E, S> for Run<P> {
     const HAS_PARALLEL: bool = P::HAS_PARALLEL;
     const WEIGHT: usize = P::WEIGHT;
     const VALID: bool = P::VALID;
     #[inline]
-    fn handle(&mut self, _: &E, state: &mut S) {
-        let _ = run_now(&mut self.0, state);
+    unsafe fn handle(&mut self, input: *const (), state: &mut S) {
+        let _ = unsafe { run_now(&mut self.0, input, state) };
     }
     fn defer(&mut self, queue: &mut S::Queue) {
         self.0.defer(queue);
@@ -132,7 +207,10 @@ pub trait MaybeHandle<E: 'static, S> {
     const HAS_PARALLEL: bool;
     #[doc(hidden)]
     const WEIGHT: usize;
-    fn maybe_handle(&mut self, event: &E, state: &mut S);
+    /// # Safety
+    /// As `Handle::handle`.
+    #[doc(hidden)]
+    unsafe fn maybe_handle(&mut self, input: *const (), state: &mut S);
     #[doc(hidden)]
     fn maybe_defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
     where
@@ -153,7 +231,7 @@ impl<E: 'static, S, H> MaybeHandle<E, S> for H {
     default const HAS_PARALLEL: bool = false;
     default const WEIGHT: usize = 0;
     #[inline]
-    default fn maybe_handle(&mut self, _: &E, _: &mut S) {}
+    default unsafe fn maybe_handle(&mut self, _: *const (), _: &mut S) {}
     #[inline]
     default fn maybe_defer(&mut self, _: &mut <S as SystemWorld>::Queue)
     where
@@ -176,8 +254,8 @@ impl<E: 'static, S, H: Handle<E, S>> MaybeHandle<E, S> for On<E, H> {
     const HAS_PARALLEL: bool = H::HAS_PARALLEL;
     const WEIGHT: usize = H::WEIGHT;
     #[inline]
-    fn maybe_handle(&mut self, event: &E, state: &mut S) {
-        self.handler.handle(event, state);
+    unsafe fn maybe_handle(&mut self, input: *const (), state: &mut S) {
+        unsafe { self.handler.handle(input, state) };
     }
     #[inline]
     fn maybe_defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
@@ -205,7 +283,10 @@ pub trait Dispatch<E: 'static, S> {
     const HAS_PARALLEL: bool = false;
     #[doc(hidden)]
     const WEIGHT: usize = 0;
-    fn dispatch(&mut self, event: &E, state: &mut S);
+    /// # Safety
+    /// `input` points at a live item of `E`'s input family.
+    #[doc(hidden)]
+    unsafe fn dispatch(&mut self, input: *const (), state: &mut S);
     /// Move the matching handlers' commands to the queue, in registration order.
     #[doc(hidden)]
     fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
@@ -224,7 +305,7 @@ pub trait Dispatch<E: 'static, S> {
 
 impl<E: 'static, S> Dispatch<E, S> for Nil {
     #[inline]
-    fn dispatch(&mut self, _: &E, _: &mut S) {}
+    unsafe fn dispatch(&mut self, _: *const (), _: &mut S) {}
     #[inline]
     fn defer(&mut self, _: &mut <S as SystemWorld>::Queue)
     where
@@ -262,9 +343,11 @@ impl<E: 'static, S, H: MaybeHandle<E, S>, T: Dispatch<E, S>> Dispatch<E, S> for 
     const HAS_PARALLEL: bool = H::HAS_PARALLEL || T::HAS_PARALLEL;
     const WEIGHT: usize = H::WEIGHT + T::WEIGHT;
     #[inline]
-    fn dispatch(&mut self, event: &E, state: &mut S) {
-        self.1.dispatch(event, state);
-        self.0.maybe_handle(event, state);
+    unsafe fn dispatch(&mut self, input: *const (), state: &mut S) {
+        unsafe {
+            self.1.dispatch(input, state);
+            self.0.maybe_handle(input, state);
+        }
     }
     #[inline]
     fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
@@ -302,12 +385,14 @@ where
 /// Thread-safe listener lists run a frame as one invocation; others run each
 /// parallel registration as its own invocation.
 trait Emit<E: 'static, S>: Dispatch<E, S> {
-    fn emit(&mut self, event: &E, state: &mut S);
+    /// # Safety
+    /// As `Dispatch::dispatch`.
+    unsafe fn emit(&mut self, input: *const (), state: &mut S);
 }
 impl<E: 'static, S, L: Dispatch<E, S>> Emit<E, S> for L {
     #[inline]
-    default fn emit(&mut self, event: &E, state: &mut S) {
-        self.dispatch(event, state);
+    default unsafe fn emit(&mut self, input: *const (), state: &mut S) {
+        unsafe { self.dispatch(input, state) };
     }
 }
 impl<E, S, L> Emit<E, S> for L
@@ -317,14 +402,13 @@ where
     L: Dispatch<E, S> + Send,
 {
     #[inline]
-    fn emit(&mut self, event: &E, state: &mut S) {
+    unsafe fn emit(&mut self, input: *const (), state: &mut S) {
         if const { !L::HAS_PARALLEL } || !executor::parallel(L::WEIGHT) {
-            return self.dispatch(event, state);
+            return unsafe { self.dispatch(input, state) };
         }
-        let event = std::ptr::from_ref(event).cast();
         unsafe {
             let start = Flow::new(S::clock(state), false);
-            let end = executor::execute::<S, L, Frame<E, Done>>(self, state, event, start);
+            let end = executor::execute::<S, L, Frame<E, Done>>(self, state, input, start);
             S::set_clock(state, end.clock());
         }
     }
@@ -334,9 +418,6 @@ where
 #[doc(hidden)]
 pub trait Handler {
     type Access;
-}
-impl<F> Handler for Callback<F> {
-    type Access = ();
 }
 impl<P: Shape> Handler for Run<P> {
     type Access = P::Access;
@@ -396,7 +477,7 @@ where
 }
 
 /// Every handler in a listener list runs against world `W`. Checked once at
-/// `build`, which also fixes the world type of callbacks written as `World<_>`.
+/// `build`, which also fixes the world type of systems written as `World<_>`.
 #[doc(hidden)]
 pub trait Fits<W> {
     const VALID: bool;
@@ -420,10 +501,6 @@ pub struct AppBuilder<C = (), L = Nil, K = Nil> {
     components: PhantomData<fn() -> C>,
 }
 
-/// The builder after installing hook `E` with systems `P`.
-type Hooked<C, L, K, E, P> =
-    AppBuilder<<Hook<E, P> as Install<C, L, K>>::Components, L, Cons<Hook<E, P>, K>>;
-
 impl<C: Storage, L, K> AppBuilder<C, L, K> {
     pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
         self.execution_mode = mode;
@@ -441,82 +518,40 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
             components: PhantomData,
         }
     }
-    /// A payload handler with exclusive world access. Annotate the world as
-    /// `world: &mut World<_>`; it is inferred at `build`.
-    #[allow(clippy::type_complexity)]
-    pub fn on<E: 'static, F>(self, callback: F) -> AppBuilder<C, Cons<On<E, Callback<F>>, L>, K> {
-        self.install(system(callback))
-    }
-    /// A zero-sized event type can serve as an open-ended schedule label.
-    /// Plans ignore the payload; use `on` when a system needs event data.
-    #[allow(clippy::type_complexity)]
-    pub fn add_systems<E: 'static, P: IntoSystems<M>, M>(
-        self,
-        _: E,
-        systems: P,
-    ) -> AppBuilder<
-        <<P::Systems as Shape>::Access as Uses<C>>::Out,
-        Cons<Scheduled<E, P::Systems>, L>,
-        K,
-    >
-    where
-        <P::Systems as Shape>::Access: Uses<C>,
-    {
-        self.install(On {
-            handler: Run(systems.into_systems()),
-            marker: PhantomData,
-        })
-    }
-    /// Hook systems run after `T` is added to entities that lacked it.
-    /// Hooks run inside structural operations, so they cannot be exclusive:
+    /// Register systems under label `E`. Each takes `E`'s input first (none for
+    /// plain labels, `&E` for payload labels, `Trigger` for lifecycle labels).
+    /// Plain and payload labels run on `emit`; lifecycle labels run inside the
+    /// world's structural operations, serially and without exclusive access:
     /// ```compile_fail
     /// use static_ecs::prelude::*;
     /// struct Tag;
-    /// App::new().on_add::<Tag, _, _>(exclusive(|_: &mut World<_>| {}));
+    /// App::new()
+    ///     .add_systems(OnAdd::<Tag>, exclusive(|_: Trigger, _: &mut World<_>| {}))
+    ///     .build();
     /// ```
-    pub fn on_add<T: 'static, P: IntoSystems<M>, M>(
+    /// A system that does not take the label's input fails to compile:
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct Damage(u32);
+    /// impl Schedule for Damage {
+    ///     type In = Ref<Self>;
+    /// }
+    /// App::new().add_systems(Damage, |_: Query<&u32>| {});
+    /// ```
+    #[allow(clippy::type_complexity)]
+    pub fn add_systems<E: Schedule, X: Label<E, LM>, LM, P: IntoSystems<E::In, M>, M>(
         self,
+        label: X,
         systems: P,
-    ) -> Hooked<C, L, K, OnAdd<T>, P::Systems>
+    ) -> AppBuilder<
+        <Placed<E, P::Systems> as Install<C, L, K>>::Components,
+        <Placed<E, P::Systems> as Install<C, L, K>>::Listeners,
+        <Placed<E, P::Systems> as Install<C, L, K>>::Hooks,
+    >
     where
-        Hook<OnAdd<T>, P::Systems>:
-            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnAdd<T>, P::Systems>, K>>,
+        Placed<E, P::Systems>: Install<C, L, K>,
     {
-        self.install(hook::on_add::<T, P, M>(systems))
-    }
-    /// Hook systems run after `T` is written, whether added or replaced.
-    pub fn on_insert<T: 'static, P: IntoSystems<M>, M>(
-        self,
-        systems: P,
-    ) -> Hooked<C, L, K, OnInsert<T>, P::Systems>
-    where
-        Hook<OnInsert<T>, P::Systems>:
-            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnInsert<T>, P::Systems>, K>>,
-    {
-        self.install(hook::on_insert::<T, P, M>(systems))
-    }
-    /// Hook systems run before an existing `T` is overwritten, removed, or
-    /// despawned, while the old value is still readable.
-    pub fn on_replace<T: 'static, P: IntoSystems<M>, M>(
-        self,
-        systems: P,
-    ) -> Hooked<C, L, K, OnReplace<T>, P::Systems>
-    where
-        Hook<OnReplace<T>, P::Systems>:
-            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnReplace<T>, P::Systems>, K>>,
-    {
-        self.install(hook::on_replace::<T, P, M>(systems))
-    }
-    /// Hook systems run before `T` is removed or its entity despawned.
-    pub fn on_remove<T: 'static, P: IntoSystems<M>, M>(
-        self,
-        systems: P,
-    ) -> Hooked<C, L, K, OnRemove<T>, P::Systems>
-    where
-        Hook<OnRemove<T>, P::Systems>:
-            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnRemove<T>, P::Systems>, K>>,
-    {
-        self.install(hook::on_remove::<T, P, M>(systems))
+        self.install(schedule(label, systems))
     }
     /// Install relation `R`: its components `Relates<R>`/`Sources<R>` and the
     /// hooks keeping them consistent. Name the world as `_`:
@@ -638,16 +673,22 @@ impl<S: Storage, L> App<S, L> {
     pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
         self.execution_mode = mode;
     }
-    /// Runs every handler registered for E, in registration order, then
-    /// applies their commands in the same order.
+    /// Runs every system registered under `E`, in registration order, handing
+    /// each `E`'s input, then applies their commands in the same order.
     #[inline]
-    pub fn emit<E: 'static>(&mut self, event: &E)
+    pub fn emit<E: Schedule>(&mut self, event: &E)
     where
+        E::In: FromEvent<E>,
         L: Dispatch<E, World<S>>,
     {
+        let input = <E::In as FromEvent<E>>::of(event);
+        let input = (&raw const input).cast();
+        // SAFETY: `input` is `E`'s input and outlives the frame.
         match self.execution_mode {
-            ExecutionMode::Parallel => self.listeners.emit(event, &mut self.world),
-            ExecutionMode::Serial => serially(|| self.listeners.dispatch(event, &mut self.world)),
+            ExecutionMode::Parallel => unsafe { self.listeners.emit(input, &mut self.world) },
+            ExecutionMode::Serial => {
+                serially(|| unsafe { self.listeners.dispatch(input, &mut self.world) })
+            }
         }
         self.listeners
             .defer(unsafe { &mut *<World<S> as SystemWorld>::queue(&mut self.world) });

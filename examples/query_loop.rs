@@ -9,6 +9,7 @@ use std::time::Instant;
 pub struct Position(f32);
 pub struct Velocity(f32);
 struct Update;
+impl Schedule for Update {}
 
 #[unsafe(no_mangle)]
 #[inline(never)]

@@ -1,5 +1,6 @@
 use static_ecs::{
-    App, Entity, Has, Query, Single, Sparse, With, Without, World, exclusive, system,
+    App, Entity, Has, Query, Ref, Schedule, Single, Sparse, With, Without, World, exclusive,
+    schedule,
 };
 use std::cell::RefCell;
 
@@ -9,7 +10,14 @@ mod first {
 mod second {
     pub struct Event(pub u32);
 }
+impl Schedule for first::Event {
+    type In = Ref<Self>;
+}
+impl Schedule for second::Event {
+    type In = Ref<Self>;
+}
 struct Unhandled;
+impl Schedule for Unhandled {}
 
 #[test]
 fn specialization_filters_types_preserving_order_and_captures() {
@@ -17,13 +25,17 @@ fn specialization_filters_types_preserving_order_and_captures() {
     let mut count = 0;
     let mut app = App::new()
         .install((
-            system(|e: &first::Event, _: &mut World<_>| {
+            schedule(first::Event, |e: &first::Event| {
                 count += 1;
                 log.borrow_mut().push(("first", e.0 * count));
             }),
             (
-                system(|e: &second::Event, _: &mut World<_>| log.borrow_mut().push(("other", e.0))),
-                system(|e: &first::Event, _: &mut World<_>| log.borrow_mut().push(("last", e.0))),
+                schedule(second::Event, |e: &second::Event| {
+                    log.borrow_mut().push(("other", e.0))
+                }),
+                schedule(first::Event, |e: &first::Event| {
+                    log.borrow_mut().push(("last", e.0))
+                }),
             ),
         ))
         .build();
@@ -47,14 +59,21 @@ fn specialization_filters_types_preserving_order_and_captures() {
 #[test]
 fn schedule_labels_and_event_payloads_select_only_matching_systems() {
     struct Update;
+    impl Schedule for Update {}
     struct Set(u32);
+    impl Schedule for Set {
+        type In = Ref<Self>;
+    }
     let mut app = App::new()
         .add_systems(Update, |mut n: Single<&mut u32>| **n += 1)
-        .on(|event: &Set, world: &mut World<_>| {
-            for mut n in &mut world.query::<&mut u32>() {
-                *n = event.0;
-            }
-        })
+        .add_systems(
+            Set,
+            exclusive(|event: &Set, world: &mut World<_>| {
+                for mut n in &mut world.query::<&mut u32>() {
+                    *n = event.0;
+                }
+            }),
+        )
         .add_systems(Update, |mut n: Single<&mut u32>| **n *= 2)
         .build();
     let entity = app.world.spawn_bundle((0_u32,));
@@ -86,6 +105,7 @@ struct Marker;
 #[test]
 fn the_world_stores_every_component_any_registration_uses_once() {
     struct Update;
+    impl Schedule for Update {}
     let mut app = App::new()
         .storage::<Sparse<Marker>>()
         // Queried by two systems, filtered by one, and inserted by a plugin.

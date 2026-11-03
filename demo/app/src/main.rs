@@ -1,6 +1,6 @@
 use demo_input::Click;
 use demo_networking::PacketReceived;
-use static_ecs::{App, World};
+use static_ecs::{App, Schedule};
 
 fn main() {
     let (mut analytics, mut clicks, mut bytes, mut local) = (0, 0, 0, 0);
@@ -8,13 +8,14 @@ fn main() {
         let mut app = App::new()
             .install(demo_analytics::plugin(&mut analytics))
             .install(demo_networking::plugin(&mut clicks, &mut bytes))
-            .on(|event: &Click, _: &mut World<_>| local += event.x)
+            .add_systems(Click, |click: &Click| local += click.0)
             .build();
 
-        app.emit(&Click { x: 3 });
-        app.emit(&PacketReceived { bytes: 128 });
-        app.emit(&Click { x: 3 });
+        app.emit(&Click(3));
+        app.emit(&PacketReceived(128));
+        app.emit(&Click(3));
         struct Unhandled;
+        impl Schedule for Unhandled {}
         app.emit(&Unhandled);
     }
     assert_eq!((analytics, clicks, bytes, local), (9, 2, 128, 6));
