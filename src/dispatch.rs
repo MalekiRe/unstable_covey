@@ -95,7 +95,7 @@ impl<E: Schedule, A, B, F: FnOnce(A, B) -> E> Label<E, fn(A, B)> for F {}
 impl<E: Schedule, A, B, C, F: FnOnce(A, B, C) -> E> Label<E, fn(A, B, C)> for F {}
 
 /// An installable registration, e.g. returned by a plugin:
-/// `.install(schedule(Click, count_clicks))` equals
+/// `.add_plugins(schedule(Click, count_clicks))` equals
 /// `.add_systems(Click, count_clicks)`.
 pub fn schedule<E, X, LM, P, M>(_: X, systems: P) -> Placed<E, P::Systems>
 where
@@ -423,24 +423,27 @@ impl<P: Shape> Handler for Run<P> {
     type Access = P::Access;
 }
 
-/// Type-transforming installation. Tuples install their left fragment first.
-/// `Components` is `C` extended with every component the fragment's systems
-/// use; handlers extend the listener list `L`, hooks the hook list `K`.
-pub trait Install<C, L, K> {
+/// Anything `add_plugins` accepts: a registration (`schedule(...)`,
+/// `relation()`), or a tuple of up to 12 plugins, nested freely, applied left
+/// to right. Each changes the builder's type: `Components` is `C` extended
+/// with every component its systems use; emitted systems extend the listener
+/// list `L`, hooks and relation registrations the hook list `K`.
+pub trait Plugins<C, L, K> {
     type Components: Storage;
     type Listeners;
     type Hooks;
-    fn install(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks);
+    #[doc(hidden)]
+    fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks);
 }
-impl<E: 'static, H: Handler<Access: Uses<C>>, C, L, K> Install<C, L, K> for On<E, H> {
+impl<E: 'static, H: Handler<Access: Uses<C>>, C, L, K> Plugins<C, L, K> for On<E, H> {
     type Components = <H::Access as Uses<C>>::Out;
     type Listeners = Cons<Self, L>;
     type Hooks = K;
-    fn install(self, listeners: L, hooks: K) -> (Self::Listeners, K) {
+    fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, K) {
         (Cons(self, listeners), hooks)
     }
 }
-impl<E, P, C, L, K> Install<C, L, K> for Hook<E, P>
+impl<E, P, C, L, K> Plugins<C, L, K> for Hook<E, P>
 where
     E: Event,
     P: Shape<Output = ()>,
@@ -450,31 +453,65 @@ where
     type Components = <P::Access as Uses<<C as Insert<Components<E::Component>>>::Out>>::Out;
     type Listeners = L;
     type Hooks = Cons<Self, K>;
-    fn install(self, listeners: L, hooks: K) -> (L, Self::Hooks) {
+    fn add_to(self, listeners: L, hooks: K) -> (L, Self::Hooks) {
         (listeners, Cons(self, hooks))
     }
 }
-impl<R: Relation, C: Insert<Components<PairOf<R>>>, L, K> Install<C, L, K> for Fragment<R> {
+impl<R: Relation, C: Insert<Components<PairOf<R>>>, L, K> Plugins<C, L, K> for Fragment<R> {
     type Components = <C as Insert<Components<PairOf<R>>>>::Out;
     type Listeners = L;
     type Hooks = Cons<Self, K>;
-    fn install(self, listeners: L, hooks: K) -> (L, Self::Hooks) {
+    fn add_to(self, listeners: L, hooks: K) -> (L, Self::Hooks) {
         (listeners, Cons(self, hooks))
     }
 }
-impl<C, L, K, A, B> Install<C, L, K> for (A, B)
+impl<C, L, K, A: Plugins<C, L, K>> Plugins<C, L, K> for (A,) {
+    type Components = A::Components;
+    type Listeners = A::Listeners;
+    type Hooks = A::Hooks;
+    fn add_to(self, listeners: L, hooks: K) -> (A::Listeners, A::Hooks) {
+        self.0.add_to(listeners, hooks)
+    }
+}
+impl<C, L, K, A, B> Plugins<C, L, K> for (A, B)
 where
-    A: Install<C, L, K>,
-    B: Install<A::Components, A::Listeners, A::Hooks>,
+    A: Plugins<C, L, K>,
+    B: Plugins<A::Components, A::Listeners, A::Hooks>,
 {
     type Components = B::Components;
     type Listeners = B::Listeners;
     type Hooks = B::Hooks;
-    fn install(self, listeners: L, hooks: K) -> (B::Listeners, B::Hooks) {
-        let (listeners, hooks) = self.0.install(listeners, hooks);
-        self.1.install(listeners, hooks)
+    fn add_to(self, listeners: L, hooks: K) -> (B::Listeners, B::Hooks) {
+        let (listeners, hooks) = self.0.add_to(listeners, hooks);
+        self.1.add_to(listeners, hooks)
     }
 }
+/// Longer tuples apply their head, then the rest as one tuple.
+macro_rules! plugin_tuples {
+    ($a:ident $($i:tt $t:ident)+) => {
+        impl<C, L, K, $a, $($t),+> Plugins<C, L, K> for ($a, $($t),+)
+        where
+            ($a, ($($t,)+)): Plugins<C, L, K>,
+        {
+            type Components = <($a, ($($t,)+)) as Plugins<C, L, K>>::Components;
+            type Listeners = <($a, ($($t,)+)) as Plugins<C, L, K>>::Listeners;
+            type Hooks = <($a, ($($t,)+)) as Plugins<C, L, K>>::Hooks;
+            fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks) {
+                (self.0, ($(self.$i,)+)).add_to(listeners, hooks)
+            }
+        }
+    };
+}
+plugin_tuples!(A 1 B 2 C2);
+plugin_tuples!(A 1 B 2 C2 3 D);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I 9 J);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I 9 J 10 K2);
+plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I 9 J 10 K2 11 L2);
 
 /// Every handler in a listener list runs against world `W`. Checked once at
 /// `build`, which also fixes the world type of systems written as `World<_>`.
@@ -506,11 +543,13 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         self.execution_mode = mode;
         self
     }
-    pub fn install<P: Install<C, L, K>>(
+    /// Add a plugin or a tuple of plugins (up to 12, nested freely), applied
+    /// left to right: `.add_plugins((physics::plugin(), net::plugin(&mut stats)))`.
+    pub fn add_plugins<P: Plugins<C, L, K>>(
         self,
-        plugin: P,
+        plugins: P,
     ) -> AppBuilder<P::Components, P::Listeners, P::Hooks> {
-        let (listeners, hooks) = plugin.install(self.listeners, self.hooks);
+        let (listeners, hooks) = plugins.add_to(self.listeners, self.hooks);
         AppBuilder {
             listeners,
             hooks,
@@ -544,14 +583,14 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         label: X,
         systems: P,
     ) -> AppBuilder<
-        <Placed<E, P::Systems> as Install<C, L, K>>::Components,
-        <Placed<E, P::Systems> as Install<C, L, K>>::Listeners,
-        <Placed<E, P::Systems> as Install<C, L, K>>::Hooks,
+        <Placed<E, P::Systems> as Plugins<C, L, K>>::Components,
+        <Placed<E, P::Systems> as Plugins<C, L, K>>::Listeners,
+        <Placed<E, P::Systems> as Plugins<C, L, K>>::Hooks,
     >
     where
-        Placed<E, P::Systems>: Install<C, L, K>,
+        Placed<E, P::Systems>: Plugins<C, L, K>,
     {
-        self.install(schedule(label, systems))
+        self.add_plugins(schedule(label, systems))
     }
     /// Install relation `R`: its components `Relates<R>`/`Sources<R>` and the
     /// hooks keeping them consistent. Name the world as `_`:
@@ -560,18 +599,18 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
     pub fn relation<R: Relation, S>(
         self,
     ) -> AppBuilder<
-        <RelationHooks<R, S> as Install<C, L, K>>::Components,
+        <RelationHooks<R, S> as Plugins<C, L, K>>::Components,
         L,
-        <RelationHooks<R, S> as Install<C, L, K>>::Hooks,
+        <RelationHooks<R, S> as Plugins<C, L, K>>::Hooks,
     >
     where
-        RelationHooks<R, S>: Install<C, L, K, Listeners = L>,
+        RelationHooks<R, S>: Plugins<C, L, K, Listeners = L>,
         S: Storage
             + ComponentLookup<Relates<R>>
             + ComponentLookup<Sources<R>>
             + ComponentLookup<PairOf<R>>,
     {
-        self.install(relation::relation::<R, S>())
+        self.add_plugins(relation::relation::<R, S>())
     }
     /// Store `T` even though no system queries it, e.g. a tag that is only
     /// inserted, or data read through `World` methods outside systems. Keeps

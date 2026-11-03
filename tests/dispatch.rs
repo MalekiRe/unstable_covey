@@ -24,7 +24,7 @@ fn specialization_filters_types_preserving_order_and_captures() {
     let log = RefCell::new(Vec::new());
     let mut count = 0;
     let mut app = App::new()
-        .install((
+        .add_plugins((
             schedule(first::Event, |e: &first::Event| {
                 count += 1;
                 log.borrow_mut().push(("first", e.0 * count));
@@ -135,4 +135,29 @@ fn the_world_stores_every_component_any_registration_uses_once() {
     // Sparse membership leaves the dense u64 row in place.
     assert!(app.world.remove::<Marker>(b).is_some());
     assert_eq!(app.world.get::<u64>(b), Some(&21));
+}
+
+#[test]
+fn plugin_tuples_of_any_shape_apply_left_to_right() {
+    struct Tick;
+    impl Schedule for Tick {}
+    let log = RefCell::new(Vec::new());
+    let push = |name: &'static str| {
+        let log = &log;
+        schedule(Tick, move || log.borrow_mut().push(name))
+    };
+    let mut app = App::new()
+        .add_plugins(push("single"))
+        .add_plugins((
+            push("a"),
+            push("b"),
+            (push("c"), (push("d"),)),
+            push("e"),
+            push("f"),
+            push("g"),
+        ))
+        .build();
+    app.emit(&Tick);
+    drop(app);
+    assert_eq!(*log.borrow(), ["single", "a", "b", "c", "d", "e", "f", "g"]);
 }

@@ -26,8 +26,8 @@ mod vocab;
 pub use change::{Mut, MutSlice};
 pub use command::Commands;
 pub use dispatch::{
-    App, AppBuilder, Cons, Dispatch, Handle, Install, Label, Listener, MaybeHandle, Nil, On,
-    Placed, Run, Schedule, Scheduled, schedule,
+    App, AppBuilder, Cons, Dispatch, Handle, Label, Listener, MaybeHandle, Nil, On, Placed,
+    Plugins, Run, Schedule, Scheduled, schedule,
 };
 pub use executor::WorkerPool;
 pub use filter::{Added, Changed, Or, Related, With, Without};

@@ -101,7 +101,7 @@ fn analytics(total: &mut u32) -> Listener<Click, impl FnMut(&Click) + '_> {
 
 let mut total = 0;
 {
-    let mut app = App::new().install(analytics(&mut total)).build();
+    let mut app = App::new().add_plugins(analytics(&mut total)).build();
     app.emit(&Click(3));
     app.emit(&Click(3));
 }
@@ -109,8 +109,9 @@ assert_eq!(total, 9);
 ```
 
 `Listener<E, F>` names a world-free system under payload label `E`; systems
-with parameters are `Scheduled<E, P>`. `install` consumes the builder and
-returns a new type; nested tuples install left to right. The `demo/` crates
+with parameters are `Scheduled<E, P>`. `add_plugins` takes one plugin or a
+tuple of up to 12 (nested freely), applied left to right; it consumes the
+builder and returns a new type. The `demo/` crates
 compose two independent plugin crates.
 `.build()` creates the world and checks every system against it.
 

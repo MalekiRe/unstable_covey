@@ -6,8 +6,10 @@ fn main() {
     let (mut analytics, mut clicks, mut bytes, mut local) = (0, 0, 0, 0);
     {
         let mut app = App::new()
-            .install(demo_analytics::plugin(&mut analytics))
-            .install(demo_networking::plugin(&mut clicks, &mut bytes))
+            .add_plugins((
+                demo_analytics::plugin(&mut analytics),
+                demo_networking::plugin(&mut clicks, &mut bytes),
+            ))
             .add_systems(Click, |click: &Click| local += click.0)
             .build();
 
