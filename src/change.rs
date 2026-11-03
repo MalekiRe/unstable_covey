@@ -119,6 +119,13 @@ pub trait SystemWorld {
     /// # Safety
     /// The pointer is live and no system holds the world.
     unsafe fn set_clock(world: *mut Self, latest: u64);
+    /// Where systems move their deferred commands.
+    type Queue;
+    /// # Safety
+    /// The pointer is live; the result borrows only the queue field.
+    unsafe fn queue(world: *mut Self) -> *mut Self::Queue;
+    /// Apply every queued command.
+    fn flush(&mut self);
 }
 impl SystemWorld for () {
     unsafe fn world_id(_: *mut Self) -> u64 {
@@ -128,4 +135,9 @@ impl SystemWorld for () {
         0
     }
     unsafe fn set_clock(_: *mut Self, _: u64) {}
+    type Queue = ();
+    unsafe fn queue(_: *mut Self) -> *mut () {
+        std::ptr::NonNull::dangling().as_ptr()
+    }
+    fn flush(&mut self) {}
 }

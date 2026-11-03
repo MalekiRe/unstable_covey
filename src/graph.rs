@@ -1,5 +1,6 @@
 //! Labels and access descriptions are compiled into constants. Execution follows
 //! concrete Rust continuations; only potential cross-worker joins have state.
+use crate::change::SystemWorld;
 use crate::{
     access::{Access, Conflict, Same},
     executor::{self, Context, Continue, Fields, First, Flow, Inner, Join, Project, Second},
@@ -530,8 +531,10 @@ pub trait Nodes<S>: NodeList {
         world: *mut S,
         clock: &mut u64,
     ) -> bool;
-    /// Apply every node's deferred work, in declaration order.
-    fn apply(&mut self, world: &mut S);
+    /// Move every node's deferred work to the queue, in declaration order.
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld;
 }
 impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     const VALID: bool = F::VALID;
@@ -630,8 +633,11 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     ) -> bool {
         unsafe { G::Nodes::serial::<G, Zero, Stage>(nodes, world, clock) }
     }
-    fn apply(&mut self, world: &mut S) {
-        self.system.apply_deferred(world);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.system.defer(queue);
     }
 }
 impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
@@ -714,9 +720,12 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
                 | B::ordered::<G, Offset<Stage, A>>(nodes, world, clock)
         }
     }
-    fn apply(&mut self, world: &mut S) {
-        self.0.apply(world);
-        self.1.apply(world);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.0.defer(queue);
+        self.1.defer(queue);
     }
 }
 
@@ -798,7 +807,10 @@ impl<S: Send + Sync, N: Nodes<S> + BuildRows<N> + Send> System<S> for ReadyGraph
         }
         unsafe { plan::invocation(self, world, clock) }
     }
-    fn apply_deferred(&mut self, world: &mut S) {
-        self.nodes.apply(world);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.nodes.defer(queue);
     }
 }

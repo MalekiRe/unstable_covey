@@ -1,6 +1,8 @@
 use crate::{
     change::{Mut, SystemWorld},
     column::{Column, Info, Store, Summary},
+    command::CommandQueue,
+    hook::{Add, Event, HookList, HookTable, Insert, Kind, Remove, Replace},
     lookup::ComponentLookup,
 };
 use std::{
@@ -17,6 +19,28 @@ pub struct Entity {
     world: u64,
     slot: u32,
     generation: u32,
+}
+/// Reserves entities from a frame without structural access.
+pub(crate) struct Reserve<'a> {
+    world: u64,
+    base: usize,
+    next: &'a AtomicU32,
+}
+impl Reserve<'_> {
+    /// A fresh slot beyond every live one; it becomes an entity when a spawn
+    /// command places it. No free-list reuse, so reservations never race.
+    pub(crate) fn entity(&self) -> Entity {
+        let next = self.next.fetch_add(1, Ordering::Relaxed);
+        let slot = u32::try_from(self.base)
+            .ok()
+            .and_then(|base| base.checked_add(next))
+            .expect("entity slots exhausted");
+        Entity {
+            world: self.world,
+            slot,
+            generation: 0,
+        }
+    }
 }
 /// Declares a dense component; SUMMARY opts into conservative column summaries.
 pub struct Components<T, const SUMMARY: bool = false>(PhantomData<T>);
@@ -290,7 +314,21 @@ pub struct World<S: Storage> {
     clock: u64,
     /// Fresh slots handed out by `Commands` during a frame, beyond `locations`.
     reserved: AtomicU32,
+    /// Commands from hooks and finished systems, applied by `flush`.
+    queue: CommandQueue<S>,
+    flushing: bool,
+    /// The entities the running hook fired for.
+    trigger: Fired,
+    hooks: Option<HookTable<S>>,
     schema: PhantomData<S>,
+}
+/// A hook's entity slice; only read while that hook runs.
+#[derive(Clone, Copy)]
+struct Fired(*const Entity, usize);
+unsafe impl Send for Fired {}
+unsafe impl Sync for Fired {}
+impl Fired {
+    const NONE: Self = Self(NonNull::dangling().as_ptr(), 0);
 }
 impl<S: Storage> Default for World<S> {
     fn default() -> Self {
@@ -318,10 +356,113 @@ impl<S: Storage> World<S> {
             bundles: Transitions::default(),
             clock: 0,
             reserved: AtomicU32::new(0),
+            queue: CommandQueue::default(),
+            flushing: false,
+            trigger: Fired::NONE,
+            hooks: None,
             schema: PhantomData,
         };
         world.add_table(vec![false; S::LEN]);
         world
+    }
+    /// Install an app's hooks; a world with hooks owns and runs them.
+    pub(crate) fn set_hooks<H: HookList<S> + Send + Sync + 'static>(&mut self, hooks: H) {
+        self.hooks = Some(HookTable::new(hooks));
+    }
+    /// The running hook's entities; empty outside hooks.
+    /// # Safety
+    /// The pointer is live; reads only the trigger field.
+    pub(crate) unsafe fn trigger<'a>(world: *mut Self) -> &'a [Entity] {
+        unsafe {
+            let Fired(entities, len) = (*world).trigger;
+            std::slice::from_raw_parts(entities, len)
+        }
+    }
+    /// Run the hooks for event `E` on `entities`: one indirect call when any
+    /// hook listens, nothing otherwise.
+    #[inline]
+    fn fire<E: Event>(&mut self, entities: &[Entity])
+    where
+        S: ComponentLookup<E::Component>,
+    {
+        let Some(hooks) = &self.hooks else {
+            return;
+        };
+        let index = <S as ComponentLookup<E::Component>>::INDEX;
+        if let Some((entry, list)) = hooks.entry(index, <E::Kind as Kind>::INDEX) {
+            let world: *mut Self = self;
+            unsafe { Self::firing(world, entities, || entry(list, world)) };
+        }
+    }
+    /// Run kind `K` hooks for every hooked component the entity's table has,
+    /// in component order.
+    fn fire_present<K: Kind>(&mut self, entity: Entity, table: usize) {
+        let Some(hooks) = &self.hooks else {
+            return;
+        };
+        // Hooks never change structure, tables, or the hook table itself.
+        let hooked: *const [usize] = hooks.hooked();
+        let world: *mut Self = self;
+        unsafe {
+            for &index in &*hooked {
+                let tables = &(*world).tables;
+                if !tables[table].present[index] {
+                    continue;
+                }
+                let hooks = (*world).hooks.as_ref().unwrap_unchecked();
+                if let Some((entry, list)) = hooks.entry(index, K::INDEX) {
+                    Self::firing(world, &[entity], || entry(list, world));
+                }
+            }
+        }
+    }
+    /// Expose `entities` as the trigger while hooks run, even if one unwinds.
+    /// # Safety
+    /// Every world access during `run` goes through `world`.
+    unsafe fn firing(world: *mut Self, entities: &[Entity], run: impl FnOnce()) {
+        struct Reset(*mut Fired);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                unsafe { *self.0 = Fired::NONE };
+            }
+        }
+        unsafe {
+            let trigger = &raw mut (*world).trigger;
+            *trigger = Fired(entities.as_ptr(), entities.len());
+            let _reset = Reset(trigger);
+            run();
+        }
+    }
+    /// Apply queued commands until none remain, breadth first: commands
+    /// queued while applying (by hooks) run after the current batch. Nested
+    /// calls from those commands return at once.
+    pub fn flush(&mut self) {
+        if self.flushing {
+            return;
+        }
+        struct Flushing<'a, S: Storage>(&'a mut World<S>);
+        impl<S: Storage> Drop for Flushing<'_, S> {
+            fn drop(&mut self) {
+                self.0.flushing = false;
+            }
+        }
+        self.flushing = true;
+        let world = Flushing(self);
+        while !world.0.queue.is_empty() {
+            let mut queue = std::mem::take(&mut world.0.queue);
+            queue.apply(world.0);
+            if world.0.queue.is_empty() {
+                // Keep the allocation.
+                world.0.queue = queue;
+            }
+        }
+    }
+    /// After a structural operation: apply what its hooks queued.
+    #[inline]
+    fn settle(&mut self) {
+        if self.hooks.is_some() {
+            self.flush();
+        }
     }
     fn add_table(&mut self, present: Vec<bool>) -> usize {
         let components: Vec<_> = present
@@ -437,18 +578,17 @@ impl<S: Storage> World<S> {
             }
         }
     }
-    /// Reserve an entity without structural access; it becomes live when a
-    /// spawn command places it. Fresh slots only: no free-list race.
-    pub(crate) fn reserve_entity(&self) -> Entity {
-        let next = self.reserved.fetch_add(1, Ordering::Relaxed);
-        let slot = u32::try_from(self.locations.len())
-            .ok()
-            .and_then(|base| base.checked_add(next))
-            .expect("entity slots exhausted");
-        Entity {
-            world: self.id,
-            slot,
-            generation: 0,
+    /// A handle reserving entities without structural access, reading only the
+    /// fields it needs: running hooks own other parts of the world meanwhile.
+    /// # Safety
+    /// The world is live for 'a and no structural change happens meanwhile.
+    pub(crate) unsafe fn reserve<'a>(world: *mut Self) -> Reserve<'a> {
+        unsafe {
+            Reserve {
+                world: (*world).id,
+                base: (*world).locations.len(),
+                next: &(*world).reserved,
+            }
         }
     }
     /// Materialize reserved slots, unplaced, before any other allocation.
@@ -564,7 +704,9 @@ impl<S: Storage> World<S> {
         let table = self.destination::<B>(0, true);
         let tick = self.change_tick();
         self.reserve_slots(1);
-        self.spawn_at(table, bundle, tick)
+        let entity = self.spawn_at(table, bundle, tick);
+        self.added::<B>(&[entity]);
+        entity
     }
     /// Place a bundle at an entity reserved by `Commands`.
     pub(crate) fn spawn_reserved<B: Bundle<S>>(&mut self, entity: Entity, bundle: B) {
@@ -575,6 +717,14 @@ impl<S: Storage> World<S> {
         let table = self.destination::<B>(0, true);
         let tick = self.change_tick();
         self.place(entity, table, bundle, tick);
+        self.added::<B>(&[entity]);
+    }
+    /// Hooks for freshly spawned entities, once per batch.
+    #[inline]
+    fn added<B: Bundle<S>>(&mut self, entities: &[Entity]) {
+        B::fire::<Add>(self, entities, B::ALL);
+        B::fire::<Insert>(self, entities, B::ALL);
+        self.settle();
     }
     /// One destination, reservation, and timestamp per batch. A panicking iterator
     /// leaves its completed prefix live; unknown-length iterators grow amortized.
@@ -598,6 +748,7 @@ impl<S: Storage> World<S> {
         for bundle in bundles {
             entities.push(self.spawn_at(table, bundle, tick));
         }
+        self.added::<I::Item>(&entities);
         entities
     }
     fn spawn_at<B: Bundle<S>>(&mut self, table: usize, bundle: B, tick: u64) -> Entity {
@@ -735,6 +886,9 @@ impl<S: Storage> World<S> {
         let location = self
             .location(entity)
             .expect("entity is dead or belongs to another world");
+        // Replace hooks see old values; hooks never move entities.
+        let before = B::mask(&self.tables[location.table].present);
+        B::fire::<Replace>(self, &[entity], before);
         let destination = self.destination::<B>(location.table, true);
         let tick = self.change_tick();
         let row = self.prepare_move(location, destination);
@@ -748,6 +902,9 @@ impl<S: Storage> World<S> {
             )
         };
         self.transfer(location, destination);
+        B::fire::<Add>(self, &[entity], B::ALL & !before);
+        B::fire::<Insert>(self, &[entity], B::ALL);
+        self.settle();
         replaced
     }
     /// Remove all present members with one transition; absent members return None.
@@ -756,10 +913,14 @@ impl<S: Storage> World<S> {
         let Some(location) = self.location(entity) else {
             return B::Replaced::default();
         };
+        let present = B::mask(&self.tables[location.table].present);
+        B::fire::<Replace>(self, &[entity], present);
+        B::fire::<Remove>(self, &[entity], present);
         let destination = self.destination::<B>(location.table, false);
         self.prepare_move(location, destination);
         let removed = unsafe { B::take(&self.tables[location.table], location.row) };
         self.transfer(location, destination);
+        self.settle();
         removed
     }
     pub fn insert<T: 'static>(&mut self, entity: Entity, value: T) -> Option<T>
@@ -820,6 +981,8 @@ impl<S: Storage> World<S> {
         let Some(location) = self.location(entity) else {
             return false;
         };
+        self.fire_present::<Replace>(entity, location.table);
+        self.fire_present::<Remove>(entity, location.table);
         let dense = self.archetypes[location.table].dense;
         let physical = self.physical_row(location);
         unsafe { self.dense[dense].prepare_drop(physical) };
@@ -854,6 +1017,7 @@ impl<S: Storage> World<S> {
         let finish = S::HAS_SPARSE.then(|| Finish(sparse, sparse.entities.len()));
         unsafe { self.dense[dense].drop_row(self.dense[dense].entities.len()) };
         drop(finish);
+        self.settle();
         true
     }
     /// Issue the next change tick under exclusive access.
@@ -874,6 +1038,13 @@ impl<S: Storage> SystemWorld for World<S> {
     }
     unsafe fn set_clock(world: *mut Self, latest: u64) {
         unsafe { (*world).clock = latest }
+    }
+    type Queue = CommandQueue<S>;
+    unsafe fn queue(world: *mut Self) -> *mut CommandQueue<S> {
+        unsafe { &raw mut (*world).queue }
+    }
+    fn flush(&mut self) {
+        World::flush(self);
     }
 }
 mod bundle_sealed {
@@ -902,6 +1073,15 @@ pub trait Bundle<S: Storage>: bundle_sealed::Sealed + 'static {
     /// # Safety
     /// Present columns are live and removed values will not be dropped again.
     unsafe fn take(table: &Table, row: usize) -> Self::Replaced;
+    /// One bit per member.
+    #[doc(hidden)]
+    const ALL: u8;
+    /// The members `present` marks.
+    #[doc(hidden)]
+    fn mask(present: &[bool]) -> u8;
+    /// Fire kind `K` hooks for the members in `members`, in member order.
+    #[doc(hidden)]
+    fn fire<K: Kind>(world: &mut World<S>, entities: &[Entity], members: u8);
 }
 macro_rules! bundle {
     ($($t:ident:$i:tt),+) => {
@@ -913,6 +1093,14 @@ macro_rules! bundle {
                 let mut i = 0; while i < indices.len() { let mut j = i + 1; while j < indices.len() { valid = valid && indices[i] != indices[j]; j += 1; } i += 1; } valid
             };
             type Replaced = ($(Option<$t>,)+);
+            const ALL: u8 = 0 $(| 1 << $i)+;
+            fn mask(present: &[bool]) -> u8 {
+                0 $(| (present[<S as ComponentLookup<$t>>::INDEX] as u8) << $i)+
+            }
+            #[inline]
+            fn fire<K: Kind>(world: &mut World<S>, entities: &[Entity], members: u8) {
+                $(if members & 1 << $i != 0 { world.fire::<<K as Kind>::Of<$t>>(entities); })+
+            }
             unsafe fn write(self, table: &Table, row: usize, tick: u64) { $(unsafe {
                 let column = table.columns[<S as ComponentLookup<$t>>::INDEX]; column.value::<$t>(row).write(self.$i); column.mark(row, tick, true);
             })+ }

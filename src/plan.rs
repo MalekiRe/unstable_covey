@@ -55,9 +55,14 @@ pub trait System<S>: Shape {
     /// VALID must hold; world must be live and its declared access must not
     /// conflict with any other active borrow. State and captures are exclusive.
     unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<Self::Output>;
-    /// Apply deferred work (commands) recorded by the last runs, in system order.
+    /// Move deferred work (commands) recorded by the last runs to the world's
+    /// queue, in system order.
     #[doc(hidden)]
-    fn apply_deferred(&mut self, _world: &mut S) {}
+    fn defer(&mut self, _queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+    }
 
     /// Run once against an exclusive world, then apply its commands.
     #[inline]
@@ -66,7 +71,8 @@ pub trait System<S>: Shape {
         S: SystemWorld,
     {
         let output = run_now(self, world);
-        self.apply_deferred(world);
+        self.defer(unsafe { &mut *S::queue(world) });
+        world.flush();
         output
     }
     /// Run every nested group directly on this thread.
@@ -196,8 +202,8 @@ macro_rules! function {
                 *clock = window.now;
                 Some(result)
             }
-            fn apply_deferred(&mut self, _world: &mut S) {
-                $($p::apply(&mut self.local.$i, _world);)*
+            fn defer(&mut self, _queue: &mut S::Queue) {
+                $($p::defer(&mut self.local.$i, _queue);)*
             }
         }
     };
@@ -274,9 +280,12 @@ impl<S, A: System<S, Output = ()>, B: System<S, Output = ()>> System<S> for Sequ
         let right = unsafe { self.1.run_unchecked(world, clock) };
         left.or(right)
     }
-    fn apply_deferred(&mut self, world: &mut S) {
-        self.0.apply_deferred(world);
-        self.1.apply_deferred(world);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.0.defer(queue);
+        self.1.defer(queue);
     }
 }
 
@@ -360,9 +369,12 @@ where
         let right = unsafe { self.1.run_unchecked(world, clock) };
         left.or(right)
     }
-    fn apply_deferred(&mut self, world: &mut S) {
-        self.0.apply_deferred(world);
-        self.1.apply_deferred(world);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.0.defer(queue);
+        self.1.defer(queue);
     }
 }
 
@@ -406,9 +418,12 @@ impl<S, P: System<S, Output = ()>, C: System<S, Output = bool>> System<S> for Co
             None
         }
     }
-    fn apply_deferred(&mut self, world: &mut S) {
-        self.1.apply_deferred(world);
-        self.0.apply_deferred(world);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.1.defer(queue);
+        self.0.defer(queue);
     }
 }
 

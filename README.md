@@ -199,6 +199,41 @@ order (`System::run` applies right after the run). Commands on entities
 despawned before they apply do nothing. Like `World<_>`, the parameter names the
 world, so components only ever inserted through commands must be registered.
 
+### Hooks
+
+Hooks are ordinary systems registered for a component's lifecycle event:
+
+```rust
+use static_ecs::prelude::*;
+struct Health(u32);
+struct Alive;
+
+let mut app = App::new()
+    .on_add::<Health, _, _>(|added: Trigger, mut commands: Commands<_>| {
+        for &entity in added.iter() {
+            commands.insert(entity, (Alive,));
+        }
+    })
+    .register::<Alive>()
+    .build();
+let entity = app.world.spawn_bundle((Health(10),));
+assert!(app.world.get::<Alive>(entity).is_some()); // applied before spawn returned
+```
+
+- `on_add` (newly added), `on_insert` (any write), `on_replace` (before an
+  existing value is overwritten, removed, or despawned), `on_remove` (before
+  removal or despawn). Several hooks for one event run in registration order;
+  plugins install them with the `on_add`/... functions.
+- `Trigger` holds the affected entities: one per call, all of a `spawn_batch`.
+- Hooks run serially inside the structural operation, so they take system
+  parameters only (`Query`, `Single`, `Local`, `Commands`); exclusive hooks fail
+  to compile. Their commands apply, breadth first, before the outermost
+  structural operation returns.
+- The built world owns its hooks, which must be `Send + Sync + 'static`. Each
+  (component, event) with hooks compiles to one function running all of them;
+  an operation reaches it through one table lookup and indirect call. Worlds
+  without hooks skip the table entirely.
+
 ## Execution model
 
 A frame is one compiled program:
@@ -243,7 +278,7 @@ debug = "line-tables-only" # keeps file:line backtraces
 Limits: very long continuation chains may need a higher `#![recursion_limit]` in
 the crate that builds the app. Graph compile time grows quadratically with nodes
 per graph. Parallel groups need `Send` systems and `Send + Sync` world data.
-Missing Bevy features include hooks, observers, relations, states, resources as
-a separate store, and runtime system registration.
+Missing Bevy features include observers, relations, states, resources as a
+separate store, and runtime system registration.
 
 Benchmarks against Bevy 0.20 are in [BENCHMARKS.md](BENCHMARKS.md).

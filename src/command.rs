@@ -4,6 +4,7 @@
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, size_of};
 
+use crate::storage::Reserve;
 use crate::{Bundle, Entity, Storage, World};
 
 /// Applies (or, without a world, drops) the command at `value`.
@@ -56,6 +57,14 @@ impl<S: Storage> CommandQueue<S> {
             self.bytes.set_len(start + len);
         }
     }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+    /// Move every command of `other` to the end of this queue. Records are
+    /// position-independent, so moving their bytes moves the commands.
+    pub(crate) fn append(&mut self, other: &mut Self) {
+        self.bytes.append(&mut other.bytes);
+    }
     /// Apply every command in order. A panicking command drops the rest.
     pub(crate) fn apply(&mut self, world: &mut World<S>) {
         self.drain(Some(world));
@@ -106,16 +115,17 @@ impl<S: Storage> Drop for CommandQueue<S> {
 }
 
 /// Structural changes recorded during a system and applied when the `emit`
-/// that ran it finishes (or right after `System::run`), in system order.
+/// that ran it finishes (or right after `System::run`), in system order. In a
+/// hook, they apply before the structural operation that fired it returns.
 /// Commands on entities despawned before they apply do nothing.
 pub struct Commands<'a, S: Storage> {
     pub(crate) queue: &'a mut CommandQueue<S>,
-    pub(crate) world: &'a World<S>,
+    pub(crate) reserve: Reserve<'a>,
 }
 impl<S: Storage> Commands<'_, S> {
     /// Spawn a bundle. The entity is reserved now and live once applied.
     pub fn spawn<B: Bundle<S> + Send + 'static>(&mut self, bundle: B) -> Entity {
-        let entity = self.world.reserve_entity();
+        let entity = self.reserve.entity();
         self.queue
             .push(move |world: &mut World<S>| world.spawn_reserved(entity, bundle));
         entity

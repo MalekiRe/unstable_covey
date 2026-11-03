@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use crate::change::SystemWorld;
 use crate::executor::{self, Context, Continue, Done, Fields, First, Flow, Inner, Project, Root};
 use crate::executor::{Second, Tail, Within, serially};
+use crate::hook::{self, Event, Hook, HookList, OnAdd, OnInsert, OnRemove, OnReplace};
 use crate::lookup::ComponentLookup;
 use crate::plan::{ExecutionMode, Shape, run_now};
 use crate::vocab::{Declaration, Insert, Uses};
@@ -27,9 +28,13 @@ pub trait Handle<E, S> {
     #[doc(hidden)]
     const VALID: bool = true;
     fn handle(&mut self, event: &E, state: &mut S);
-    /// Apply commands recorded by `handle`/`enter`, after the frame.
+    /// Move commands recorded by `handle`/`enter` to the world's queue.
     #[doc(hidden)]
-    fn apply_deferred(&mut self, _state: &mut S) {}
+    fn defer(&mut self, _queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+    }
     /// Handle within a frame invocation, then continue with K. The handler has
     /// exclusive world access, so the world clock follows this path meanwhile.
     /// # Safety
@@ -103,8 +108,8 @@ impl<E, S: SystemWorld, P: System<S, Output = ()>> Handle<E, S> for Run<P> {
     fn handle(&mut self, _: &E, state: &mut S) {
         let _ = run_now(&mut self.0, state);
     }
-    fn apply_deferred(&mut self, state: &mut S) {
-        self.0.apply_deferred(state);
+    fn defer(&mut self, queue: &mut S::Queue) {
+        self.0.defer(queue);
     }
     #[inline(always)]
     unsafe fn enter<R: Send, Path: Project<R, Target = Self>, K: Continue<S, R>>(
@@ -128,7 +133,9 @@ pub trait MaybeHandle<E: 'static, S> {
     const WEIGHT: usize;
     fn maybe_handle(&mut self, event: &E, state: &mut S);
     #[doc(hidden)]
-    fn maybe_apply(&mut self, state: &mut S);
+    fn maybe_defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld;
     /// # Safety
     /// As `Handle::enter`.
     #[doc(hidden)]
@@ -147,7 +154,11 @@ impl<E: 'static, S, H> MaybeHandle<E, S> for H {
     #[inline]
     default fn maybe_handle(&mut self, _: &E, _: &mut S) {}
     #[inline]
-    default fn maybe_apply(&mut self, _: &mut S) {}
+    default fn maybe_defer(&mut self, _: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+    }
     #[inline(always)]
     default unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
@@ -168,8 +179,11 @@ impl<E: 'static, S, H: Handle<E, S>> MaybeHandle<E, S> for On<E, H> {
         self.handler.handle(event, state);
     }
     #[inline]
-    fn maybe_apply(&mut self, state: &mut S) {
-        self.handler.apply_deferred(state);
+    fn maybe_defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.handler.defer(queue);
     }
     #[inline(always)]
     unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
@@ -191,9 +205,11 @@ pub trait Dispatch<E: 'static, S> {
     #[doc(hidden)]
     const WEIGHT: usize = 0;
     fn dispatch(&mut self, event: &E, state: &mut S);
-    /// Apply the matching handlers' commands, in registration order.
+    /// Move the matching handlers' commands to the queue, in registration order.
     #[doc(hidden)]
-    fn apply(&mut self, state: &mut S);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld;
     /// # Safety
     /// As `Handle::enter`.
     #[doc(hidden)]
@@ -209,7 +225,11 @@ impl<E: 'static, S> Dispatch<E, S> for Nil {
     #[inline]
     fn dispatch(&mut self, _: &E, _: &mut S) {}
     #[inline]
-    fn apply(&mut self, _: &mut S) {}
+    fn defer(&mut self, _: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+    }
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
@@ -246,9 +266,12 @@ impl<E: 'static, S, H: MaybeHandle<E, S>, T: Dispatch<E, S>> Dispatch<E, S> for 
         self.0.maybe_handle(event, state);
     }
     #[inline]
-    fn apply(&mut self, state: &mut S) {
-        self.1.apply(state);
-        self.0.maybe_apply(state);
+    fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        self.1.defer(queue);
+        self.0.maybe_defer(queue);
     }
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
@@ -319,24 +342,47 @@ impl<P: Shape> Handler for Run<P> {
 }
 
 /// Type-transforming installation. Tuples install their left fragment first.
-/// `Components` is `C` extended with every component the fragment's systems use.
-pub trait Install<C, L> {
+/// `Components` is `C` extended with every component the fragment's systems
+/// use; handlers extend the listener list `L`, hooks the hook list `K`.
+pub trait Install<C, L, K> {
     type Components: Storage;
-    type Output;
-    fn install(self, listeners: L) -> Self::Output;
+    type Listeners;
+    type Hooks;
+    fn install(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks);
 }
-impl<E: 'static, H: Handler<Access: Uses<C>>, C, L> Install<C, L> for On<E, H> {
+impl<E: 'static, H: Handler<Access: Uses<C>>, C, L, K> Install<C, L, K> for On<E, H> {
     type Components = <H::Access as Uses<C>>::Out;
-    type Output = Cons<Self, L>;
-    fn install(self, listeners: L) -> Self::Output {
-        Cons(self, listeners)
+    type Listeners = Cons<Self, L>;
+    type Hooks = K;
+    fn install(self, listeners: L, hooks: K) -> (Self::Listeners, K) {
+        (Cons(self, listeners), hooks)
     }
 }
-impl<C, L, A: Install<C, L>, B: Install<A::Components, A::Output>> Install<C, L> for (A, B) {
+impl<E, P, C, L, K> Install<C, L, K> for Hook<E, P>
+where
+    E: Event,
+    P: Shape<Output = ()>,
+    C: Insert<Components<E::Component>>,
+    P::Access: Uses<<C as Insert<Components<E::Component>>>::Out>,
+{
+    type Components = <P::Access as Uses<<C as Insert<Components<E::Component>>>::Out>>::Out;
+    type Listeners = L;
+    type Hooks = Cons<Self, K>;
+    fn install(self, listeners: L, hooks: K) -> (L, Self::Hooks) {
+        (listeners, Cons(self, hooks))
+    }
+}
+impl<C, L, K, A, B> Install<C, L, K> for (A, B)
+where
+    A: Install<C, L, K>,
+    B: Install<A::Components, A::Listeners, A::Hooks>,
+{
     type Components = B::Components;
-    type Output = B::Output;
-    fn install(self, listeners: L) -> Self::Output {
-        self.1.install(self.0.install(listeners))
+    type Listeners = B::Listeners;
+    type Hooks = B::Hooks;
+    fn install(self, listeners: L, hooks: K) -> (B::Listeners, B::Hooks) {
+        let (listeners, hooks) = self.0.install(listeners, hooks);
+        self.1.install(listeners, hooks)
     }
 }
 
@@ -356,29 +402,40 @@ impl<W, E: 'static, H: Handle<E, W>> Fits<W> for On<E, H> {
     const VALID: bool = H::VALID;
 }
 
-/// Composes plugins and systems; `build` creates a world storing exactly the
-/// components they use. `C` is that inferred component set.
-pub struct AppBuilder<C = (), L = Nil> {
+/// Composes plugins, systems, and hooks; `build` creates a world storing
+/// exactly the components they use. `C` is that inferred component set.
+pub struct AppBuilder<C = (), L = Nil, K = Nil> {
     listeners: L,
+    hooks: K,
     execution_mode: ExecutionMode,
     components: PhantomData<fn() -> C>,
 }
 
-impl<C: Storage, L> AppBuilder<C, L> {
+/// The builder after installing hook `E` with systems `P`.
+type Hooked<C, L, K, E, P> =
+    AppBuilder<<Hook<E, P> as Install<C, L, K>>::Components, L, Cons<Hook<E, P>, K>>;
+
+impl<C: Storage, L, K> AppBuilder<C, L, K> {
     pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
         self.execution_mode = mode;
         self
     }
-    pub fn install<P: Install<C, L>>(self, plugin: P) -> AppBuilder<P::Components, P::Output> {
+    pub fn install<P: Install<C, L, K>>(
+        self,
+        plugin: P,
+    ) -> AppBuilder<P::Components, P::Listeners, P::Hooks> {
+        let (listeners, hooks) = plugin.install(self.listeners, self.hooks);
         AppBuilder {
-            listeners: plugin.install(self.listeners),
+            listeners,
+            hooks,
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
     }
     /// A payload handler with exclusive world access. Annotate the world as
     /// `world: &mut World<_>`; it is inferred at `build`.
-    pub fn on<E: 'static, F>(self, callback: F) -> AppBuilder<C, Cons<On<E, Callback<F>>, L>> {
+    #[allow(clippy::type_complexity)]
+    pub fn on<E: 'static, F>(self, callback: F) -> AppBuilder<C, Cons<On<E, Callback<F>>, L>, K> {
         self.install(system(callback))
     }
     /// A zero-sized event type can serve as an open-ended schedule label.
@@ -391,6 +448,7 @@ impl<C: Storage, L> AppBuilder<C, L> {
     ) -> AppBuilder<
         <<P::Systems as Shape>::Access as Uses<C>>::Out,
         Cons<Scheduled<E, P::Systems>, L>,
+        K,
     >
     where
         <P::Systems as Shape>::Access: Uses<C>,
@@ -399,6 +457,57 @@ impl<C: Storage, L> AppBuilder<C, L> {
             handler: Run(systems.into_systems()),
             marker: PhantomData,
         })
+    }
+    /// Hook systems run after `T` is added to entities that lacked it.
+    /// Hooks run inside structural operations, so they cannot be exclusive:
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct Tag;
+    /// App::new().on_add::<Tag, _, _>(exclusive(|_: &mut World<_>| {}));
+    /// ```
+    pub fn on_add<T: 'static, P: IntoSystems<M>, M>(
+        self,
+        systems: P,
+    ) -> Hooked<C, L, K, OnAdd<T>, P::Systems>
+    where
+        Hook<OnAdd<T>, P::Systems>:
+            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnAdd<T>, P::Systems>, K>>,
+    {
+        self.install(hook::on_add::<T, P, M>(systems))
+    }
+    /// Hook systems run after `T` is written, whether added or replaced.
+    pub fn on_insert<T: 'static, P: IntoSystems<M>, M>(
+        self,
+        systems: P,
+    ) -> Hooked<C, L, K, OnInsert<T>, P::Systems>
+    where
+        Hook<OnInsert<T>, P::Systems>:
+            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnInsert<T>, P::Systems>, K>>,
+    {
+        self.install(hook::on_insert::<T, P, M>(systems))
+    }
+    /// Hook systems run before an existing `T` is overwritten, removed, or
+    /// despawned, while the old value is still readable.
+    pub fn on_replace<T: 'static, P: IntoSystems<M>, M>(
+        self,
+        systems: P,
+    ) -> Hooked<C, L, K, OnReplace<T>, P::Systems>
+    where
+        Hook<OnReplace<T>, P::Systems>:
+            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnReplace<T>, P::Systems>, K>>,
+    {
+        self.install(hook::on_replace::<T, P, M>(systems))
+    }
+    /// Hook systems run before `T` is removed or its entity despawned.
+    pub fn on_remove<T: 'static, P: IntoSystems<M>, M>(
+        self,
+        systems: P,
+    ) -> Hooked<C, L, K, OnRemove<T>, P::Systems>
+    where
+        Hook<OnRemove<T>, P::Systems>:
+            Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnRemove<T>, P::Systems>, K>>,
+    {
+        self.install(hook::on_remove::<T, P, M>(systems))
     }
     /// Store `T` even though no system queries it, e.g. a tag that is only
     /// inserted, or data read through `World` methods outside systems. Keeps
@@ -410,12 +519,13 @@ impl<C: Storage, L> AppBuilder<C, L> {
     /// let entity = app.world.spawn();
     /// app.world.insert(entity, Tag); // never used or registered
     /// ```
-    pub fn register<T: 'static>(self) -> AppBuilder<<C as Insert<Components<T>>>::Out, L>
+    pub fn register<T: 'static>(self) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K>
     where
         C: Insert<Components<T>>,
     {
         AppBuilder {
             listeners: self.listeners,
+            hooks: self.hooks,
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
@@ -431,7 +541,7 @@ impl<C: Storage, L> AppBuilder<C, L> {
     ///     .storage::<Sparse<Tag>>() // too late: Tag is already dense
     ///     .build();
     /// ```
-    pub fn storage<D: Declaration>(self) -> AppBuilder<<C as Insert<D>>::Out, L>
+    pub fn storage<D: Declaration>(self) -> AppBuilder<<C as Insert<D>>::Out, L, K>
     where
         C: Insert<D>,
     {
@@ -445,23 +555,30 @@ impl<C: Storage, L> AppBuilder<C, L> {
         }
         AppBuilder {
             listeners: self.listeners,
+            hooks: self.hooks,
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
     }
-    /// Create the world. Every handler is checked against it here.
+    /// Create the world, which owns the hooks. Every handler and hook is
+    /// checked against it here.
     pub fn build(self) -> App<C, L>
     where
+        K: HookList<C> + Send + Sync + 'static,
         L: Fits<World<C>>,
     {
         const {
             assert!(
-                L::VALID,
+                L::VALID && K::VALID,
                 "invalid system: missing/ambiguous storage or conflicting access"
             );
         }
+        let mut world = World::default();
+        if const { !K::EMPTY } {
+            world.set_hooks(self.hooks);
+        }
         App {
-            world: World::default(),
+            world,
             listeners: self.listeners,
             execution_mode: self.execution_mode,
         }
@@ -481,6 +598,7 @@ impl App<()> {
     pub fn new() -> AppBuilder {
         AppBuilder {
             listeners: Nil,
+            hooks: Nil,
             execution_mode: ExecutionMode::Parallel,
             components: PhantomData,
         }
@@ -502,6 +620,8 @@ impl<S: Storage, L> App<S, L> {
             ExecutionMode::Parallel => self.listeners.emit(event, &mut self.world),
             ExecutionMode::Serial => serially(|| self.listeners.dispatch(event, &mut self.world)),
         }
-        self.listeners.apply(&mut self.world);
+        self.listeners
+            .defer(unsafe { &mut *<World<S> as SystemWorld>::queue(&mut self.world) });
+        self.world.flush();
     }
 }

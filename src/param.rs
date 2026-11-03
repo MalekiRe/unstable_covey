@@ -1,9 +1,10 @@
 use std::ops::{Deref, DerefMut};
 
 use crate::access::{Access, Filtered, QueryAccess, ValidAccess};
-use crate::change::ChangeWindow;
+use crate::change::{ChangeWindow, SystemWorld};
 use crate::command::{CommandQueue, Commands};
 use crate::filter::{FilterFor, QueryFilter};
+use crate::hook::Trigger;
 use crate::query::{FetchQuery, QueryData, QueryState};
 use crate::{Query, Single, Storage, World};
 
@@ -25,6 +26,7 @@ mod sealed {
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Query<'_, D, F> {}
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Single<'_, D, F> {}
     impl<S: super::Storage> Sealed for super::Commands<'_, S> {}
+    impl Sealed for super::Trigger<'_> {}
 }
 
 /// What a parameter accesses and yields, independent of any world type.
@@ -37,7 +39,7 @@ pub trait ParamShape: sealed::Sealed {
 /// # Safety
 /// Access must describe every world borrow including its structural filter.
 /// Fetch may only borrow matching component rows, for the invocation lifetime.
-pub unsafe trait Param<S>: ParamShape {
+pub unsafe trait Param<S: SystemWorld>: ParamShape {
     const VALID: bool;
     /// Returns None when this invocation cannot satisfy the parameter.
     /// # Safety
@@ -48,9 +50,9 @@ pub unsafe trait Param<S>: ParamShape {
         local: &'a mut Self::State,
         window: ChangeWindow,
     ) -> Option<Self::Item<'a>>;
-    /// Apply deferred work recorded in this parameter's state, after the
-    /// system ran, with exclusive world access.
-    fn apply(_state: &mut Self::State, _world: &mut S) {}
+    /// Move deferred work recorded in this parameter's state to the world's
+    /// queue, after the system ran.
+    fn defer(_state: &mut Self::State, _queue: &mut S::Queue) {}
 }
 impl<T: Default + 'static> ParamShape for Local<'_, T> {
     type Access = ();
@@ -58,7 +60,7 @@ impl<T: Default + 'static> ParamShape for Local<'_, T> {
     type Item<'a> = Local<'a, T>;
 }
 // SAFETY: Local only borrows its own per-system state, never world storage.
-unsafe impl<S, T: Default + 'static> Param<S> for Local<'_, T> {
+unsafe impl<S: SystemWorld, T: Default + 'static> Param<S> for Local<'_, T> {
     const VALID: bool = true;
     unsafe fn fetch<'a>(_: *mut S, local: &'a mut T, _: ChangeWindow) -> Option<Local<'a, T>> {
         Some(Local(local))
@@ -109,7 +111,7 @@ impl<S: Storage> ParamShape for Commands<'_, S> {
     type Item<'a> = Commands<'a, S>;
 }
 // SAFETY: Commands only reserves entities atomically during the run; every
-// structural change waits for `apply`, which has exclusive world access.
+// structural change waits for the world's queue, applied with exclusive access.
 unsafe impl<S: Storage> Param<World<S>> for Commands<'_, S> {
     const VALID: bool = true;
     unsafe fn fetch<'a>(
@@ -119,10 +121,26 @@ unsafe impl<S: Storage> Param<World<S>> for Commands<'_, S> {
     ) -> Option<Commands<'a, S>> {
         Some(Commands {
             queue,
-            world: unsafe { &*world },
+            reserve: unsafe { World::reserve(world) },
         })
     }
-    fn apply(queue: &mut CommandQueue<S>, world: &mut World<S>) {
-        queue.apply(world);
+    fn defer(queue: &mut CommandQueue<S>, world: &mut CommandQueue<S>) {
+        world.append(queue);
+    }
+}
+impl ParamShape for Trigger<'_> {
+    type Access = ();
+    type State = ();
+    type Item<'a> = Trigger<'a>;
+}
+// SAFETY: reads the running hook's entity slice, set by the world around it.
+unsafe impl<S: Storage> Param<World<S>> for Trigger<'_> {
+    const VALID: bool = true;
+    unsafe fn fetch<'a>(
+        world: *mut World<S>,
+        _: &'a mut (),
+        _: ChangeWindow,
+    ) -> Option<Trigger<'a>> {
+        Some(Trigger(unsafe { World::trigger(world) }))
     }
 }
