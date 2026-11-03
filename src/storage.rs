@@ -291,6 +291,26 @@ struct Slot {
     location: Option<Location>,
     next: Option<u32>,
 }
+/// Entity lookups that borrow only the slot index: queries hold one while
+/// other parts of the world (hooks, columns) are in use.
+#[derive(Clone, Copy)]
+pub(crate) struct Locator<'a> {
+    world: u64,
+    slots: &'a [Slot],
+}
+impl Locator<'_> {
+    /// The live entity's table and logical row.
+    pub(crate) fn find(self, entity: Entity) -> Option<(usize, usize)> {
+        if entity.world != self.world {
+            return None;
+        }
+        let slot = self.slots.get(entity.slot as usize)?;
+        if slot.generation != entity.generation {
+            return None;
+        }
+        slot.location.map(|location| (location.table, location.row))
+    }
+}
 struct Archetype {
     dense: usize,
     sparse: Store,
@@ -637,14 +657,24 @@ impl<S: Storage> World<S> {
         }
     }
     fn location(&self, entity: Entity) -> Option<Location> {
-        if entity.world != self.id {
-            return None;
+        let (table, row) = self.locator().find(entity)?;
+        Some(Location { table, row })
+    }
+    fn locator(&self) -> Locator<'_> {
+        Locator {
+            world: self.id,
+            slots: &self.locations,
         }
-        let slot = self.locations.get(entity.slot as usize)?;
-        if slot.generation != entity.generation {
-            return None;
+    }
+    /// # Safety
+    /// The world is live for 'a with no structural change meanwhile.
+    pub(crate) unsafe fn locate<'a>(world: *mut Self) -> Locator<'a> {
+        unsafe {
+            Locator {
+                world: (*world).id,
+                slots: &(*world).locations,
+            }
         }
-        slot.location
     }
     pub fn contains(&self, entity: Entity) -> bool {
         self.location(entity).is_some()

@@ -7,7 +7,7 @@ struct Marker;
 struct Log(Vec<String>);
 
 fn value_of(query: &mut Query<(Entity, &Health)>, entity: Entity) -> u32 {
-    query.iter_mut().find(|(e, _)| *e == entity).unwrap().1.0
+    query.get_mut(entity).unwrap().1.0
 }
 
 #[test]

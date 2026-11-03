@@ -701,3 +701,55 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         }
     }
 }
+
+#[test]
+fn get_mut_resolves_one_entity_through_data_archetype_and_row_filters() {
+    let mut world = World::<(
+        (Components<Position>, Components<Velocity>),
+        (Sparse<Tag>, Components<Other>),
+    )>::default();
+    let moving = world.spawn_bundle((Position(1), Velocity(2)));
+    let tagged = world.spawn_bundle((Position(3), Velocity(4), Tag));
+    let still = world.spawn_bundle((Position(5),));
+    let gone = world.spawn_bundle((Position(6), Velocity(7)));
+    world.despawn(gone);
+    let elsewhere = World::<(Components<Position>, Components<Velocity>)>::default()
+        .spawn_bundle((Position(8), Velocity(9)));
+
+    let mut query = world.query::<(&mut Position, &Velocity)>();
+    let (mut position, velocity) = query.get_mut(tagged).unwrap();
+    position.0 += velocity.0;
+    assert!(
+        query.get_mut(still).is_none(),
+        "missing a queried component"
+    );
+    assert!(query.get_mut(gone).is_none(), "despawned");
+    assert!(query.get_mut(elsewhere).is_none(), "another world's entity");
+    assert_eq!(world.get::<Position>(tagged), Some(&Position(7)));
+
+    let mut untagged = world.query_filtered::<&Position, Without<Tag>>();
+    assert_eq!(untagged.get_mut(moving), Some(&Position(1)));
+    assert!(untagged.get_mut(tagged).is_none(), "archetype filter");
+
+    // Row filter: get_mut sees the watched entity only in windows where it changed.
+    struct Watch(Entity, Vec<Option<i32>>);
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            |mut positions: Query<&Position, Changed<Position>>, mut watch: Single<&mut Watch>| {
+                let seen = positions.get_mut(watch.0).map(|p| p.0);
+                watch.1.push(seen);
+            },
+        )
+        .build();
+    let watched = app.world.spawn_bundle((Position(10),));
+    let log = app.world.spawn_bundle((Watch(watched, Vec::new()),));
+    app.emit(&Update); // first run: everything is new
+    app.emit(&Update); // unchanged since
+    app.world.get_mut::<Position>(watched).unwrap().0 = 11;
+    app.emit(&Update);
+    assert_eq!(
+        app.world.get::<Watch>(log).unwrap().1,
+        [Some(10), None, Some(11)]
+    );
+}

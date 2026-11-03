@@ -4,7 +4,7 @@ use crate::{
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
     filter::{FilterFor, QueryFilter, TableMatch},
     lookup::ComponentLookup,
-    storage::{ColumnPtr, Table},
+    storage::{ColumnPtr, Locator, Table},
 };
 use std::{
     marker::PhantomData,
@@ -103,6 +103,7 @@ impl<'a> Tables<'a> {
 /// Borrowed query; static component indices resolve columns once per archetype.
 pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     tables: &'w [Table],
+    locator: Locator<'w>,
     matching: Option<&'w [usize]>,
     cached: bool,
     indices: D::Indices,
@@ -124,6 +125,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         }
         Self {
             tables: unsafe { &(*world).tables },
+            locator: unsafe { World::locate(world) },
             matching: None,
             cached: false,
             indices: D::INDICES,
@@ -190,6 +192,26 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         match self.matching {
             Some(matching) => Tables::Indexed(self.tables, matching.iter(), self.cached),
             None => Tables::All(self.tables.iter()),
+        }
+    }
+    /// The item for `entity`, if it is live and matches this query and its
+    /// filters (including row filters such as `Changed`).
+    pub fn get_mut(&mut self, entity: Entity) -> Option<D::Item<'_>> {
+        let (table, row) = self.locator.find(entity)?;
+        let table = &self.tables[table];
+        if !D::matches(&self.indices, &table.present) || !F::matches(&self.filter, &table.present) {
+            return None;
+        }
+        // SAFETY: the table matches, the row is live, and `&mut self` keeps
+        // every other item of this query from being alive meanwhile.
+        unsafe {
+            match F::classify(&self.filter, table, self.window) {
+                TableMatch::None => return None,
+                TableMatch::Maybe if !F::row(&self.filter, table, row, self.window) => return None,
+                _ => {}
+            }
+            let fetch = D::fetch(table, &self.indices, self.window.now);
+            Some(D::get(&fetch, row, self.window.now))
         }
     }
     pub fn iter_mut(&mut self) -> QueryIter<'_, D, F> {

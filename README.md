@@ -149,6 +149,8 @@ assert!(world.despawn(entity));
 - `Single<D, F>` requires exactly one match; otherwise the system is skipped
   without running or advancing its locals.
 - Registered queries cache matching archetypes and scan only new ones.
+- `query.get_mut(entity)` returns one entity's item if it matches the query and
+  its filters, including row filters such as `Changed`.
 - `query.contiguous_mut()` yields one slice per matching table, or an error for
   row filters and fragmented rows.
 - `world.query`, `world.query_filtered`, and `world.single` work outside systems.
