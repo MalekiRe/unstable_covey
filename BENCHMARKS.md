@@ -140,6 +140,26 @@ is 3.3% faster than Bevy ECS with one worker and 7.4% faster with four (8.4%
 with `for` loops). At 100,000 actors a frame is dominated by grid neighbor scans
 and pathfinding inside the loop bodies, not by iteration.
 
+## Commands, hooks, and relations (`ae7b98e` → `5344e82`)
+
+These add a command queue, hook dispatch on every structural operation, and
+pair-keyed tables. The matched simulation uses none of them, so this measures
+their cost when unused. Five alternating repetitions per row
+(`relations-paired.json`):
+
+| Actors | Workers | Before ms | After ms | Change | Init before/after ms |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0666 | 0.0671 | +0.8% | 1.0 / 1.1 |
+| 0 | 4 | 0.0261 | 0.0242 | −7.4% | 0.6 / 0.6 |
+| 4,096 | 1 | 1.245 | 1.239 | −0.4% | 3.2 / 3.7 |
+| 4,096 | 4 | 1.010 | 1.015 | +0.6% | 2.5 / 2.6 |
+| 100,000 | 1 | 100.4 | 100.6 | +0.2% | 127 / 128 |
+| 100,000 | 4 | 83.2 | 83.5 | +0.3% | 111 / 112 |
+
+Frame times are within run-to-run variation (the −7.4% row included); final
+states match in all 60 processes. Table creation now also compares pairs and
+maintains the pair index, visible as +0.5 ms init at 4,096 actors.
+
 ## Blended microbenchmark
 
 `blend_*`: 4,096 tiny systems in four parallel lanes plus a small simulation over
