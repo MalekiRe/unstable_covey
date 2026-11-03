@@ -17,11 +17,24 @@ struct Velocity(i32);
 
 #[test]
 fn heterogeneous_queries_skip_tables_missing_any_requested_component() {
-    type State = (
-        Components<Position>,
-        (Components<Velocity>, Components<i32>),
-    );
-    let mut world = World::<State>::default();
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (
+                |mut query: Query<(&mut Position, &Velocity)>| {
+                    for (mut p, v) in &mut query {
+                        p.0 += v.0;
+                    }
+                },
+                |mut query: Query<(&mut Position, &Velocity, &i32)>| {
+                    for (mut p, v, a) in &mut query {
+                        p.0 += v.0 * *a;
+                    }
+                },
+            ),
+        )
+        .build();
+    let world = &mut app.world;
     let complete = world.spawn();
     let pair = world.spawn();
     let position_only = world.spawn();
@@ -41,21 +54,6 @@ fn heterogeneous_queries_skip_tables_missing_any_requested_component() {
     let no_position = world.spawn();
     world.insert(no_position, Velocity(100));
     world.insert(no_position, 100_i32);
-    let mut app = App::new(world).add_systems(
-        Update,
-        (
-            |mut query: Query<(&mut Position, &Velocity)>| {
-                for (mut p, v) in &mut query {
-                    p.0 += v.0;
-                }
-            },
-            |mut query: Query<(&mut Position, &Velocity, &i32)>| {
-                for (mut p, v, a) in &mut query {
-                    p.0 += v.0 * *a;
-                }
-            },
-        ),
-    );
     app.emit(&Update);
     assert_eq!(app.world.get::<Position>(complete), Some(&Position(18)));
     assert_eq!(app.world.get::<Position>(pair), Some(&Position(12)));
@@ -75,11 +73,18 @@ fn heterogeneous_queries_skip_tables_missing_any_requested_component() {
 
 #[test]
 fn retained_mutable_items_span_multiple_tables() {
-    type State = (
-        Components<Position>,
-        (Components<Velocity>, Components<Tag>),
-    );
-    let mut world = World::<State>::default();
+    fn retain(mut query: Query<(Entity, &mut Position, &mut Velocity)>) {
+        let mut items: Vec<_> = query.iter_mut().collect();
+        for (_, position, velocity) in &mut items {
+            position.0 += 1;
+            velocity.0 += position.0;
+        }
+    }
+    let mut app = App::new()
+        .add_systems(Update, retain)
+        .register::<Tag>()
+        .build();
+    let world = &mut app.world;
     let entities: Vec<_> = (0..48)
         .map(|i| {
             let entity = world.spawn();
@@ -91,14 +96,6 @@ fn retained_mutable_items_span_multiple_tables() {
             entity
         })
         .collect();
-    fn retain(mut query: Query<(Entity, &mut Position, &mut Velocity)>) {
-        let mut items: Vec<_> = query.iter_mut().collect();
-        for (_, position, velocity) in &mut items {
-            position.0 += 1;
-            velocity.0 += position.0;
-        }
-    }
-    let mut app = App::new(world).add_systems(Update, retain);
     app.emit(&Update);
     for (i, &entity) in entities.iter().enumerate() {
         assert_eq!(
@@ -169,18 +166,14 @@ fn singleton_skips_preserve_body_state_and_resume_when_all_parameters_match() {
         p.0 += v.0;
         log.push(*calls);
     }
-    type State = (
-        Components<Position>,
-        (Components<Velocity>, Components<Vec<usize>>),
-    );
-    let mut world = World::<State>::default();
-    let log = world.spawn();
-    world.insert(log, Vec::<usize>::new());
     let siblings = std::cell::Cell::new(0);
-    let mut app = App::new(world).add_systems(
-        Update,
-        (update, || siblings.set(siblings.get() + 1)).chain(),
-    );
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (update, || siblings.set(siblings.get() + 1)).chain(),
+        )
+        .build();
+    let log = app.world.spawn_bundle((Vec::<usize>::new(),));
     app.emit(&Update); // First Single is missing.
     let p = app.world.spawn();
     app.world.insert(p, Position(1));
@@ -221,11 +214,10 @@ fn invalid_singleton_condition_skips_group_without_advancing_locals() {
         *calls += 1;
         log.push(*calls);
     }
-    type State = (Components<bool>, (Components<Tag>, Components<Vec<usize>>));
-    let mut world = World::<State>::default();
-    let log = world.spawn();
-    world.insert(log, Vec::<usize>::new());
-    let mut app = App::new(world).add_systems(Update, (record, record).chain().run_if(condition));
+    let mut app = App::new()
+        .add_systems(Update, (record, record).chain().run_if(condition))
+        .build();
+    let log = app.world.spawn_bundle((Vec::<usize>::new(),));
     app.emit(&Update);
     let enabled = app.world.spawn();
     app.world.insert(enabled, true);
@@ -256,21 +248,21 @@ fn invalid_singleton_condition_skips_group_without_advancing_locals() {
 
 #[test]
 fn parallel_singleton_skips_leave_siblings_running() {
-    let mut world = World::<(Components<Position>, Components<Velocity>)>::default();
-    let velocity = world.spawn();
-    world.insert(velocity, Velocity(2));
-    let mut app = App::new(world).add_systems(
-        Update,
-        (
-            |mut p: Single<&mut Position>| p.0 += 10,
-            |mut q: Query<&mut Velocity>| {
-                for mut v in &mut q {
-                    v.0 += 1;
-                }
-            },
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (
+                |mut p: Single<&mut Position>| p.0 += 10,
+                |mut q: Query<&mut Velocity>| {
+                    for mut v in &mut q {
+                        v.0 += 1;
+                    }
+                },
+            )
+                .parallel(),
         )
-            .parallel(),
-    );
+        .build();
+    let velocity = app.world.spawn_bundle((Velocity(2),));
     with_workers(|| app.emit(&Update));
     assert_eq!(app.world.get::<Velocity>(velocity), Some(&Velocity(3)));
     let a = app.world.spawn();
@@ -337,7 +329,6 @@ fn structural_filters_apply_and_or_without_and_required_data() {
 
 #[test]
 fn complementary_parallel_queries_follow_structural_changes_between_emissions() {
-    type State = (Components<Position>, Components<Tag>);
     fn tagged(mut query: Query<&mut Position, With<Tag>>) {
         for mut value in &mut query {
             value.0 += 10;
@@ -348,13 +339,11 @@ fn complementary_parallel_queries_follow_structural_changes_between_emissions() 
             value.0 += 1;
         }
     }
-    let mut world = World::<State>::default();
-    let a = world.spawn();
-    let b = world.spawn();
-    world.insert(a, Position(0));
-    world.insert(b, Position(100));
-    world.insert(a, Tag);
-    let mut app = App::new(world).add_systems(Update, (tagged, untagged).parallel());
+    let mut app = App::new()
+        .add_systems(Update, (tagged, untagged).parallel())
+        .build();
+    let a = app.world.spawn_bundle((Position(0), Tag));
+    let b = app.world.spawn_bundle((Position(100),));
     with_workers(|| app.emit(&Update));
     assert_eq!(app.world.get::<Position>(a), Some(&Position(10)));
     assert_eq!(app.world.get::<Position>(b), Some(&Position(101)));
@@ -377,7 +366,6 @@ fn complementary_parallel_queries_follow_structural_changes_between_emissions() 
 
 #[test]
 fn complementary_access_survives_parameter_and_nested_group_composition() {
-    type State = (Components<i32>, (Components<Tag>, Components<Other>));
     type EitherTag = Or<(With<Tag>, With<Other>)>;
     fn tagged(mut values: Query<&mut i32, EitherTag>) {
         for mut value in &mut values {
@@ -400,21 +388,21 @@ fn complementary_access_survives_parameter_and_nested_group_composition() {
             *value *= 3;
         }
     }
-    let mut world = World::<State>::default();
-    let entities = [world.spawn(), world.spawn(), world.spawn()];
-    for entity in entities {
-        world.insert(entity, 0_i32);
-    }
-    world.insert(entities[0], Tag);
-    world.insert(entities[1], Other);
-    let mut app = App::new(world).add_systems(
-        Update,
-        (
-            ((tagged, tagged).chain(), (neither, neither).chain()).parallel(),
-            together,
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (
+                ((tagged, tagged).chain(), (neither, neither).chain()).parallel(),
+                together,
+            )
+                .chain(),
         )
-            .chain(),
-    );
+        .build();
+    let entities = [
+        app.world.spawn_bundle((0_i32, Tag)),
+        app.world.spawn_bundle((0_i32, Other)),
+        app.world.spawn_bundle((0_i32,)),
+    ];
     with_workers(|| app.emit(&Update));
     assert_eq!(app.world.get::<i32>(entities[0]), Some(&40));
     assert_eq!(app.world.get::<i32>(entities[1]), Some(&60));
@@ -423,24 +411,22 @@ fn complementary_access_survives_parameter_and_nested_group_composition() {
 
 #[test]
 fn filtered_single_and_query_can_write_complementary_populations() {
-    let mut world = World::<(Components<i32>, Components<Global>)>::default();
-    let global = world.spawn();
-    let ordinary = world.spawn();
-    world.insert(global, 5_i32);
-    world.insert(global, Global);
-    world.insert(ordinary, 1_i32);
-    let mut app = App::new(world).add_systems(
-        Update,
-        (
-            |mut value: Single<&mut i32, With<Global>>| **value *= 3,
-            |mut values: Query<&mut i32, Without<Global>>| {
-                for mut value in &mut values {
-                    *value += 2;
-                }
-            },
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (
+                |mut value: Single<&mut i32, With<Global>>| **value *= 3,
+                |mut values: Query<&mut i32, Without<Global>>| {
+                    for mut value in &mut values {
+                        *value += 2;
+                    }
+                },
+            )
+                .parallel(),
         )
-            .parallel(),
-    );
+        .build();
+    let global = app.world.spawn_bundle((5_i32, Global));
+    let ordinary = app.world.spawn_bundle((1_i32,));
     with_workers(|| app.emit(&Update));
     assert_eq!(app.world.get::<i32>(global), Some(&15));
     assert_eq!(app.world.get::<i32>(ordinary), Some(&3));
@@ -448,21 +434,20 @@ fn filtered_single_and_query_can_write_complementary_populations() {
 
 #[test]
 fn filtered_parameters_retain_disjoint_mutable_items_together() {
-    let mut world = World::<(Components<i32>, Components<Global>)>::default();
-    let global = world.spawn();
-    let ordinary = world.spawn();
-    world.insert(global, 5_i32);
-    world.insert(global, Global);
-    world.insert(ordinary, 1_i32);
-    let mut app = App::new(world).add_systems(
-        Update,
-        |value: Single<&mut i32, With<Global>>, mut values: Query<&mut i32, Without<Global>>| {
-            let mut global = value.into_inner();
-            let mut ordinary = values.iter_mut().next().unwrap();
-            *global += *ordinary;
-            *ordinary += *global;
-        },
-    );
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            |value: Single<&mut i32, With<Global>>,
+             mut values: Query<&mut i32, Without<Global>>| {
+                let mut global = value.into_inner();
+                let mut ordinary = values.iter_mut().next().unwrap();
+                *global += *ordinary;
+                *ordinary += *global;
+            },
+        )
+        .build();
+    let global = app.world.spawn_bundle((5_i32, Global));
+    let ordinary = app.world.spawn_bundle((1_i32,));
     app.emit(&Update);
     assert_eq!(app.world.get::<i32>(global), Some(&6));
     assert_eq!(app.world.get::<i32>(ordinary), Some(&7));
@@ -470,40 +455,34 @@ fn filtered_parameters_retain_disjoint_mutable_items_together() {
 
 #[test]
 fn parallel_read_singletons_join_before_dependents() {
-    type State = (
-        Components<i32>,
-        (Components<Position>, Components<Velocity>),
-    );
-    let mut world = World::<State>::default();
-    let global = world.spawn();
-    world.insert(global, 3_i32);
-    let entity = world.spawn();
-    world.insert(entity, Position(1));
-    world.insert(entity, Velocity(2));
-    let mut app = App::new(world).add_systems(
-        Update,
-        (
+    let mut app = App::new()
+        .add_systems(
+            Update,
             (
-                |step: Single<&i32>, mut query: Query<&mut Position>| {
-                    for mut p in &mut query {
-                        p.0 += **step;
-                    }
-                },
-                |step: Single<&i32>, mut query: Query<&mut Velocity>| {
-                    for mut v in &mut query {
-                        v.0 *= **step;
+                (
+                    |step: Single<&i32>, mut query: Query<&mut Position>| {
+                        for mut p in &mut query {
+                            p.0 += **step;
+                        }
+                    },
+                    |step: Single<&i32>, mut query: Query<&mut Velocity>| {
+                        for mut v in &mut query {
+                            v.0 *= **step;
+                        }
+                    },
+                )
+                    .parallel(),
+                |mut query: Query<(&mut Position, &Velocity)>| {
+                    for (mut p, v) in &mut query {
+                        p.0 += v.0;
                     }
                 },
             )
-                .parallel(),
-            |mut query: Query<(&mut Position, &Velocity)>| {
-                for (mut p, v) in &mut query {
-                    p.0 += v.0;
-                }
-            },
+                .chain(),
         )
-            .chain(),
-    );
+        .build();
+    let global = app.world.spawn_bundle((3_i32,));
+    let entity = app.world.spawn_bundle((Position(1), Velocity(2)));
     with_workers(|| app.emit(&Update));
     assert_eq!(app.world.get::<Position>(entity), Some(&Position(10)));
     assert_eq!(app.world.get::<Velocity>(entity), Some(&Velocity(6)));
@@ -516,10 +495,8 @@ fn local_state_is_independent_per_registration_and_persists() {
         *local += 1;
         log.push(*local);
     }
-    let mut world = World::<Components<Vec<usize>>>::default();
-    let log = world.spawn();
-    world.insert(log, Vec::<usize>::new());
-    let mut app = App::new(world).add_systems(Update, (record, record));
+    let mut app = App::new().add_systems(Update, (record, record)).build();
+    let log = app.world.spawn_bundle((Vec::<usize>::new(),));
     for _ in 0..3 {
         app.emit(&Update);
     }
@@ -543,17 +520,14 @@ fn condition_skips_nested_group_without_advancing_system_locals() {
         *calls += 1;
         log.push(*calls);
     }
-    type State = (Components<Vec<usize>>, (Components<bool>, Components<i32>));
-    let mut world = World::<State>::default();
-    let global = world.spawn();
-    world.insert(global, Vec::<usize>::new());
-    world.insert(global, true);
-    let entity = world.spawn();
-    world.insert(entity, 1_i32);
-    let mut app = App::new(world).add_systems(
-        Update,
-        (record, (record, record).chain()).run_if(every_other),
-    );
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (record, (record, record).chain()).run_if(every_other),
+        )
+        .build();
+    let global = app.world.spawn_bundle((Vec::<usize>::new(), true));
+    let entity = app.world.spawn_bundle((1_i32,));
     app.emit(&Update);
     assert_eq!(app.world.get::<Vec<usize>>(global).unwrap(), &[]);
     app.emit(&Update);
@@ -588,12 +562,11 @@ fn tuples_and_chains_run_conflicting_systems_in_registration_order() {
     fn subtract(mut value: Single<&mut i32>) {
         **value -= 1;
     }
-    let mut world = World::<Components<i32>>::default();
-    let entity = world.spawn();
-    world.insert(entity, 1_i32);
-    let mut app = App::new(world)
+    let mut app = App::new()
         .add_systems(Update, (add, multiply))
-        .add_systems(Update, (subtract, (add, multiply).chain()).chain());
+        .add_systems(Update, (subtract, (add, multiply).chain()).chain())
+        .build();
+    let entity = app.world.spawn_bundle((1_i32,));
     app.emit(&Update);
     assert_eq!(app.world.get::<i32>(entity), Some(&30));
     app.emit(&Update);
@@ -602,26 +575,25 @@ fn tuples_and_chains_run_conflicting_systems_in_registration_order() {
 
 #[test]
 fn panic_propagates_only_after_parallel_sibling_finishes() {
-    let mut world = World::<(Components<Position>, Components<Velocity>)>::default();
-    let entity = world.spawn();
-    world.insert(entity, Position(0));
-    world.insert(entity, Velocity(0));
     let rendezvous = std::sync::Arc::new(std::sync::Barrier::new(2));
     let left = rendezvous.clone();
-    let mut app = App::new(world).add_systems(
-        Update,
-        (
-            move |_: Single<&mut Position>| {
-                left.wait();
-                panic!("system failed");
-            },
-            move |mut right: Single<&mut Velocity>| {
-                rendezvous.wait();
-                right.0 = 7;
-            },
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (
+                move |_: Single<&mut Position>| {
+                    left.wait();
+                    panic!("system failed");
+                },
+                move |mut right: Single<&mut Velocity>| {
+                    rendezvous.wait();
+                    right.0 = 7;
+                },
+            )
+                .parallel(),
         )
-            .parallel(),
-    );
+        .build();
+    let entity = app.world.spawn_bundle((Position(0), Velocity(0)));
     with_workers(|| {
         assert!(catch_unwind(AssertUnwindSafe(|| app.emit(&Update))).is_err());
     });
@@ -630,26 +602,26 @@ fn panic_propagates_only_after_parallel_sibling_finishes() {
 
 #[test]
 fn exclusive_system_can_change_structure_before_a_typed_system() {
-    type State = (Components<Position>, Components<Tag>);
-    let mut world = World::<State>::default();
-    let entity = world.spawn();
-    world.insert(entity, Position(1));
-    let mut app = App::new(world).add_systems(
-        Update,
-        (
-            exclusive(move |world: &mut World<State>| {
-                if world.remove::<Tag>(entity).is_none() {
-                    world.insert(entity, Tag);
-                }
-            }),
-            |mut query: Query<&mut Position, With<Tag>>| {
-                for mut p in &mut query {
-                    p.0 += 10;
-                }
-            },
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (
+                exclusive(|world: &mut World<_>| {
+                    let entity = world.single::<(Entity, &Position)>().unwrap().0;
+                    if world.remove::<Tag>(entity).is_none() {
+                        world.insert(entity, Tag);
+                    }
+                }),
+                |mut query: Query<&mut Position, With<Tag>>| {
+                    for mut p in &mut query {
+                        p.0 += 10;
+                    }
+                },
+            )
+                .chain(),
         )
-            .chain(),
-    );
+        .build();
+    let entity = app.world.spawn_bundle((Position(1),));
     app.emit(&Update);
     assert_eq!(app.world.get::<Position>(entity), Some(&Position(11)));
     app.emit(&Update);
@@ -684,11 +656,9 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         ("parallel_conflict", Some("E0080")),
         ("change_conflict", Some("E0080")),
         ("duplicate_bundle", Some("E0080")),
-        ("unregistered_bundle", Some("E0080")),
-        ("unregistered_empty_batch", Some("E0080")),
-        ("duplicate_bundle_slot", Some("E0080")),
         ("mutable_condition", Some("E0080")),
         ("missing_component", Some("E0080")),
+        ("late_storage", Some("E0080")),
         ("duplicate_component", Some("E0080")),
         ("missing_filter", Some("E0080")),
         ("overlapping_filters", Some("E0080")),

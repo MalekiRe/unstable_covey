@@ -25,14 +25,17 @@ mod sealed {
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Single<'_, D, F> {}
 }
 
-/// Built-in parameter description. Implementations are sealed.
-/// # Safety
-/// Access must describe every world borrow including its structural filter.
-/// Fetch may only borrow matching component rows, for the invocation lifetime.
-pub unsafe trait Param<S>: sealed::Sealed {
+/// What a parameter accesses and yields, independent of any world type.
+pub trait ParamShape: sealed::Sealed {
     type Access: Access;
     type State: Default;
     type Item<'a>;
+}
+/// Fetching a parameter from world type `S`. Implementations are sealed.
+/// # Safety
+/// Access must describe every world borrow including its structural filter.
+/// Fetch may only borrow matching component rows, for the invocation lifetime.
+pub unsafe trait Param<S>: ParamShape {
     const VALID: bool;
     /// Returns None when this invocation cannot satisfy the parameter.
     /// # Safety
@@ -44,15 +47,22 @@ pub unsafe trait Param<S>: sealed::Sealed {
         window: ChangeWindow,
     ) -> Option<Self::Item<'a>>;
 }
-// SAFETY: Local only borrows its own per-system state, never world storage.
-unsafe impl<S, T: Default + 'static> Param<S> for Local<'_, T> {
+impl<T: Default + 'static> ParamShape for Local<'_, T> {
     type Access = ();
     type State = T;
     type Item<'a> = Local<'a, T>;
+}
+// SAFETY: Local only borrows its own per-system state, never world storage.
+unsafe impl<S, T: Default + 'static> Param<S> for Local<'_, T> {
     const VALID: bool = true;
     unsafe fn fetch<'a>(_: *mut S, local: &'a mut T, _: ChangeWindow) -> Option<Local<'a, T>> {
         Some(Local(local))
     }
+}
+impl<D: QueryData, F: QueryFilter> ParamShape for Query<'_, D, F> {
+    type Access = Filtered<QueryAccess<D::Access, F::Access>, F>;
+    type State = QueryState;
+    type Item<'a> = Query<'a, D, F>;
 }
 // SAFETY: D describes the component accesses, F precisely filters their tables.
 // Iteration only yields distinct aligned rows within the query borrow lifetime.
@@ -60,9 +70,6 @@ unsafe impl<S: Storage, D: FetchQuery<S>, F: FilterFor<S>> Param<World<S>> for Q
 where
     D::Access: ValidAccess,
 {
-    type Access = Filtered<QueryAccess<D::Access, F::Access>, F>;
-    type State = QueryState;
-    type Item<'a> = Query<'a, D, F>;
     const VALID: bool = D::VALID && F::VALID && D::Access::VALID;
     unsafe fn fetch<'a>(
         world: *mut World<S>,
@@ -72,14 +79,16 @@ where
         Some(unsafe { Query::from_cached(world, state, window) })
     }
 }
+impl<D: QueryData, F: QueryFilter> ParamShape for Single<'_, D, F> {
+    type Access = Filtered<QueryAccess<D::Access, F::Access>, F>;
+    type State = QueryState;
+    type Item<'a> = Single<'a, D, F>;
+}
 // SAFETY: same access as Query; cardinality is checked before any row is fetched.
 unsafe impl<S: Storage, D: FetchQuery<S>, F: FilterFor<S>> Param<World<S>> for Single<'_, D, F>
 where
     D::Access: ValidAccess,
 {
-    type Access = Filtered<QueryAccess<D::Access, F::Access>, F>;
-    type State = QueryState;
-    type Item<'a> = Single<'a, D, F>;
     const VALID: bool = D::VALID && F::VALID && D::Access::VALID;
     unsafe fn fetch<'a>(
         world: *mut World<S>,

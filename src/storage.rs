@@ -22,8 +22,6 @@ pub struct Components<T, const SUMMARY: bool = false>(PhantomData<T>);
 /// Declares archetype-local sparse storage. Sparse-only changes preserve the
 /// physical dense row; sparse columns remain aligned with archetype membership.
 pub struct Sparse<T, const SUMMARY: bool = false>(PhantomData<T>);
-/// Declares an exact bundle type with a compiler-selected destination cache.
-pub struct BundleSlot<B>(PhantomData<fn() -> B>);
 impl<T, const B: bool> Default for Components<T, B> {
     fn default() -> Self {
         Self(PhantomData)
@@ -34,44 +32,30 @@ impl<T, const B: bool> Default for Sparse<T, B> {
         Self(PhantomData)
     }
 }
-impl<B> Default for BundleSlot<B> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
 mod sealed {
     pub trait Sealed {}
     impl Sealed for () {}
     impl<T, const B: bool> Sealed for super::Components<T, B> {}
     impl<T, const B: bool> Sealed for super::Sparse<T, B> {}
-    impl<B> Sealed for super::BundleSlot<B> {}
     impl<A: super::Storage, B: super::Storage> Sealed for (A, B) {}
 }
-/// Sealed, statically composed component and bundle vocabulary.
-#[allow(private_interfaces)]
-pub trait Storage: sealed::Sealed + Default {
+/// Sealed, statically composed component vocabulary.
+pub trait Storage: sealed::Sealed + Default + 'static {
     const LEN: usize;
-    const BUNDLES: usize;
     const HAS_SPARSE: bool;
-    #[doc(hidden)]
-    type BundleCache: Default + Send + Sync;
     #[doc(hidden)]
     fn describe(output: &mut Vec<Info>);
 }
 impl Storage for () {
     const LEN: usize = 0;
-    const BUNDLES: usize = 0;
     const HAS_SPARSE: bool = false;
-    type BundleCache = ();
     fn describe(_: &mut Vec<Info>) {}
 }
 macro_rules! schema {
     ($name:ident, $sparse:expr) => {
-        impl<T, const SUMMARY: bool> Storage for $name<T, SUMMARY> {
+        impl<T: 'static, const SUMMARY: bool> Storage for $name<T, SUMMARY> {
             const LEN: usize = 1;
-            const BUNDLES: usize = 0;
             const HAS_SPARSE: bool = $sparse;
-            type BundleCache = ();
             fn describe(output: &mut Vec<Info>) {
                 output.push(Info::of::<T>($sparse, SUMMARY));
             }
@@ -80,56 +64,75 @@ macro_rules! schema {
 }
 schema!(Components, false);
 schema!(Sparse, true);
-impl<B: 'static> Storage for BundleSlot<B> {
-    const LEN: usize = 0;
-    const BUNDLES: usize = 1;
-    const HAS_SPARSE: bool = false;
-    type BundleCache = Option<NonZeroUsize>;
-    fn describe(_: &mut Vec<Info>) {}
-}
 impl<A: Storage, B: Storage> Storage for (A, B) {
     const LEN: usize = A::LEN + B::LEN;
-    const BUNDLES: usize = A::BUNDLES + B::BUNDLES;
     const HAS_SPARSE: bool = A::HAS_SPARSE || B::HAS_SPARSE;
-    type BundleCache = (A::BundleCache, B::BundleCache);
     fn describe(output: &mut Vec<Info>) {
         A::describe(output);
         B::describe(output);
     }
 }
-trait BundleLookup<B: 'static>: Storage {
-    const COUNT: usize;
-    const INDEX: usize;
-    fn slot(cache: &mut Self::BundleCache) -> &mut Option<NonZeroUsize>;
+
+/// Multi-component transitions, keyed by source table and a bundle's
+/// compile-time key. Open addressing; entries verify their exact index list.
+#[derive(Default)]
+struct Transitions {
+    slots: Box<[Option<Transition>]>,
+    len: usize,
 }
-impl<B: 'static, S: Storage> BundleLookup<B> for S {
-    default const COUNT: usize = 0;
-    default const INDEX: usize = 0;
-    default fn slot(_: &mut Self::BundleCache) -> &mut Option<NonZeroUsize> {
-        panic!("missing bundle slot")
+#[derive(Clone, Copy)]
+struct Transition {
+    source: usize,
+    adding: bool,
+    indices: &'static [usize],
+    destination: usize,
+}
+impl Transitions {
+    fn start(&self, key: u64, source: usize, adding: bool) -> usize {
+        let hash = (key ^ (source as u64) << 1 ^ adding as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        (hash >> 32) as usize & (self.slots.len() - 1)
     }
-}
-impl<B: 'static> BundleLookup<B> for BundleSlot<B> {
-    const COUNT: usize = 1;
-    const INDEX: usize = 0;
-    fn slot(cache: &mut Self::BundleCache) -> &mut Option<NonZeroUsize> {
-        cache
-    }
-}
-impl<B: 'static, L: BundleLookup<B>, R: BundleLookup<B>> BundleLookup<B> for (L, R) {
-    const COUNT: usize = L::COUNT + R::COUNT;
-    const INDEX: usize = if L::COUNT != 0 {
-        L::INDEX
-    } else {
-        L::BUNDLES + R::INDEX
-    };
-    fn slot(cache: &mut Self::BundleCache) -> &mut Option<NonZeroUsize> {
-        if L::COUNT != 0 {
-            L::slot(&mut cache.0)
-        } else {
-            R::slot(&mut cache.1)
+    #[inline]
+    fn get(&self, key: u64, source: usize, indices: &[usize], adding: bool) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut i = self.start(key, source, adding);
+        loop {
+            let entry = self.slots[i]?;
+            if entry.source == source && entry.adding == adding && entry.indices == indices {
+                return Some(entry.destination);
+            }
+            i = (i + 1) & (self.slots.len() - 1);
         }
     }
+    #[cold]
+    fn insert(&mut self, key: u64, entry: Transition) {
+        if (self.len + 1) * 2 > self.slots.len() {
+            let capacity = (self.slots.len() * 2).max(16);
+            let old = std::mem::replace(&mut self.slots, vec![None; capacity].into_boxed_slice());
+            self.len = 0;
+            for entry in old.into_iter().flatten() {
+                self.insert(bundle_key(entry.indices), entry);
+            }
+        }
+        let mut i = self.start(key, entry.source, entry.adding);
+        while self.slots[i].is_some() {
+            i = (i + 1) & (self.slots.len() - 1);
+        }
+        self.slots[i] = Some(entry);
+        self.len += 1;
+    }
+}
+/// FNV-1a over a bundle's component indices; evaluated at compile time.
+const fn bundle_key(indices: &[usize]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut i = 0;
+    while i < indices.len() {
+        hash = (hash ^ indices[i] as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        i += 1;
+    }
+    hash
 }
 
 /// Immutable access metadata, separate from all owned component buffers.
@@ -245,7 +248,6 @@ struct Archetype {
     rows: Vec<usize>,
     components: Vec<usize>,
     transitions: Vec<[Option<NonZeroUsize>; 2]>,
-    bundles: Vec<[Option<NonZeroUsize>; 2]>,
 }
 /// Dynamic archetypes over a compile-time component vocabulary.
 pub struct World<S: Storage> {
@@ -258,7 +260,7 @@ pub struct World<S: Storage> {
     info: Vec<Info>,
     dense: Vec<Store>,
     archetypes: Vec<Archetype>,
-    bundles: S::BundleCache,
+    bundles: Transitions,
     /// The latest issued change tick; systems carry their own copy during a frame.
     clock: u64,
     schema: PhantomData<S>,
@@ -286,7 +288,7 @@ impl<S: Storage> World<S> {
             info,
             dense: Vec::new(),
             archetypes: Vec::new(),
-            bundles: Default::default(),
+            bundles: Transitions::default(),
             clock: 0,
             schema: PhantomData,
         };
@@ -336,7 +338,6 @@ impl<S: Storage> World<S> {
             rows: Vec::new(),
             components,
             transitions: vec![[None; 2]; S::LEN],
-            bundles: vec![[None; 2]; S::BUNDLES],
         };
         self.tables.push(Table {
             present,
@@ -460,59 +461,29 @@ impl<S: Storage> World<S> {
         const {
             assert!(
                 B::VALID,
-                "bundle components must exist uniquely and must not repeat"
-            );
-        }
-        const {
-            assert!(
-                <S as BundleLookup<B>>::COUNT == 1,
-                "bundle must have exactly one BundleSlot in the world schema"
+                "component not stored by this world (no system uses it: register it), or repeated in the bundle"
             );
         }
     }
+    /// The table reached from `source` by adding or removing B's components.
+    /// Single components use a per-archetype array; bundles a keyed cache.
     #[inline]
-    fn bundle_table<B: Bundle<S>>(&mut self) -> usize {
-        Self::check_bundle::<B>();
-        if let Some(table) = *<S as BundleLookup<B>>::slot(&mut self.bundles) {
-            return table.get() - 1;
+    fn destination<B: Bundle<S>>(&mut self, source: usize, adding: bool) -> usize {
+        let cached = if B::INDICES.len() == 1 {
+            self.archetypes[source].transitions[B::INDICES[0]][adding as usize]
+                .map(|id| id.get() - 1)
+        } else {
+            self.bundles.get(B::KEY, source, B::INDICES, adding)
+        };
+        match cached {
+            Some(destination) => destination,
+            None => self.resolve::<B>(source, adding),
         }
-        self.resolve_bundle::<B>()
     }
     #[cold]
-    fn resolve_bundle<B: Bundle<S>>(&mut self) -> usize {
-        let table = self
-            .tables
-            .iter()
-            .position(|table| {
-                table
-                    .present
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &p)| p == B::INDICES.contains(&i))
-            })
-            .unwrap_or_else(|| {
-                self.add_table((0..S::LEN).map(|i| B::INDICES.contains(&i)).collect())
-            });
-        *<S as BundleLookup<B>>::slot(&mut self.bundles) = NonZeroUsize::new(table + 1);
-        table
-    }
-    fn destination(
-        &mut self,
-        source: usize,
-        indices: &[usize],
-        adding: bool,
-        bundle_slot: Option<usize>,
-    ) -> usize {
-        let cached = if let Some(slot) = bundle_slot {
-            self.archetypes[source].bundles[slot][adding as usize]
-        } else {
-            self.archetypes[source].transitions[indices[0]][adding as usize]
-        };
-        if let Some(id) = cached {
-            return id.get() - 1;
-        }
+    fn resolve<B: Bundle<S>>(&mut self, source: usize, adding: bool) -> usize {
         let mut signature = self.tables[source].present.clone();
-        for &i in indices {
+        for &i in B::INDICES {
             signature[i] = adding;
         }
         let destination = self
@@ -520,17 +491,24 @@ impl<S: Storage> World<S> {
             .iter()
             .position(|t| t.present == signature)
             .unwrap_or_else(|| self.add_table(signature));
-        let id = NonZeroUsize::new(destination + 1);
-        if let Some(slot) = bundle_slot {
-            self.archetypes[source].bundles[slot][adding as usize] = id;
+        if B::INDICES.len() == 1 {
+            self.archetypes[source].transitions[B::INDICES[0]][adding as usize] =
+                NonZeroUsize::new(destination + 1);
         } else {
-            self.archetypes[source].transitions[indices[0]][adding as usize] = id;
+            let entry = Transition {
+                source,
+                adding,
+                indices: B::INDICES,
+                destination,
+            };
+            self.bundles.insert(B::KEY, entry);
         }
         destination
     }
-    /// Spawn directly into the final archetype using a compiler-selected bundle slot.
+    /// Spawn directly into the bundle's archetype; no declaration needed.
     pub fn spawn_bundle<B: Bundle<S>>(&mut self, bundle: B) -> Entity {
-        let table = self.bundle_table::<B>();
+        Self::check_bundle::<B>();
+        let table = self.destination::<B>(0, true);
         let tick = self.change_tick();
         self.reserve_slots(1);
         self.spawn_at(table, bundle, tick)
@@ -546,7 +524,7 @@ impl<S: Storage> World<S> {
         let Some(first) = bundles.next() else {
             return Vec::new();
         };
-        let table = self.bundle_table::<I::Item>();
+        let table = self.destination::<I::Item>(0, true);
         let tick = self.change_tick();
         let count = bundles.size_hint().0.saturating_add(1);
         self.reserve_slots(count);
@@ -686,21 +664,10 @@ impl<S: Storage> World<S> {
     /// Returns the previous values, one Option per tuple member.
     pub fn insert_bundle<B: Bundle<S>>(&mut self, entity: Entity, bundle: B) -> B::Replaced {
         Self::check_bundle::<B>();
-        self.insert_inner(entity, bundle, Some(<S as BundleLookup<B>>::INDEX))
-    }
-    fn insert_inner<B: Bundle<S>>(
-        &mut self,
-        entity: Entity,
-        bundle: B,
-        slot: Option<usize>,
-    ) -> B::Replaced {
-        const {
-            assert!(B::VALID, "invalid bundle components");
-        }
         let location = self
             .location(entity)
             .expect("entity is dead or belongs to another world");
-        let destination = self.destination(location.table, B::INDICES, true, slot);
+        let destination = self.destination::<B>(location.table, true);
         let tick = self.change_tick();
         let row = self.prepare_move(location, destination);
         let replaced = unsafe {
@@ -718,16 +685,10 @@ impl<S: Storage> World<S> {
     /// Remove all present members with one transition; absent members return None.
     pub fn remove_bundle<B: Bundle<S>>(&mut self, entity: Entity) -> B::Replaced {
         Self::check_bundle::<B>();
-        self.remove_inner::<B>(entity, Some(<S as BundleLookup<B>>::INDEX))
-    }
-    fn remove_inner<B: Bundle<S>>(&mut self, entity: Entity, slot: Option<usize>) -> B::Replaced {
-        const {
-            assert!(B::VALID, "invalid bundle components");
-        }
         let Some(location) = self.location(entity) else {
             return B::Replaced::default();
         };
-        let destination = self.destination(location.table, B::INDICES, false, slot);
+        let destination = self.destination::<B>(location.table, false);
         self.prepare_move(location, destination);
         let removed = unsafe { B::take(&self.tables[location.table], location.row) };
         self.transfer(location, destination);
@@ -737,13 +698,13 @@ impl<S: Storage> World<S> {
     where
         S: ComponentLookup<T>,
     {
-        self.insert_inner(entity, (value,), None).0
+        self.insert_bundle(entity, (value,)).0
     }
     pub fn remove<T: 'static>(&mut self, entity: Entity) -> Option<T>
     where
         S: ComponentLookup<T>,
     {
-        self.remove_inner::<(T,)>(entity, None).0
+        self.remove_bundle::<(T,)>(entity).0
     }
     pub fn get<T: 'static>(&self, entity: Entity) -> Option<&T>
     where
@@ -853,6 +814,8 @@ mod bundle_sealed {
 /// Tuples of one through eight unique components.
 pub trait Bundle<S: Storage>: bundle_sealed::Sealed + 'static {
     const INDICES: &'static [usize];
+    #[doc(hidden)]
+    const KEY: u64 = bundle_key(Self::INDICES);
     const VALID: bool;
     type Replaced: Default;
     /// # Safety

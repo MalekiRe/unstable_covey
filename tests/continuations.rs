@@ -19,32 +19,34 @@ fn narrow_prefix_reactivates_workers_and_nested_groups_join() {
         let a = count.clone();
         let b = count.clone();
         let observed = count.clone();
-        let mut app = App::new(World::new(())).add_systems(
-            Update,
-            ready((
-                node(Prefix, || {}),
-                node(
-                    Fork,
-                    (
-                        move || {
-                            left.wait();
-                            a.fetch_add(1, Ordering::SeqCst);
-                        },
-                        move || {
-                            right.wait();
-                            b.fetch_add(1, Ordering::SeqCst);
-                        },
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                ready((
+                    node(Prefix, || {}),
+                    node(
+                        Fork,
+                        (
+                            move || {
+                                left.wait();
+                                a.fetch_add(1, Ordering::SeqCst);
+                            },
+                            move || {
+                                right.wait();
+                                b.fetch_add(1, Ordering::SeqCst);
+                            },
+                        )
+                            .parallel(),
                     )
-                        .parallel(),
-                )
-                .after(Prefix),
-                node(Join, move |mut invocation: Local<usize>| {
-                    *invocation += 1;
-                    assert_eq!(observed.load(Ordering::SeqCst), *invocation * 2);
-                })
-                .after(Fork),
-            )),
-        );
+                    .after(Prefix),
+                    node(Join, move |mut invocation: Local<usize>| {
+                        *invocation += 1;
+                        assert_eq!(observed.load(Ordering::SeqCst), *invocation * 2);
+                    })
+                    .after(Fork),
+                )),
+            )
+            .build();
         for _ in 0..100 {
             app.emit(&Update);
         }
@@ -61,33 +63,33 @@ fn flattened_condition_skips_preserve_locals_and_release_dependents() {
         let observed = count.clone();
         let visits = Arc::new(Mutex::new(Vec::new()));
         let output = visits.clone();
-        let mut world = World::<Components<bool>>::default();
-        let gate = world.spawn();
-        world.insert(gate, true);
-        let mut app = App::new(world).add_systems(
-            Update,
-            ready((
-                node(
-                    Fork,
-                    (
-                        move |mut local: Local<usize>| {
-                            *local += 1;
-                            a.fetch_add(*local, Ordering::SeqCst);
-                        },
-                        move |mut local: Local<usize>| {
-                            *local += 1;
-                            b.fetch_add(*local, Ordering::SeqCst);
-                        },
-                    )
-                        .parallel()
-                        .run_if(|gate: Single<&bool>| **gate),
-                ),
-                node(Join, move || {
-                    output.lock().unwrap().push(observed.load(Ordering::SeqCst));
-                })
-                .after(Fork),
-            )),
-        );
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                ready((
+                    node(
+                        Fork,
+                        (
+                            move |mut local: Local<usize>| {
+                                *local += 1;
+                                a.fetch_add(*local, Ordering::SeqCst);
+                            },
+                            move |mut local: Local<usize>| {
+                                *local += 1;
+                                b.fetch_add(*local, Ordering::SeqCst);
+                            },
+                        )
+                            .parallel()
+                            .run_if(|gate: Single<&bool>| **gate),
+                    ),
+                    node(Join, move || {
+                        output.lock().unwrap().push(observed.load(Ordering::SeqCst));
+                    })
+                    .after(Fork),
+                )),
+            )
+            .build();
+        let gate = app.world.spawn_bundle((true,));
         for enabled in [true, false, false, true] {
             *app.world.get_mut::<bool>(gate).unwrap() = enabled;
             app.emit(&Update);
@@ -103,20 +105,23 @@ fn dynamic_reentry_is_direct_and_pool_binding_restores_after_unwind() {
         let count = Arc::new(AtomicUsize::new(0));
         let a = count.clone();
         let b = count.clone();
-        let mut inner = App::new(World::new(())).add_systems(
-            Update,
-            (
-                move || {
-                    a.fetch_add(1, Ordering::SeqCst);
-                },
-                move || {
-                    b.fetch_add(2, Ordering::SeqCst);
-                },
+        let mut inner = App::new()
+            .add_systems(
+                Update,
+                (
+                    move || {
+                        a.fetch_add(1, Ordering::SeqCst);
+                    },
+                    move || {
+                        b.fetch_add(2, Ordering::SeqCst);
+                    },
+                )
+                    .parallel(),
             )
-                .parallel(),
-        );
-        let mut outer = App::new(World::new(()))
-            .add_systems(Update, (move || inner.emit(&Update), || {}).parallel());
+            .build();
+        let mut outer = App::new()
+            .add_systems(Update, (move || inner.emit(&Update), || {}).parallel())
+            .build();
         for _ in 0..20 {
             outer.emit(&Update);
         }
@@ -131,18 +136,20 @@ fn dynamic_reentry_is_direct_and_pool_binding_restores_after_unwind() {
         let barrier = Arc::new(Barrier::new(2));
         let a = barrier.clone();
         let b = barrier;
-        let mut concurrent = App::new(World::new(())).add_systems(
-            Update,
-            (
-                move || {
-                    a.wait();
-                },
-                move || {
-                    b.wait();
-                },
+        let mut concurrent = App::new()
+            .add_systems(
+                Update,
+                (
+                    move || {
+                        a.wait();
+                    },
+                    move || {
+                        b.wait();
+                    },
+                )
+                    .parallel(),
             )
-                .parallel(),
-        );
+            .build();
         concurrent.emit(&Update);
     });
 }
@@ -154,20 +161,22 @@ fn explicit_work_threshold_runs_small_groups_on_caller() {
     let a = count.clone();
     let b = count.clone();
     WorkerPool::new(3).with_min_parallel_work(3).install(|| {
-        let mut app = App::new(World::new(())).add_systems(
-            Update,
-            (
-                move || {
-                    assert_eq!(std::thread::current().id(), caller);
-                    a.fetch_add(1, Ordering::SeqCst);
-                },
-                move || {
-                    assert_eq!(std::thread::current().id(), caller);
-                    b.fetch_add(1, Ordering::SeqCst);
-                },
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                (
+                    move || {
+                        assert_eq!(std::thread::current().id(), caller);
+                        a.fetch_add(1, Ordering::SeqCst);
+                    },
+                    move || {
+                        assert_eq!(std::thread::current().id(), caller);
+                        b.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                    .parallel(),
             )
-                .parallel(),
-        );
+            .build();
         for _ in 0..20 {
             app.emit(&Update);
         }
@@ -178,25 +187,25 @@ fn explicit_work_threshold_runs_small_groups_on_caller() {
 #[test]
 fn conflict_order_respects_dependencies_not_registration_order() {
     WorkerPool::new(3).install(|| {
-        let mut world = World::<Components<u32>>::default();
-        let entity = world.spawn();
-        world.insert(entity, 1_u32);
-        let mut app = App::new(world).add_systems(
-            Update,
-            ready((
-                node(Join, |mut value: Single<&mut u32>| {
-                    **value *= 10;
-                })
-                .after(Fork),
-                node(Prefix, |mut value: Single<&mut u32>| {
-                    **value += 2;
-                }),
-                node(Fork, |mut value: Single<&mut u32>| {
-                    **value += 3;
-                })
-                .after(Prefix),
-            )),
-        );
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                ready((
+                    node(Join, |mut value: Single<&mut u32>| {
+                        **value *= 10;
+                    })
+                    .after(Fork),
+                    node(Prefix, |mut value: Single<&mut u32>| {
+                        **value += 2;
+                    }),
+                    node(Fork, |mut value: Single<&mut u32>| {
+                        **value += 3;
+                    })
+                    .after(Prefix),
+                )),
+            )
+            .build();
+        let entity = app.world.spawn_bundle((1_u32,));
         app.emit(&Update);
         assert_eq!(app.world.get::<u32>(entity), Some(&60));
     });
@@ -220,20 +229,22 @@ fn multiple_panics_release_payloads_on_the_caller_and_pool_is_reusable() {
             let b = barrier;
             let x = dropped.clone();
             let y = dropped.clone();
-            let mut app = App::new(World::new(())).add_systems(
-                Update,
-                (
-                    move || {
-                        a.wait();
-                        std::panic::panic_any(Payload(x.clone()));
-                    },
-                    move || {
-                        b.wait();
-                        std::panic::panic_any(Payload(y.clone()));
-                    },
+            let mut app = App::new()
+                .add_systems(
+                    Update,
+                    (
+                        move || {
+                            a.wait();
+                            std::panic::panic_any(Payload(x.clone()));
+                        },
+                        move || {
+                            b.wait();
+                            std::panic::panic_any(Payload(y.clone()));
+                        },
+                    )
+                        .parallel(),
                 )
-                    .parallel(),
-            );
+                .build();
             let payload =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.emit(&Update)))
                     .unwrap_err();
@@ -251,22 +262,21 @@ fn simultaneous_callers_keep_worlds_and_invocation_lifetimes_separate() {
             let pool = &pool;
             scope.spawn(move || {
                 pool.install(|| {
-                    let mut world = World::<(Components<u32>, Components<u64>)>::default();
-                    let entity = world.spawn();
-                    world.insert(entity, seed);
-                    world.insert(entity, 0_u64);
-                    let mut app = App::new(world).add_systems(
-                        Update,
-                        (
-                            |mut value: Single<&mut u32>| {
-                                **value += 1;
-                            },
-                            |mut value: Single<&mut u64>| {
-                                **value += 2;
-                            },
+                    let mut app = App::new()
+                        .add_systems(
+                            Update,
+                            (
+                                |mut value: Single<&mut u32>| {
+                                    **value += 1;
+                                },
+                                |mut value: Single<&mut u64>| {
+                                    **value += 2;
+                                },
+                            )
+                                .parallel(),
                         )
-                            .parallel(),
-                    );
+                        .build();
+                    let entity = app.world.spawn_bundle((seed, 0_u64));
                     for _ in 0..30 {
                         app.emit(&Update);
                     }
@@ -291,18 +301,20 @@ fn cancelled_invocations_return_only_after_every_published_branch_finishes() {
                 ran.fetch_add(1, Ordering::SeqCst);
             }
         };
-        let mut app = App::new(World::new(())).add_systems(
-            Update,
-            (
-                || panic!("cancel"),
+        let mut app = App::new()
+            .add_systems(
+                Update,
                 (
-                    (count(&ran), count(&ran)).parallel(),
-                    (count(&ran), count(&ran)).parallel(),
-                    (count(&ran), count(&ran)).parallel(),
-                ),
+                    || panic!("cancel"),
+                    (
+                        (count(&ran), count(&ran)).parallel(),
+                        (count(&ran), count(&ran)).parallel(),
+                        (count(&ran), count(&ran)).parallel(),
+                    ),
+                )
+                    .parallel(),
             )
-                .parallel(),
-        );
+            .build();
         for _ in 0..iterations {
             let emitted =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| app.emit(&Update)));
@@ -319,11 +331,7 @@ fn cancelled_invocations_return_only_after_every_published_branch_finishes() {
 #[test]
 fn later_registrations_observe_every_branch_of_earlier_parallel_ones() {
     WorkerPool::new(3).install(|| {
-        let mut world = World::<(Components<u32>, Components<u64>)>::default();
-        let entity = world.spawn();
-        world.insert(entity, 0_u32);
-        world.insert(entity, 0_u64);
-        let mut app = App::new(world)
+        let mut app = App::new()
             .add_systems(
                 Update,
                 (
@@ -348,7 +356,9 @@ fn later_registrations_observe_every_branch_of_earlier_parallel_ones() {
                     },
                 )
                     .parallel(),
-            );
+            )
+            .build();
+        let entity = app.world.spawn_bundle((0_u32, 0_u64));
         for _ in 0..200 {
             app.emit(&Update);
         }
@@ -363,11 +373,7 @@ fn non_send_systems_and_listeners_still_run_parallel_groups() {
     let local = Rc::new(Cell::new(0));
     let (system, listener) = (local.clone(), local.clone());
     WorkerPool::new(2).install(|| {
-        let mut world = World::<(Components<u32>, Components<u64>)>::default();
-        let entity = world.spawn();
-        world.insert(entity, 0_u32);
-        world.insert(entity, 0_u64);
-        let mut app = App::new(world)
+        let mut app = App::new()
             .add_systems(
                 Update,
                 (
@@ -380,8 +386,10 @@ fn non_send_systems_and_listeners_still_run_parallel_groups() {
                 ),
             )
             .on(move |_: &Update, world: &mut World<_>| {
-                listener.set(listener.get() + *world.get::<u32>(entity).unwrap());
-            });
+                listener.set(listener.get() + **world.single::<&u32>().unwrap());
+            })
+            .build();
+        let entity = app.world.spawn_bundle((0_u32, 0_u64));
         for _ in 0..3 {
             app.emit(&Update);
         }

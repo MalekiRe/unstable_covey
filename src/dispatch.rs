@@ -3,8 +3,10 @@ use std::marker::PhantomData;
 use crate::change::SystemWorld;
 use crate::executor::{self, Context, Continue, Done, Fields, First, Flow, Inner, Project, Root};
 use crate::executor::{Second, Tail, Within, serially};
-use crate::plan::ExecutionMode;
-use crate::{IntoSystems, Storage, System, World};
+use crate::lookup::ComponentLookup;
+use crate::plan::{ExecutionMode, Shape};
+use crate::vocab::{Declaration, Insert, Uses};
+use crate::{Components, IntoSystems, Storage, System, World};
 
 #[derive(Default)]
 pub struct Nil;
@@ -21,6 +23,9 @@ pub trait Handle<E, S> {
     const HAS_PARALLEL: bool = false;
     #[doc(hidden)]
     const WEIGHT: usize = 1;
+    /// Valid for world S: storage resolves and accesses do not alias.
+    #[doc(hidden)]
+    const VALID: bool = true;
     fn handle(&mut self, event: &E, state: &mut S);
     /// Handle within a frame invocation, then continue with K. The handler has
     /// exclusive world access, so the world clock follows this path meanwhile.
@@ -43,10 +48,12 @@ pub trait Handle<E, S> {
     }
 }
 
-impl<E, S, F: FnMut(&E, &mut S)> Handle<E, S> for F {
+/// A payload handler with exclusive world access.
+pub struct Callback<F>(F);
+impl<E, S, F: FnMut(&E, &mut S)> Handle<E, S> for Callback<F> {
     #[inline]
     fn handle(&mut self, event: &E, state: &mut S) {
-        self(event, state);
+        (self.0)(event, state);
     }
 }
 
@@ -67,9 +74,11 @@ pub fn subscribe<E: 'static, F: FnMut(&E)>(callback: F) -> Subscribe<E, F> {
     }
 }
 
-pub fn system<E: 'static, S, F: FnMut(&E, &mut S)>(callback: F) -> On<E, F> {
+/// An installable payload handler. Annotate the world as `&mut World<_>`, or
+/// make a plugin generic over it.
+pub fn system<E: 'static, F>(callback: F) -> On<E, Callback<F>> {
     On {
-        handler: callback,
+        handler: Callback(callback),
         marker: PhantomData,
     }
 }
@@ -103,6 +112,7 @@ impl<H, T> Fields for Cons<H, T> {
 impl<E, S: SystemWorld, P: System<S, Output = ()>> Handle<E, S> for Run<P> {
     const HAS_PARALLEL: bool = P::HAS_PARALLEL;
     const WEIGHT: usize = P::WEIGHT;
+    const VALID: bool = P::VALID;
     #[inline]
     fn handle(&mut self, _: &E, state: &mut S) {
         let _ = self.0.run(state);
@@ -289,24 +299,57 @@ where
     }
 }
 
+/// What a handler's systems access, independent of any world type.
+#[doc(hidden)]
+pub trait Handler {
+    type Access;
+}
+impl<F> Handler for Callback<F> {
+    type Access = ();
+}
+impl<F> Handler for Listener<F> {
+    type Access = ();
+}
+impl<P: Shape> Handler for Run<P> {
+    type Access = P::Access;
+}
+
 /// Type-transforming installation. Tuples install their left fragment first.
-pub trait Install<S, L> {
+/// `Components` is `C` extended with every component the fragment's systems use.
+pub trait Install<C, L> {
+    type Components: Storage;
     type Output;
     fn install(self, listeners: L) -> Self::Output;
 }
-
-impl<E: 'static, H: Handle<E, S>, S, L> Install<S, L> for On<E, H> {
+impl<E: 'static, H: Handler<Access: Uses<C>>, C, L> Install<C, L> for On<E, H> {
+    type Components = <H::Access as Uses<C>>::Out;
     type Output = Cons<Self, L>;
     fn install(self, listeners: L) -> Self::Output {
         Cons(self, listeners)
     }
 }
-
-impl<S, L, A: Install<S, L>, B: Install<S, A::Output>> Install<S, L> for (A, B) {
+impl<C, L, A: Install<C, L>, B: Install<A::Components, A::Output>> Install<C, L> for (A, B) {
+    type Components = B::Components;
     type Output = B::Output;
     fn install(self, listeners: L) -> Self::Output {
         self.1.install(self.0.install(listeners))
     }
+}
+
+/// Every handler in a listener list runs against world `W`. Checked once at
+/// `build`, which also fixes the world type of callbacks written as `World<_>`.
+#[doc(hidden)]
+pub trait Fits<W> {
+    const VALID: bool;
+}
+impl<W> Fits<W> for Nil {
+    const VALID: bool = true;
+}
+impl<W, H: Fits<W>, T: Fits<W>> Fits<W> for Cons<H, T> {
+    const VALID: bool = H::VALID && T::VALID;
+}
+impl<W, E: 'static, H: Handle<E, W>> Fits<W> for On<E, H> {
+    const VALID: bool = H::VALID;
 }
 
 /// Event-only dispatcher; listeners and their captures live inline.
@@ -345,73 +388,141 @@ impl<L> Bus<L> {
     }
 }
 
-/// The same specialized dispatcher, with typed ECS storage passed to systems.
+/// Composes plugins and systems; `build` creates a world storing exactly the
+/// components they use. `C` is that inferred component set.
+pub struct AppBuilder<C = (), L = Nil> {
+    listeners: L,
+    execution_mode: ExecutionMode,
+    components: PhantomData<fn() -> C>,
+}
+
+impl<C: Storage, L> AppBuilder<C, L> {
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+    pub fn install<P: Install<C, L>>(self, plugin: P) -> AppBuilder<P::Components, P::Output> {
+        AppBuilder {
+            listeners: plugin.install(self.listeners),
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
+    /// A payload handler with exclusive world access. Annotate the world as
+    /// `world: &mut World<_>`; it is inferred at `build`.
+    pub fn on<E: 'static, F>(self, callback: F) -> AppBuilder<C, Cons<On<E, Callback<F>>, L>> {
+        self.install(system(callback))
+    }
+    /// A zero-sized event type can serve as an open-ended schedule label.
+    /// Plans ignore the payload; use `on` when a system needs event data.
+    #[allow(clippy::type_complexity)]
+    pub fn add_systems<E: 'static, P: IntoSystems<M>, M>(
+        self,
+        _: E,
+        systems: P,
+    ) -> AppBuilder<
+        <<P::Systems as Shape>::Access as Uses<C>>::Out,
+        Cons<Scheduled<E, P::Systems>, L>,
+    >
+    where
+        <P::Systems as Shape>::Access: Uses<C>,
+    {
+        self.install(On {
+            handler: Run(systems.into_systems()),
+            marker: PhantomData,
+        })
+    }
+    /// Store `T` even though no system queries it, e.g. a tag that is only
+    /// inserted, or data read through `World` methods outside systems. Keeps
+    /// any storage already chosen for `T`.
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct Tag;
+    /// let mut app = App::new().build();
+    /// let entity = app.world.spawn();
+    /// app.world.insert(entity, Tag); // never used or registered
+    /// ```
+    pub fn register<T: 'static>(self) -> AppBuilder<<C as Insert<Components<T>>>::Out, L>
+    where
+        C: Insert<Components<T>>,
+    {
+        AppBuilder {
+            listeners: self.listeners,
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
+    /// Choose a component's storage: `Sparse<T>`, or `Components<T, true>` for
+    /// column change summaries. Must precede systems that use `T`.
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct Update;
+    /// struct Tag;
+    /// App::new()
+    ///     .add_systems(Update, |_: Query<&Tag>| {})
+    ///     .storage::<Sparse<Tag>>() // too late: Tag is already dense
+    ///     .build();
+    /// ```
+    pub fn storage<D: Declaration>(self) -> AppBuilder<<C as Insert<D>>::Out, L>
+    where
+        C: Insert<D>,
+    {
+        const {
+            assert!(
+                <C as ComponentLookup<D::Component>>::COUNT == 0
+                    || (<C as ComponentLookup<D::Component>>::SPARSE == D::SPARSE
+                        && <C as ComponentLookup<D::Component>>::SUMMARY == D::SUMMARY),
+                "component already stored differently: choose storage before systems that use it"
+            );
+        }
+        AppBuilder {
+            listeners: self.listeners,
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
+    /// Create the world. Every handler is checked against it here.
+    pub fn build(self) -> App<C, L>
+    where
+        L: Fits<World<C>>,
+    {
+        const {
+            assert!(
+                L::VALID,
+                "invalid system: missing/ambiguous storage or conflicting access"
+            );
+        }
+        App {
+            world: World::default(),
+            listeners: self.listeners,
+            execution_mode: self.execution_mode,
+        }
+    }
+}
+
+/// A built app: a world with its inferred component set `S`, and every handler.
 pub struct App<S: Storage, L = Nil> {
     pub world: World<S>,
     listeners: L,
     execution_mode: ExecutionMode,
 }
 
-impl<S: Storage> App<S> {
-    pub fn new(world: World<S>) -> Self {
-        Self {
-            world,
+impl App<()> {
+    /// Start composing an app. Components are inferred from its systems.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> AppBuilder {
+        AppBuilder {
             listeners: Nil,
             execution_mode: ExecutionMode::Parallel,
+            components: PhantomData,
         }
     }
 }
 
 impl<S: Storage, L> App<S, L> {
-    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
-        self.execution_mode = mode;
-        self
-    }
     pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
         self.execution_mode = mode;
     }
-    /// Installation checks the handler's storage type, rather than silently
-    /// accepting an incompatible system that would take the no-op fallback.
-    /// ```compile_fail
-    /// use static_ecs::{App, Components, World, system};
-    /// struct Update;
-    /// App::new(World::<Components<u32>>::default())
-    ///     .install(system(|_: &Update, _: &mut World<Components<String>>| {}));
-    /// ```
-    pub fn install<P: Install<World<S>, L>>(self, plugin: P) -> App<S, P::Output> {
-        App {
-            world: self.world,
-            listeners: plugin.install(self.listeners),
-            execution_mode: self.execution_mode,
-        }
-    }
-
-    pub fn on<E: 'static, F: FnMut(&E, &mut World<S>)>(
-        self,
-        callback: F,
-    ) -> App<S, Cons<On<E, F>, L>> {
-        self.install(system(callback))
-    }
-
-    /// A zero-sized event type can serve as an open-ended schedule label.
-    /// Plans ignore the payload; use `on` when a system needs event data.
-    pub fn add_systems<E: 'static, P: IntoSystems<World<S>, M>, M>(
-        self,
-        _: E,
-        systems: P,
-    ) -> App<S, Cons<Scheduled<E, P::Systems>, L>> {
-        const {
-            assert!(
-                P::Systems::VALID,
-                "invalid system: missing/ambiguous storage or conflicting access"
-            );
-        }
-        self.install(On {
-            handler: Run(systems.into_systems()),
-            marker: PhantomData,
-        })
-    }
-
     /// Runs every handler registered for E, in registration order.
     #[inline]
     pub fn emit<E: 'static>(&mut self, event: &E)

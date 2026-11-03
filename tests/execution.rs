@@ -22,34 +22,34 @@ fn dependent_runs_before_unrelated_root_finishes() {
         let a = rendezvous.clone();
         let b = rendezvous;
         let (send, receive) = mpsc::channel();
-        let mut world = World::<Components<u32>>::default();
-        let entity = world.spawn();
-        world.insert(entity, 0_u32);
-        let mut app = App::new(world).add_systems(
-            Update,
-            ready((
-                node(A, move |mut value: Single<&mut u32>| {
-                    a.wait();
-                    **value += 1;
-                }),
-                node(B, move || {
-                    b.wait();
-                    assert_eq!(
-                        receive.recv_timeout(Duration::from_secs(10)).unwrap() % 11,
-                        1
-                    );
-                }),
-                node(C, move |value: Single<&u32>| {
-                    send.send(**value).unwrap();
-                })
-                .after(A),
-                node(D, |mut value: Single<&mut u32>| {
-                    **value += 10;
-                })
-                .after(A)
-                .after(B),
-            )),
-        );
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                ready((
+                    node(A, move |mut value: Single<&mut u32>| {
+                        a.wait();
+                        **value += 1;
+                    }),
+                    node(B, move || {
+                        b.wait();
+                        assert_eq!(
+                            receive.recv_timeout(Duration::from_secs(10)).unwrap() % 11,
+                            1
+                        );
+                    }),
+                    node(C, move |value: Single<&u32>| {
+                        send.send(**value).unwrap();
+                    })
+                    .after(A),
+                    node(D, |mut value: Single<&mut u32>| {
+                        **value += 10;
+                    })
+                    .after(A)
+                    .after(B),
+                )),
+            )
+            .build();
+        let entity = app.world.spawn_bundle((0_u32,));
         app.emit(&Update);
         app.emit(&Update);
         assert_eq!(app.world.get::<u32>(entity), Some(&22));
@@ -63,26 +63,26 @@ fn conflicting_nodes_are_serialized_without_dependency_edges() {
         let active = Arc::new(AtomicUsize::new(0));
         let a = active.clone();
         let b = active.clone();
-        let mut world = World::<Components<u64>>::default();
-        let entity = world.spawn();
-        world.insert(entity, 0_u64);
-        let mut app = App::new(world).add_systems(
-            Update,
-            ready((
-                node(A, move |mut value: Single<&mut u64>| {
-                    assert_eq!(a.fetch_add(1, Ordering::SeqCst), 0);
-                    std::thread::yield_now();
-                    **value += 1;
-                    a.fetch_sub(1, Ordering::SeqCst);
-                }),
-                node(B, move |mut value: Single<&mut u64>| {
-                    assert_eq!(b.fetch_add(1, Ordering::SeqCst), 0);
-                    std::thread::yield_now();
-                    **value += 2;
-                    b.fetch_sub(1, Ordering::SeqCst);
-                }),
-            )),
-        );
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                ready((
+                    node(A, move |mut value: Single<&mut u64>| {
+                        assert_eq!(a.fetch_add(1, Ordering::SeqCst), 0);
+                        std::thread::yield_now();
+                        **value += 1;
+                        a.fetch_sub(1, Ordering::SeqCst);
+                    }),
+                    node(B, move |mut value: Single<&mut u64>| {
+                        assert_eq!(b.fetch_add(1, Ordering::SeqCst), 0);
+                        std::thread::yield_now();
+                        **value += 2;
+                        b.fetch_sub(1, Ordering::SeqCst);
+                    }),
+                )),
+            )
+            .build();
+        let entity = app.world.spawn_bundle((0_u64,));
         for _ in 0..50 {
             app.emit(&Update);
         }
@@ -93,10 +93,9 @@ fn conflicting_nodes_are_serialized_without_dependency_edges() {
 
 #[test]
 fn serial_graph_releases_dependents_after_parameter_and_condition_skips() {
-    type Schema = Components<u32>;
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
-    let mut app = App::new(World::<Schema>::default())
+    let mut app = App::new()
         .with_execution_mode(ExecutionMode::Serial)
         .add_systems(
             Update,
@@ -107,18 +106,18 @@ fn serial_graph_releases_dependents_after_parameter_and_condition_skips() {
                 node(B, (|| panic!("skipped body")).run_if(|| false)).after(A),
                 node(
                     C,
-                    exclusive(|world: &mut World<Schema>| {
+                    exclusive(|world: &mut World<_>| {
                         if let Some(mut value) = world.single::<&mut u32>() {
                             **value += 1;
                         } else {
-                            let entity = world.spawn();
-                            world.insert(entity, 1_u32);
+                            world.spawn_bundle((1_u32,));
                         }
                     }),
                 )
                 .after(B),
             )),
-        );
+        )
+        .build();
     app.emit(&Update);
     app.emit(&Update);
     app.emit(&Update);
@@ -135,29 +134,29 @@ fn panic_joins_running_nodes_and_graph_can_run_again() {
         let right = barrier;
         let completed = Arc::new(AtomicUsize::new(0));
         let done = completed.clone();
-        let mut world = World::<Components<u32>>::default();
-        let entity = world.spawn();
-        world.insert(entity, 0_u32);
-        let mut app = App::new(world).add_systems(
-            Update,
-            ready((
-                node(A, move |mut attempts: Local<u32>| {
-                    *attempts += 1;
-                    left.wait();
-                    assert!(*attempts != 1, "first invocation fails");
-                }),
-                node(B, move || {
-                    right.wait();
-                    std::thread::yield_now();
-                    done.fetch_add(1, Ordering::SeqCst);
-                }),
-                node(C, |mut value: Single<&mut u32>| {
-                    **value += 1;
-                })
-                .after(A)
-                .after(B),
-            )),
-        );
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                ready((
+                    node(A, move |mut attempts: Local<u32>| {
+                        *attempts += 1;
+                        left.wait();
+                        assert!(*attempts != 1, "first invocation fails");
+                    }),
+                    node(B, move || {
+                        right.wait();
+                        std::thread::yield_now();
+                        done.fetch_add(1, Ordering::SeqCst);
+                    }),
+                    node(C, |mut value: Single<&mut u32>| {
+                        **value += 1;
+                    })
+                    .after(A)
+                    .after(B),
+                )),
+            )
+            .build();
+        let entity = app.world.spawn_bundle((0_u32,));
         assert!(catch_unwind(AssertUnwindSafe(|| app.emit(&Update))).is_err());
         assert_eq!(completed.load(Ordering::SeqCst), 1);
         assert_eq!(app.world.get::<u32>(entity), Some(&0));
@@ -174,7 +173,7 @@ fn serial_mode_keeps_nested_parallel_groups_on_calling_thread() {
     let a = visits.clone();
     let b = visits.clone();
     let c = visits.clone();
-    let mut app = App::new(World::new(()))
+    let mut app = App::new()
         .with_execution_mode(ExecutionMode::Serial)
         .add_systems(
             Update,
@@ -197,7 +196,8 @@ fn serial_mode_keeps_nested_parallel_groups_on_calling_thread() {
             )
                 .parallel()
                 .run_if(|| true),
-        );
+        )
+        .build();
     app.emit(&Update);
     assert_eq!(visits.load(Ordering::SeqCst), 3);
 }
@@ -206,30 +206,30 @@ fn serial_mode_keeps_nested_parallel_groups_on_calling_thread() {
 fn single_worker_nested_graphs_complete_without_blocked_workers() {
     let pool = WorkerPool::new(1);
     pool.install(|| {
-        let mut world = World::<Components<u32>>::default();
-        let entity = world.spawn();
-        world.insert(entity, 0_u32);
-        let mut app = App::new(world).add_systems(
-            Update,
-            ready((
-                node(
-                    A,
-                    ready((
-                        node(C, |mut value: Single<&mut u32>| {
-                            **value += 1;
-                        }),
-                        node(D, |mut value: Single<&mut u32>| {
-                            **value *= 3;
-                        })
-                        .after(C),
-                    )),
-                ),
-                node(B, |mut value: Single<&mut u32>| {
-                    **value += 2;
-                })
-                .after(A),
-            )),
-        );
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                ready((
+                    node(
+                        A,
+                        ready((
+                            node(C, |mut value: Single<&mut u32>| {
+                                **value += 1;
+                            }),
+                            node(D, |mut value: Single<&mut u32>| {
+                                **value *= 3;
+                            })
+                            .after(C),
+                        )),
+                    ),
+                    node(B, |mut value: Single<&mut u32>| {
+                        **value += 2;
+                    })
+                    .after(A),
+                )),
+            )
+            .build();
+        let entity = app.world.spawn_bundle((0_u32,));
         app.emit(&Update);
         assert_eq!(app.world.get::<u32>(entity), Some(&5));
     });

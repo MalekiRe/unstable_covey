@@ -56,10 +56,10 @@ compared the full state after each of 126 updates with zero, one, and 4,096
 actors, on one and four workers, across all three backends. This is
 differential verification of shared algorithms, not an independent oracle.
 
-## Executor changes against the previous commit
+## Executor changes (`4881691` → `5e0b7a0`)
 
 Same simulation and system bodies, comparing the commit before the current
-executor (`4881691`) with the current code. Five alternating repetitions per row.
+executor (`4881691`) with `5e0b7a0`. Five alternating repetitions per row.
 
 | Actors | Workers | Before ms | After ms | Change |
 |---:|---:|---:|---:|---:|
@@ -76,6 +76,27 @@ whose hottest instructions were the compare-and-swap retry loop on the shared
 world change counter. Carrying the change clock along continuations removed it.
 Populated frames are dominated by system bodies; their ±2% differences are
 within this machine's run-to-run variation.
+
+## Inferred world (`5e0b7a0` → current)
+
+The world's component set is now inferred, and bundles need no declaration: a
+world-level cache keyed by a compile-time bundle hash replaces the per-bundle
+fields. The benchmark adapter registers its 25 components up front, so shared
+helper code can name the world type; system bodies are unchanged. Five
+alternating repetitions per row:
+
+| Actors | Workers | Before ms | After ms | Change |
+|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0691 | 0.0694 | +0.5% |
+| 0 | 4 | 0.0268 | 0.0268 | +0.3% |
+| 4,096 | 1 | 1.269 | 1.280 | +0.9% |
+| 4,096 | 4 | 1.025 | 1.015 | −1.0% |
+| 100,000 | 1 | 96.9 | 98.4 | +1.5% |
+| 100,000 | 4 | 79.2 | 79.9 | +0.9% |
+
+All differences are within run-to-run variation; all 60 processes produced
+identical final states, and per-update states still match Bevy for zero, one, and
+4,096 actors. Results: `inferred-*.json`.
 
 ## Blended microbenchmark
 

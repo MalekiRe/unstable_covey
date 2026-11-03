@@ -4,7 +4,7 @@ use crate::{
     access::{Access, Conflict, Same},
     executor::{self, Context, Continue, Fields, First, Flow, Inner, Join, Project, Second},
     executor::{Tail, Then, Within, run},
-    plan::{self, IntoSystems, System},
+    plan::{self, IntoSystems, Shape, System},
 };
 use std::marker::PhantomData;
 
@@ -41,11 +41,11 @@ pub struct Entry<L, F, D> {
 #[doc(hidden)]
 pub struct Pair<A, B>(A, B);
 #[doc(hidden)]
-pub trait IntoNodes<S, M> {
+pub trait IntoNodes<M> {
     type Nodes;
     fn into_nodes(self) -> Self::Nodes;
 }
-impl<S, L, F: IntoSystems<S, M>, M, D> IntoNodes<S, M> for Node<L, F, D> {
+impl<L, F: IntoSystems<M>, M, D> IntoNodes<M> for Node<L, F, D> {
     type Nodes = Entry<L, F::Systems, D>;
     fn into_nodes(self) -> Self::Nodes {
         Entry {
@@ -54,14 +54,14 @@ impl<S, L, F: IntoSystems<S, M>, M, D> IntoNodes<S, M> for Node<L, F, D> {
         }
     }
 }
-impl<S, A: IntoNodes<S, AM>, B: IntoNodes<S, BM>, AM, BM> IntoNodes<S, (AM, BM)> for (A, B) {
+impl<A: IntoNodes<AM>, B: IntoNodes<BM>, AM, BM> IntoNodes<(AM, BM)> for (A, B) {
     type Nodes = Pair<A::Nodes, B::Nodes>;
     fn into_nodes(self) -> Self::Nodes {
         Pair(self.0.into_nodes(), self.1.into_nodes())
     }
 }
-impl<S, A: IntoNodes<S, AM>, B: IntoNodes<S, BM>, C: IntoNodes<S, CM>, AM, BM, CM>
-    IntoNodes<S, (AM, BM, CM)> for (A, B, C)
+impl<A: IntoNodes<AM>, B: IntoNodes<BM>, C: IntoNodes<CM>, AM, BM, CM> IntoNodes<(AM, BM, CM)>
+    for (A, B, C)
 {
     type Nodes = Pair<A::Nodes, Pair<B::Nodes, C::Nodes>>;
     fn into_nodes(self) -> Self::Nodes {
@@ -71,17 +71,8 @@ impl<S, A: IntoNodes<S, AM>, B: IntoNodes<S, BM>, C: IntoNodes<S, CM>, AM, BM, C
         )
     }
 }
-impl<
-    S,
-    A: IntoNodes<S, AM>,
-    B: IntoNodes<S, BM>,
-    C: IntoNodes<S, CM>,
-    D: IntoNodes<S, DM>,
-    AM,
-    BM,
-    CM,
-    DM,
-> IntoNodes<S, (AM, BM, CM, DM)> for (A, B, C, D)
+impl<A: IntoNodes<AM>, B: IntoNodes<BM>, C: IntoNodes<CM>, D: IntoNodes<DM>, AM, BM, CM, DM>
+    IntoNodes<(AM, BM, CM, DM)> for (A, B, C, D)
 {
     type Nodes = Pair<A::Nodes, Pair<B::Nodes, Pair<C::Nodes, D::Nodes>>>;
     fn into_nodes(self) -> Self::Nodes {
@@ -168,39 +159,35 @@ impl Rows {
         }
     }
 }
-trait Compare<S, D, A> {
+trait Compare<D, A> {
     const LEN: usize;
     const BITS: Bits;
 }
-impl<S, L: 'static, F: System<S>, OD, D: Depends<L>, A: Conflict<F::Access>> Compare<S, D, A>
+impl<L: 'static, F: Shape, OD, D: Depends<L>, A: Conflict<F::Access>> Compare<D, A>
     for Entry<L, F, OD>
 {
     const LEN: usize = 1;
     const BITS: Bits = Bits::Leaf(D::VALUE, A::VALUE);
 }
-impl<S, D, A, L: Compare<S, D, A>, R: Compare<S, D, A>> Compare<S, D, A> for Pair<L, R> {
+impl<D, A, L: Compare<D, A>, R: Compare<D, A>> Compare<D, A> for Pair<L, R> {
     const LEN: usize = L::LEN + R::LEN;
     const BITS: Bits = Bits::Pair(&L::BITS, &R::BITS, L::LEN);
 }
 #[doc(hidden)]
-pub trait BuildRows<S, All> {
+pub trait BuildRows<All> {
+    /// Labels are unique and every dependency names exactly one node.
     const VALID: bool;
     const COUNT: usize;
     const ROWS: Rows;
 }
-impl<
-    S,
-    L: 'static,
-    F: System<S>,
-    D: ValidDependencies<All>,
-    All: Labels<L> + Compare<S, D, F::Access>,
-> BuildRows<S, All> for Entry<L, F, D>
+impl<L: 'static, F: Shape, D: ValidDependencies<All>, All: Labels<L> + Compare<D, F::Access>>
+    BuildRows<All> for Entry<L, F, D>
 {
-    const VALID: bool = F::VALID && D::VALID && All::COUNT == 1;
+    const VALID: bool = D::VALID && All::COUNT == 1;
     const COUNT: usize = 1;
     const ROWS: Rows = Rows::Leaf(&All::BITS, F::WEIGHT);
 }
-impl<S, All, A: BuildRows<S, All>, B: BuildRows<S, All>> BuildRows<S, All> for Pair<A, B> {
+impl<All, A: BuildRows<All>, B: BuildRows<All>> BuildRows<All> for Pair<A, B> {
     const VALID: bool = A::VALID && B::VALID;
     const COUNT: usize = A::COUNT + B::COUNT;
     const ROWS: Rows = Rows::Pair(&A::ROWS, &B::ROWS, A::COUNT);
@@ -405,8 +392,8 @@ pub struct Zero;
 impl Index for Zero {
     const VALUE: usize = 0;
 }
-struct Offset<I, A, S>(PhantomData<fn() -> (I, A)>, PhantomData<fn() -> S>);
-impl<I: Index, A: Nodes<S>, S> Index for Offset<I, A, S> {
+struct Offset<I, A>(PhantomData<fn() -> (I, A)>);
+impl<I: Index, A: NodeList> Index for Offset<I, A> {
     const VALUE: usize = I::VALUE + A::LEN;
 }
 
@@ -472,14 +459,32 @@ mod sealed {
     impl<L, F, D> Sealed for super::Entry<L, F, D> {}
     impl<A, B> Sealed for super::Pair<A, B> {}
 }
-/// Each node's code is emitted once: inline at its unique local site, or in
-/// one out-of-line entry shared by publication, fallback, and join arrival.
+/// The graph's nodes, independent of any world type.
 #[doc(hidden)]
-pub trait Nodes<S>: sealed::Sealed + Sized {
+pub trait NodeList: sealed::Sealed + Sized {
     type Access: Access;
     const LEN: usize;
     const WEIGHT: usize;
     const HAS_PARALLEL: bool;
+}
+impl<L, F: Shape<Output = ()>, D> NodeList for Entry<L, F, D> {
+    type Access = F::Access;
+    const LEN: usize = 1;
+    const WEIGHT: usize = F::WEIGHT;
+    const HAS_PARALLEL: bool = F::HAS_PARALLEL;
+}
+impl<A: NodeList, B: NodeList> NodeList for Pair<A, B> {
+    type Access = (A::Access, B::Access);
+    const LEN: usize = A::LEN + B::LEN;
+    const WEIGHT: usize = A::WEIGHT + B::WEIGHT;
+    const HAS_PARALLEL: bool = A::HAS_PARALLEL || B::HAS_PARALLEL;
+}
+/// Each node's code is emitted once: inline at its unique local site, or in
+/// one out-of-line entry shared by publication, fallback, and join arrival.
+#[doc(hidden)]
+pub trait Nodes<S>: NodeList {
+    /// Every node's system is valid for world S.
+    const VALID: bool;
     /// # Safety
     /// The graph was just reset; P selects these entries within graph G.
     unsafe fn roots<
@@ -527,10 +532,7 @@ pub trait Nodes<S>: sealed::Sealed + Sized {
     ) -> bool;
 }
 impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
-    type Access = F::Access;
-    const LEN: usize = 1;
-    const WEIGHT: usize = F::WEIGHT;
-    const HAS_PARALLEL: bool = F::HAS_PARALLEL;
+    const VALID: bool = F::VALID;
     #[inline(always)]
     unsafe fn roots<
         R: Send,
@@ -628,10 +630,7 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     }
 }
 impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
-    type Access = (A::Access, B::Access);
-    const LEN: usize = A::LEN + B::LEN;
-    const WEIGHT: usize = A::WEIGHT + B::WEIGHT;
-    const HAS_PARALLEL: bool = A::HAS_PARALLEL || B::HAS_PARALLEL;
+    const VALID: bool = A::VALID && B::VALID;
     #[inline(always)]
     unsafe fn roots<
         R: Send,
@@ -652,7 +651,7 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
                 R,
                 Second<P>,
                 G,
-                Offset<I, A, S>,
+                Offset<I, A>,
                 K,
                 REMOTE,
             >(context, flow))
@@ -679,7 +678,7 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
                 R,
                 Second<P>,
                 G,
-                Offset<I, A, S>,
+                Offset<I, A>,
                 From,
                 K,
                 REMOTE,
@@ -696,7 +695,7 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
     ) -> bool {
         unsafe {
             A::serial::<G, I, Stage>(&raw mut (*nodes).0, world, clock)
-                | B::serial::<G, Offset<I, A, S>, Stage>(&raw mut (*nodes).1, world, clock)
+                | B::serial::<G, Offset<I, A>, Stage>(&raw mut (*nodes).1, world, clock)
         }
     }
     #[inline(always)]
@@ -707,7 +706,7 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
     ) -> bool {
         unsafe {
             A::ordered::<G, Stage>(nodes, world, clock)
-                | B::ordered::<G, Offset<Stage, A, S>>(nodes, world, clock)
+                | B::ordered::<G, Offset<Stage, A>>(nodes, world, clock)
         }
     }
 }
@@ -724,22 +723,25 @@ impl<N> Inner for ReadyGraph<N> {
         unsafe { &raw mut (*this).nodes }
     }
 }
+impl<N: NodeList + BuildRows<N>> ReadyGraph<N> {
+    const COMPILED: Topology = Topology::compile(&N::ROWS, N::LEN);
+}
 #[doc(hidden)]
 pub struct ReadyMarker<M>(PhantomData<M>);
-impl<S: Send + Sync, T: IntoNodes<S, M>, M> IntoSystems<S, ReadyMarker<M>> for GraphConfig<T>
+impl<T: IntoNodes<M>, M> IntoSystems<ReadyMarker<M>> for GraphConfig<T>
 where
-    T::Nodes: Nodes<S> + BuildRows<S, T::Nodes> + Send,
+    T::Nodes: NodeList + BuildRows<T::Nodes>,
 {
     type Systems = ReadyGraph<T::Nodes>;
     fn into_systems(self) -> Self::Systems {
         const {
             assert!(
-                <T::Nodes as BuildRows<S, T::Nodes>>::VALID,
-                "invalid graph: duplicate/missing labels or invalid system access"
+                <T::Nodes as BuildRows<T::Nodes>>::VALID,
+                "invalid graph: duplicate or missing labels"
             );
         }
-        let joins = const { <ReadyGraph<T::Nodes> as Spec<S>>::TOPOLOGY.joins };
-        let arrivals = const { <ReadyGraph<T::Nodes> as Spec<S>>::TOPOLOGY.arrivals };
+        let joins = const { ReadyGraph::<T::Nodes>::COMPILED.joins };
+        let arrivals = const { ReadyGraph::<T::Nodes>::COMPILED.arrivals };
         ReadyGraph {
             nodes: self.0.into_nodes(),
             joins: arrivals[..joins]
@@ -749,19 +751,21 @@ where
         }
     }
 }
-impl<S, N: Nodes<S> + BuildRows<S, N>> Spec<S> for ReadyGraph<N> {
+impl<S, N: Nodes<S> + BuildRows<N>> Spec<S> for ReadyGraph<N> {
     type Nodes = N;
-    const TOPOLOGY: Topology = Topology::compile(&N::ROWS, N::LEN);
+    const TOPOLOGY: Topology = Self::COMPILED;
     unsafe fn join(this: *mut Self, index: usize) -> *const Join {
         unsafe { &raw const (*(*this).joins.as_ptr().add(index)).0 }
     }
 }
-impl<S: Send + Sync, N: Nodes<S> + BuildRows<S, N> + Send> System<S> for ReadyGraph<N> {
+impl<N: NodeList + BuildRows<N>> Shape for ReadyGraph<N> {
     type Access = N::Access;
     type Output = ();
-    const VALID: bool = <N as BuildRows<S, N>>::VALID;
-    const HAS_PARALLEL: bool = Self::TOPOLOGY.parallel || N::HAS_PARALLEL;
+    const HAS_PARALLEL: bool = Self::COMPILED.parallel || N::HAS_PARALLEL;
     const WEIGHT: usize = N::WEIGHT;
+}
+impl<S: Send + Sync, N: Nodes<S> + BuildRows<N> + Send> System<S> for ReadyGraph<N> {
+    const VALID: bool = <N as Nodes<S>>::VALID;
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,

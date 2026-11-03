@@ -2,13 +2,15 @@
 
 A small ECS whose schedules are Rust types. Plugins, systems, and event routing
 compose into one concrete application type; `emit` runs a frame as statically
-dispatched, inlinable code. No `TypeId`, runtime registries, boxed systems, or
-external dependencies.
+dispatched, inlinable code. The world's component set is inferred from the
+systems you add, at compile time. No schema, `TypeId`, runtime registries, boxed
+systems, or external dependencies.
 
-It relies on **nightly full specialization** (`nightly-2026-10-25`), an incomplete
-feature with known soundness holes; the compiler warning is left visible. Typed
-parameter fetching and the executor use internal `unsafe`, guarded by
-compile-time access checks and sealed traits. This is an experiment.
+It relies on **nightly full specialization** and the minimal generic-const-argument
+features (`nightly-2026-10-25`). These are incomplete features with known
+soundness holes; the compiler warnings are left visible. Typed parameter fetching
+and the executor use internal `unsafe`, guarded by compile-time access checks and
+sealed traits. This is an experiment.
 
 ```sh
 cargo run --release --example simulation
@@ -23,19 +25,14 @@ struct Update;
 struct Position(f32);
 struct Velocity(f32);
 
-let mut world = World::<(Components<Position>, Components<Velocity>)>::default();
-let entity = world.spawn();
-world.insert(entity, Position(0.0));
-world.insert(entity, Velocity(2.0));
-
-let mut app = App::new(world).add_systems(
-    Update,
-    |mut query: Query<(&mut Position, &Velocity)>| {
+let mut app = App::new()
+    .add_systems(Update, |mut query: Query<(&mut Position, &Velocity)>| {
         for (mut position, velocity) in &mut query {
             position.0 += velocity.0;
         }
-    },
-);
+    })
+    .build(); // The world stores Position and Velocity: what the systems use.
+let entity = app.world.spawn_bundle((Position(0.0), Velocity(2.0)));
 app.emit(&Update);
 assert_eq!(app.world.get::<Position>(entity).unwrap().0, 2.0);
 ```
@@ -84,27 +81,46 @@ left to right. Keep the event type visible in cross-crate return types
 (`Subscribe<E, F>` is `On<E, Listener<F>>`). Events are `'static` types. The
 `demo/` crates compose two independent plugin crates.
 
-`App<State, List>` adds a world. `add_systems(Label, systems)` registers systems
-for a zero-sized label; `.on(|event: &E, world| ...)` and `system(...)` fragments
-receive the payload and exclusive world access. Handlers run in registration order.
+`App::new()` returns a builder. `add_systems(Label, systems)` registers systems
+for a zero-sized label; `.on(|event: &E, world: &mut World<_>| ...)` and
+`system(...)` fragments receive the payload and exclusive world access.
+Handlers run in registration order. `.build()` creates the world and checks
+every system against it.
+
+## The inferred world
+
+Each system's type records what it accesses: `Query<(&mut Position, &Velocity),
+With<Active>>` mentions `Position`, `Velocity`, and `Active`. As the builder
+grows, it folds these into a component set, deduplicated by type at compile time,
+and `build` creates a `World` storing exactly that set. Component lookups stay
+compile-time constants.
+
+- `.register::<T>()` adds a component no system mentions, such as a tag only
+  inserted by `main` or an exclusive system. Using an unstored component is a
+  compile error that says so.
+- `.storage::<Sparse<T>>()` (or `Components<T, true>` for column change summaries)
+  chooses a component's storage. It must precede systems that use `T`; otherwise
+  compilation fails rather than silently keeping dense storage.
+- Exclusive systems and payload handlers name the world as `World<_>`, inferred at
+  `build`. A plugin's exclusive system can instead be generic over any world
+  storing what it needs: `fn tag_new<S: Has<Tag>>() -> ExclusiveSystem<impl
+  FnMut(&mut World<S>)>`.
+
+The world exists only after `build`, so spawn entities afterwards. Changing a
+system changes the world's type; that is purely a compile-time effect.
 
 ## Storage
 
-The world declares its component vocabulary as nested pairs of `Components<T>`
-(dense) and `Sparse<T>` markers. Each type appears once; undeclared or duplicate
-types fail at compile time. Entities are generational handles; archetype tables
-hold dense columns, and sparse components move without moving dense rows.
+Entities are generational handles; archetype tables hold dense columns, and sparse
+components move without moving dense rows. A world can also be used without an
+app, by spelling its schema as nested pairs of `Components<T>` and `Sparse<T>`:
 
 ```rust
 use static_ecs::prelude::*;
 struct Position(f32);
 struct Velocity(f32);
 struct Active;
-type Actor = (Position, Velocity, Active);
-type State = (
-    (Components<Position>, (Components<Velocity>, Components<Active>)),
-    BundleSlot<Actor>,
-);
+type State = (Components<Position>, (Components<Velocity>, Components<Active>));
 let mut world = World::<State>::default();
 let entity = world.spawn_bundle((Position(0.0), Velocity(2.0), Active));
 for (mut position, velocity) in &mut world.query_filtered::<(&mut Position, &Velocity), With<Active>>() {
@@ -115,11 +131,12 @@ assert!(world.remove::<Active>(entity).is_some());
 assert!(world.despawn(entity));
 ```
 
-- `spawn`, `insert`, `remove`, `despawn`, `get`, `get_mut` work on any declared
+- `spawn`, `insert`, `remove`, `despawn`, `get`, `get_mut` work on any stored
   component. `insert` and `remove` return the previous value.
-- `BundleSlot<B>` declares a tuple bundle (1–8 components) for `spawn_bundle`,
-  `spawn_batch`, `insert_bundle`, and `remove_bundle`. Each bundle caches its
-  destination archetype in a world field selected at compile time.
+- Tuple bundles (1–8 components) work with `spawn_bundle`, `spawn_batch`,
+  `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
+  multi-component transitions in a small table keyed by a compile-time hash of
+  the bundle's component indices; single components use per-archetype arrays.
 - Global state is ordinary component data on singleton entities.
 - Structural changes need `&mut World`: between emissions, in `exclusive`
   systems, or in payload handlers.

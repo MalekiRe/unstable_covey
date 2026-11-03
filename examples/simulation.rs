@@ -45,45 +45,23 @@ fn running(state: Single<&Running, With<Global>>) -> bool {
 }
 
 fn main() {
-    type State = (
-        (Components<Position>, Components<Velocity>),
-        (
-            Components<Health>,
-            (
-                (Components<Time>, Components<Ticks>),
-                (
-                    Components<Running>,
-                    (Components<Active>, Components<Global>),
-                ),
-            ),
-        ),
-    );
-    let mut world = World::<State>::default();
-    let global = world.spawn();
-    world.insert(global, Global);
-    world.insert(global, Time(1.0));
-    world.insert(global, Ticks(0));
-    world.insert(global, Running(true));
+    // No schema: the world stores exactly what these systems use.
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            ((integrate, decay).parallel(), validate)
+                .chain()
+                .run_if(running),
+        )
+        .build();
+    let world = &mut app.world;
+    let global = world.spawn_bundle((Global, Time(1.0), Ticks(0), Running(true)));
     let entities: Vec<_> = (1..=32)
         .map(|speed| {
-            let entity = world.spawn();
-            world.insert(entity, Position(0.0));
-            world.insert(entity, Velocity(speed as f32));
-            world.insert(entity, Health(100));
-            world.insert(entity, Active);
-            entity
+            world.spawn_bundle((Position(0.0), Velocity(speed as f32), Health(100), Active))
         })
         .collect();
-    let inactive = world.spawn();
-    world.insert(inactive, Position(50.0));
-    world.insert(inactive, Velocity(3.0));
-    world.insert(inactive, Health(100));
-    let mut app = App::new(world).add_systems(
-        Update,
-        ((integrate, decay).parallel(), validate)
-            .chain()
-            .run_if(running),
-    );
+    let inactive = world.spawn_bundle((Position(50.0), Velocity(3.0), Health(100)));
     for _ in 0..10 {
         app.emit(&Update);
     }

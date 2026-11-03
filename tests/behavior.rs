@@ -208,7 +208,7 @@ fn panicking_destructor_leaves_surviving_rows_addressable() {
 
 #[test]
 fn batch_iteration_panic_keeps_prefix_and_allows_further_growth_and_migration() {
-    type Schema = ((Components<u32>, Components<Tag>), BundleSlot<(u32, Tag)>);
+    type Schema = (Components<u32>, Components<Tag>);
     let mut world = World::<Schema>::default();
     let first = world.spawn_batch((0_u32..17).map(|n| (n, Tag)));
     assert!(
@@ -261,11 +261,8 @@ fn nested_destructor_unwinding_finishes_remaining_columns() {
     }
     let drops = Arc::new((0..4).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>());
     type Schema = (
-        (
-            (Components<Owned>, Components<Bomb>),
-            (Components<String>, Components<u32>),
-        ),
-        BundleSlot<(Owned, Bomb, String, u32)>,
+        (Components<Owned>, Components<Bomb>),
+        (Components<String>, Components<u32>),
     );
     let mut world = World::<Schema>::default();
     let entities = world.spawn_batch((0..4).map(|i| {

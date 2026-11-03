@@ -1,6 +1,6 @@
 use static_ecs::prelude::*;
 fn main() {
-    let mut app = App::new(World::<Components<u32>>::default())
-        .add_systems((), |_: Query<&u64>| {});
-    app.emit(&());
+    // No system uses u64 and it is not registered, so the world cannot store it.
+    let mut app = App::new().add_systems((), |_: Query<&u32>| {}).build();
+    app.world.spawn_bundle((1_u64,));
 }

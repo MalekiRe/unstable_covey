@@ -4,7 +4,7 @@ use crate::executor::{
     self, Context, Continue, Done, Fields, First, Flow, Join, Outlined, Project, Root, Second,
     Tail, Then,
 };
-use crate::param::Param;
+use crate::param::{Param, ParamShape};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,15 +20,20 @@ pub enum ExecutionMode {
     Serial,
 }
 
-/// A concrete, access-described system. Implementations are sealed.
-pub trait System<S>: sealed::Sealed + Sized {
+/// What a system accesses and returns, independent of any world type. Apps
+/// infer their component vocabulary from these access types.
+pub trait Shape: sealed::Sealed + Sized {
     type Access: Access;
     type Output;
-    const VALID: bool;
     #[doc(hidden)]
     const HAS_PARALLEL: bool = false;
     #[doc(hidden)]
     const WEIGHT: usize = 1;
+}
+
+/// A system runnable against world type `S`. Implementations are sealed.
+pub trait System<S>: Shape {
+    const VALID: bool;
     /// Run this system inside an invocation, then its continuation.
     /// # Safety
     /// The path uniquely owns this system and all its declared world accesses.
@@ -134,8 +139,9 @@ pub struct FunctionSystem<F, P, L, R> {
 }
 impl<F, P, L, R> sealed::Sealed for FunctionSystem<F, P, L, R> {}
 
-pub trait IntoFunction<S, M, R> {
-    type Function: System<S, Output = R>;
+/// Converts a function or closure into a system without naming a world.
+pub trait IntoFunction<M, R> {
+    type Function: Shape<Output = R>;
     fn into_function(self) -> Self::Function;
 }
 
@@ -145,20 +151,21 @@ macro_rules! accesses {
 }
 macro_rules! function {
     ($($p:ident $i:tt),*) => {
-        impl<S: SystemWorld, F, R, $($p: Param<S>),*> IntoFunction<S, fn($($p),*) -> R, R> for F
-        where F: FnMut($($p),*) -> R + for<'a> FnMut($($p::Item<'a>),*) -> R,
-              accesses!($($p),*): ValidAccess {
+        impl<F, R, $($p: ParamShape),*> IntoFunction<fn($($p),*) -> R, R> for F
+        where F: FnMut($($p),*) -> R + for<'a> FnMut($($p::Item<'a>),*) -> R {
             type Function = FunctionSystem<F, ($($p,)*), ($($p::State,)*), R>;
             fn into_function(self) -> Self::Function {
                 FunctionSystem { function: self, local: Default::default(), last_run: 0, last_world: u64::MAX, marker: PhantomData }
             }
         }
+        impl<F, R, $($p: ParamShape),*> Shape for FunctionSystem<F, ($($p,)*), ($($p::State,)*), R> {
+            type Access = accesses!($($p),*);
+            type Output = R;
+        }
         impl<S: SystemWorld, F, R, $($p: Param<S>),*> System<S>
             for FunctionSystem<F, ($($p,)*), ($($p::State,)*), R>
         where F: for<'a> FnMut($($p::Item<'a>),*) -> R,
               accesses!($($p),*): ValidAccess {
-            type Access = accesses!($($p),*);
-            type Output = R;
             const VALID: bool = <Self::Access as ValidAccess>::VALID $(&& $p::VALID)*;
             #[inline]
             unsafe fn run_unchecked(&mut self, _world: *mut S, clock: &mut u64) -> Option<R> {
@@ -220,12 +227,14 @@ fields!(Sequential);
 fields!(Concurrent);
 fields!(Conditional);
 
-impl<S, A: System<S, Output = ()>, B: System<S, Output = ()>> System<S> for Sequential<A, B> {
+impl<A: Shape<Output = ()>, B: Shape<Output = ()>> Shape for Sequential<A, B> {
     type Access = (A::Access, B::Access);
     type Output = ();
-    const VALID: bool = A::VALID && B::VALID;
     const HAS_PARALLEL: bool = A::HAS_PARALLEL || B::HAS_PARALLEL;
     const WEIGHT: usize = A::WEIGHT + B::WEIGHT;
+}
+impl<S, A: System<S, Output = ()>, B: System<S, Output = ()>> System<S> for Sequential<A, B> {
+    const VALID: bool = A::VALID && B::VALID;
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
@@ -293,17 +302,19 @@ where
     }
 }
 
+impl<A: Shape<Output = ()>, B: Shape<Output = ()>> Shape for Concurrent<A, B> {
+    type Access = (A::Access, B::Access);
+    type Output = ();
+    const HAS_PARALLEL: bool = true;
+    const WEIGHT: usize = A::WEIGHT + B::WEIGHT;
+}
 impl<S: Send + Sync, A, B> System<S> for Concurrent<A, B>
 where
     A: System<S, Output = ()> + Send,
     B: System<S, Output = ()> + Send,
     A::Access: Conflict<B::Access>,
 {
-    type Access = (A::Access, B::Access);
-    type Output = ();
     const VALID: bool = A::VALID && B::VALID && !<A::Access as Conflict<B::Access>>::VALUE;
-    const HAS_PARALLEL: bool = true;
-    const WEIGHT: usize = A::WEIGHT + B::WEIGHT;
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
@@ -330,12 +341,14 @@ where
     }
 }
 
-impl<S, P: System<S, Output = ()>, C: System<S, Output = bool>> System<S> for Conditional<P, C> {
+impl<P: Shape<Output = ()>, C: Shape<Output = bool>> Shape for Conditional<P, C> {
     type Access = (P::Access, C::Access);
     type Output = ();
-    const VALID: bool = P::VALID && C::VALID && !C::Access::WRITES;
     const HAS_PARALLEL: bool = P::HAS_PARALLEL;
     const WEIGHT: usize = P::WEIGHT + C::WEIGHT;
+}
+impl<S, P: System<S, Output = ()>, C: System<S, Output = bool>> System<S> for Conditional<P, C> {
+    const VALID: bool = P::VALID && C::VALID && !C::Access::WRITES;
     #[inline(always)]
     unsafe fn enter<R: Send, Path: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
@@ -370,15 +383,18 @@ impl<S, P: System<S, Output = ()>, C: System<S, Output = bool>> System<S> for Co
     }
 }
 
-/// Explicit escape hatch for code needing the complete storage layout.
+/// Exclusive world access, for structural changes. Name the world as `World<_>`
+/// in the app body; a plugin can be generic over it (`World<S>` with `S: Has<T>`).
 pub struct ExclusiveSystem<F>(F);
 pub fn exclusive<F>(function: F) -> ExclusiveSystem<F> {
     ExclusiveSystem(function)
 }
 impl<F> sealed::Sealed for ExclusiveSystem<F> {}
-impl<S: SystemWorld, F: FnMut(&mut S)> System<S> for ExclusiveSystem<F> {
+impl<F> Shape for ExclusiveSystem<F> {
     type Access = Exclusive;
     type Output = ();
+}
+impl<S: SystemWorld, F: FnMut(&mut S)> System<S> for ExclusiveSystem<F> {
     const VALID: bool = true;
     unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<()> {
         // SAFETY: Exclusive access conflicts with all other world accesses, so
@@ -398,20 +414,22 @@ pub struct Chained<T>(T);
 pub struct Parallel<T>(T);
 pub struct RunIf<T, C>(T, C);
 
-pub trait IntoSystems<S, M>: Sized {
-    type Systems: System<S, Output = ()>;
+/// Converts system configurations without naming a world; the app checks them
+/// against its inferred world when built.
+pub trait IntoSystems<M>: Sized {
+    type Systems: Shape<Output = ()>;
     fn into_systems(self) -> Self::Systems;
 }
-impl<S, F, M> IntoSystems<S, FunctionMarker<M>> for F
+impl<F, M> IntoSystems<FunctionMarker<M>> for F
 where
-    F: IntoFunction<S, M, ()>,
+    F: IntoFunction<M, ()>,
 {
     type Systems = F::Function;
     fn into_systems(self) -> Self::Systems {
         self.into_function()
     }
 }
-impl<S: SystemWorld, F: FnMut(&mut S)> IntoSystems<S, Ready> for ExclusiveSystem<F> {
+impl<F> IntoSystems<Ready> for ExclusiveSystem<F> {
     type Systems = Self;
     fn into_systems(self) -> Self {
         self
@@ -432,16 +450,16 @@ pub trait IntoSystemConfigs: Sized {
 }
 impl<T> IntoSystemConfigs for T {}
 
-impl<S, T: IntoSystems<S, M>, M> IntoSystems<S, Chained<M>> for Chained<T> {
+impl<T: IntoSystems<M>, M> IntoSystems<Chained<M>> for Chained<T> {
     type Systems = T::Systems;
     fn into_systems(self) -> Self::Systems {
         self.0.into_systems()
     }
 }
-impl<S, T, C, M, CM> IntoSystems<S, RunIf<M, CM>> for RunIf<T, C>
+impl<T, C, M, CM> IntoSystems<RunIf<M, CM>> for RunIf<T, C>
 where
-    T: IntoSystems<S, M>,
-    C: IntoFunction<S, CM, bool>,
+    T: IntoSystems<M>,
+    C: IntoFunction<CM, bool>,
 {
     type Systems = Conditional<T::Systems, C::Function>;
     fn into_systems(self) -> Self::Systems {
@@ -461,12 +479,11 @@ macro_rules! fold_value {
 }
 macro_rules! tuple {
     ($($t:ident $m:ident $i:tt),+) => {
-        impl<S, $($t: IntoSystems<S, $m>, $m),+> IntoSystems<S, ($($m,)+)> for ($($t,)+) {
+        impl<$($t: IntoSystems<$m>, $m),+> IntoSystems<($($m,)+)> for ($($t,)+) {
             type Systems = fold_type!(Sequential; $($t),+);
             fn into_systems(self) -> Self::Systems { fold_value!(Sequential; self; $($i),+) }
         }
-        impl<S, $($t: IntoSystems<S, $m>, $m),+> IntoSystems<S, Parallel<($($m,)+)>> for Parallel<($($t,)+)>
-        where fold_type!(Concurrent; $($t),+): System<S, Output = ()> {
+        impl<$($t: IntoSystems<$m>, $m),+> IntoSystems<Parallel<($($m,)+)>> for Parallel<($($t,)+)> {
             type Systems = fold_type!(Concurrent; $($t),+);
             fn into_systems(self) -> Self::Systems {
                 let values = self.0;

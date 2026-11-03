@@ -1,7 +1,7 @@
 use static_ecs::prelude::*;
 struct Missing;
 fn main() {
-    let mut app = App::new(World::<Components<u32>>::default())
-        .add_systems((), |_: Query<&u32, Without<Missing>>| {});
-    app.emit(&());
+    // An explicit standalone schema still rejects undeclared components.
+    let mut world = World::<Components<u32>>::default();
+    world.query_filtered::<&u32, Without<Missing>>();
 }

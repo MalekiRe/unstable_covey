@@ -5,9 +5,5 @@ fn condition(mut value: Single<&mut u32>) -> bool {
 }
 fn system() {}
 fn main() {
-    let mut world = World::<Components<u32>>::default();
-    let entity = world.spawn();
-    world.insert(entity, 0_u32);
-    let mut app = App::new(world).add_systems((), system.run_if(condition));
-    app.emit(&());
+    App::new().add_systems((), system.run_if(condition)).build();
 }

@@ -15,7 +15,7 @@ struct Update;
 
 #[test]
 fn remaining_cardinality_and_count_span_archetypes() {
-    type Schema = (Components<u32>, (Components<Tag>, BundleSlot<(u32,)>));
+    type Schema = (Components<u32>, Components<Tag>);
     let mut world = World::<Schema>::default();
     let entities = world.spawn_batch((0_u32..12).map(|x| (x,)));
     for &entity in &entities[3..7] {
@@ -43,7 +43,7 @@ fn remaining_cardinality_and_count_span_archetypes() {
 
 #[test]
 fn sparse_toggles_preserve_dense_rows_and_generations_reject_stale_handles() {
-    type Schema = (Components<u64>, (Sparse<Tag>, BundleSlot<(u64,)>));
+    type Schema = (Components<u64>, Sparse<Tag>);
     let mut world = World::<Schema>::default();
     let entities = world.spawn_batch((0_u64..32).map(|x| (x,)));
     let addresses: Vec<_> = entities
@@ -84,13 +84,7 @@ fn sparse_toggles_preserve_dense_rows_and_generations_reject_stale_handles() {
 
 #[test]
 fn bundle_replacement_and_removal_preserve_unrelated_sparse_values() {
-    type Schema = (
-        (Components<String>, Components<u32>),
-        (
-            Sparse<Tag>,
-            (BundleSlot<(String, Tag)>, BundleSlot<(String, u32)>),
-        ),
-    );
+    type Schema = ((Components<String>, Components<u32>), Sparse<Tag>);
     let mut world = World::<Schema>::default();
     let entity = world.spawn_bundle((String::from("before"), Tag(9)));
     assert_eq!(
@@ -110,15 +104,11 @@ fn bundle_replacement_and_removal_preserve_unrelated_sparse_values() {
 
 #[test]
 fn summary_windows_survive_sparse_membership_changes_and_world_replacement() {
-    type Schema = (
-        Components<u32, true>,
-        (Sparse<Tag, true>, BundleSlot<(u32,)>),
-    );
-    let mut world = World::<Schema>::default();
-    let entities = world.spawn_batch((0_u32..6).map(|x| (x,)));
     let seen = Rc::new(RefCell::new(Vec::new()));
     let output = seen.clone();
-    let mut app = App::new(world)
+    let mut app = App::new()
+        .storage::<Components<u32, true>>()
+        .storage::<Sparse<Tag, true>>()
         .with_execution_mode(ExecutionMode::Serial)
         .add_systems(Update, move |mut q: Query<&u32, Changed<u32>>| {
             let (lower, upper) = q.iter_mut().size_hint();
@@ -126,7 +116,9 @@ fn summary_windows_survive_sparse_membership_changes_and_world_replacement() {
             values.sort_unstable();
             assert!(lower <= values.len() && upper.unwrap() >= values.len());
             output.borrow_mut().push(values);
-        });
+        })
+        .build();
+    let entities = app.world.spawn_batch((0_u32..6).map(|x| (x,)));
     app.emit(&Update);
     app.emit(&Update);
     app.world.insert(entities[1], Tag(1));
@@ -141,27 +133,26 @@ fn summary_windows_survive_sparse_membership_changes_and_world_replacement() {
         app.world.query::<&u32>().contiguous_mut(),
         Err(ContiguousError::Fragmented)
     ));
-    let mut replacement = World::<Schema>::default();
-    replacement.spawn_bundle((99_u32,));
-    app.world = replacement;
+    app.world = Default::default();
+    app.world.spawn_bundle((99_u32,));
     app.emit(&Update);
     assert_eq!(seen.borrow().last().unwrap(), &vec![99]);
 }
 
 #[test]
 fn tracked_chunks_only_mark_mutably_accessed_rows() {
-    type Schema = (Components<u32, true>, BundleSlot<(u32,)>);
-    let mut world = World::<Schema>::default();
-    world.spawn_batch((0_u32..5).map(|x| (x,)));
     let seen = Rc::new(RefCell::new(Vec::new()));
     let output = seen.clone();
-    let mut app = App::new(world)
+    let mut app = App::new()
+        .storage::<Components<u32, true>>()
         .with_execution_mode(ExecutionMode::Serial)
         .add_systems(Update, move |mut q: Query<&u32, Changed<u32>>| {
             output
                 .borrow_mut()
                 .push(q.iter_mut().copied().collect::<Vec<_>>());
-        });
+        })
+        .build();
+    app.world.spawn_batch((0_u32..5).map(|x| (x,)));
     app.emit(&Update);
     {
         let mut query = app.world.query::<(Entity, &mut u32)>();
@@ -202,7 +193,7 @@ fn sparse_and_dense_destructors_finish_after_unwind() {
             panic!("drop");
         }
     }
-    type Schema = ((Components<Bomb>, Sparse<Owned>), BundleSlot<(Bomb, Owned)>);
+    type Schema = (Components<Bomb>, Sparse<Owned>);
     let count = Arc::new(AtomicUsize::new(0));
     let mut world = World::<Schema>::default();
     let entity = world.spawn_bundle((Bomb, Owned(count.clone())));
@@ -218,22 +209,23 @@ fn sparse_and_dense_destructors_finish_after_unwind() {
 
 #[test]
 fn mixed_or_filters_do_not_count_structurally_missing_branches() {
-    type Schema = (Components<u32, true>, (Sparse<Tag>, BundleSlot<(u32,)>));
     type Filter = Or<(With<Tag>, Changed<u32>)>;
-    let mut world = World::<Schema>::default();
-    let entities = world.spawn_batch((0_u32..6).map(|x| (x,)));
-    world.insert(entities[1], Tag(1));
-    world.insert(entities[4], Tag(4));
     let seen = Rc::new(RefCell::new(Vec::new()));
     let output = seen.clone();
-    let mut app = App::new(world)
+    let mut app = App::new()
+        .storage::<Components<u32, true>>()
+        .storage::<Sparse<Tag>>()
         .with_execution_mode(ExecutionMode::Serial)
         .add_systems(Update, move |mut q: Query<&u32, Filter>| {
             let (lower, upper) = q.iter_mut().size_hint();
             let count = q.iter_mut().count();
             assert!(lower <= count && upper.unwrap() >= count);
             output.borrow_mut().push(count);
-        });
+        })
+        .build();
+    let entities = app.world.spawn_batch((0_u32..6).map(|x| (x,)));
+    app.world.insert(entities[1], Tag(1));
+    app.world.insert(entities[4], Tag(4));
     app.emit(&Update);
     app.emit(&Update);
     *app.world.get_mut::<u32>(entities[2]).unwrap() = 20;

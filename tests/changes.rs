@@ -5,30 +5,24 @@ use std::cell::RefCell;
 struct Value(i32);
 struct Tag;
 struct Gate;
-type Schema = (
-    (Components<Value>, (Components<Tag>, Components<Gate>)),
-    (
-        (BundleSlot<(Value,)>, BundleSlot<(Value, Tag)>),
-        (BundleSlot<(Tag,)>, BundleSlot<(Gate,)>),
-    ),
-);
-
 #[test]
 fn reads_replacements_migration_and_reinsertion_preserve_change_semantics() {
-    let mut world = World::<Schema>::default();
-    let a = world.spawn_bundle((Value(1), Tag));
-    let b = world.spawn_bundle((Value(2),));
     let log = RefCell::new(Vec::new());
-    let mut app = App::new(world).add_systems(
-        (),
-        |mut added: Query<&Value, Added<Value>>, mut changed: Query<&Value, Changed<Value>>| {
-            let mut a: Vec<_> = added.iter_mut().map(|v| v.0).collect();
-            let mut c: Vec<_> = changed.iter_mut().map(|v| v.0).collect();
-            a.sort_unstable();
-            c.sort_unstable();
-            log.borrow_mut().push((a, c));
-        },
-    );
+    let mut app = App::new()
+        .add_systems(
+            (),
+            |mut added: Query<&Value, Added<Value>>, mut changed: Query<&Value, Changed<Value>>| {
+                let mut a: Vec<_> = added.iter_mut().map(|v| v.0).collect();
+                let mut c: Vec<_> = changed.iter_mut().map(|v| v.0).collect();
+                a.sort_unstable();
+                c.sort_unstable();
+                log.borrow_mut().push((a, c));
+            },
+        )
+        .register::<Tag>()
+        .build();
+    let a = app.world.spawn_bundle((Value(1), Tag));
+    let b = app.world.spawn_bundle((Value(2),));
     app.emit(&());
     // Merely fetching mutable data must not dirty it.
     assert_eq!(app.world.get_mut::<Value>(a).unwrap().0, 1);
@@ -58,18 +52,19 @@ fn reads_replacements_migration_and_reinsertion_preserve_change_semantics() {
 
 #[test]
 fn skipped_single_and_conditions_do_not_consume_pending_changes() {
-    let mut world = World::<Schema>::default();
-    let value = world.spawn_bundle((Value(1),));
-    let gate = world.spawn();
     let log = RefCell::new(Vec::new());
-    let mut app = App::new(world).add_systems(
-        (),
-        (|mut q: Query<&Value, Changed<Value>>, _: Single<&Gate>| {
-            log.borrow_mut()
-                .push(q.iter_mut().map(|v| v.0).collect::<Vec<_>>());
-        })
-        .run_if(|mut q: Query<&Tag>| q.iter_mut().next().is_some()),
-    );
+    let mut app = App::new()
+        .add_systems(
+            (),
+            (|mut q: Query<&Value, Changed<Value>>, _: Single<&Gate>| {
+                log.borrow_mut()
+                    .push(q.iter_mut().map(|v| v.0).collect::<Vec<_>>());
+            })
+            .run_if(|mut q: Query<&Tag>| q.iter_mut().next().is_some()),
+        )
+        .build();
+    let value = app.world.spawn_bundle((Value(1),));
+    let gate = app.world.spawn();
     app.emit(&());
     app.world.insert(gate, Tag);
     app.emit(&()); // condition true, invalid Single
@@ -83,24 +78,25 @@ fn skipped_single_and_conditions_do_not_consume_pending_changes() {
 #[test]
 fn row_filters_compose_and_single_counts_only_matching_rows() {
     type ChangedOrTagged = Or<(Changed<Value>, With<Tag>)>;
-    let mut world = World::<Schema>::default();
-    let a = world.spawn_bundle((Value(1), Tag));
-    world.spawn_bundle((Value(2),));
     let log = RefCell::new(Vec::new());
-    let mut app = App::new(world).add_systems(
-        (),
-        (
-            |mut q: Query<&Value, ChangedOrTagged>| {
-                let mut values: Vec<_> = q.iter_mut().map(|v| v.0).collect();
-                values.sort_unstable();
-                log.borrow_mut().push(values);
-            },
-            |mut value: Single<&mut Value, Changed<Value>>| {
-                value.0 += 10;
-            },
+    let mut app = App::new()
+        .add_systems(
+            (),
+            (
+                |mut q: Query<&Value, ChangedOrTagged>| {
+                    let mut values: Vec<_> = q.iter_mut().map(|v| v.0).collect();
+                    values.sort_unstable();
+                    log.borrow_mut().push(values);
+                },
+                |mut value: Single<&mut Value, Changed<Value>>| {
+                    value.0 += 10;
+                },
+            )
+                .chain(),
         )
-            .chain(),
-    );
+        .build();
+    let a = app.world.spawn_bundle((Value(1), Tag));
+    app.world.spawn_bundle((Value(2),));
     app.emit(&()); // two changed rows: Single skips
     app.world.get_mut::<Value>(a).unwrap().0 = 3;
     app.emit(&()); // still two changes since Single has never run
@@ -110,12 +106,13 @@ fn row_filters_compose_and_single_counts_only_matching_rows() {
 
 #[test]
 fn successful_changed_single_resumes_after_a_quiet_frame() {
-    let mut world = World::<Schema>::default();
-    let a = world.spawn_bundle((Value(1),));
     let log = RefCell::new(Vec::new());
-    let mut app = App::new(world).add_systems((), |value: Single<&Value, Changed<Value>>| {
-        log.borrow_mut().push(value.0);
-    });
+    let mut app = App::new()
+        .add_systems((), |value: Single<&Value, Changed<Value>>| {
+            log.borrow_mut().push(value.0);
+        })
+        .build();
+    let a = app.world.spawn_bundle((Value(1),));
     app.emit(&());
     app.emit(&());
     app.world.get_mut::<Value>(a).unwrap().0 = 2;
@@ -124,33 +121,37 @@ fn successful_changed_single_resumes_after_a_quiet_frame() {
 }
 #[test]
 fn replacing_the_world_resets_system_change_windows() {
-    let mut world = World::<Schema>::default();
-    world.spawn_bundle((Value(1),));
     let log = RefCell::new(Vec::new());
-    let mut app = App::new(world).add_systems((), |mut values: Query<&Value, Added<Value>>| {
-        log.borrow_mut().extend(values.iter_mut().map(|v| v.0));
-    });
+    let mut app = App::new()
+        .add_systems((), |mut values: Query<&Value, Added<Value>>| {
+            log.borrow_mut().extend(values.iter_mut().map(|v| v.0));
+        })
+        .register::<Tag>()
+        .build();
+    app.world.spawn_bundle((Value(1),));
     for _ in 0..10 {
         app.emit(&());
     }
-    let mut replacement = World::<Schema>::default();
-    replacement.spawn_bundle((Tag,)); // Same table index now has a different signature.
-    replacement.spawn_bundle((Value(2),));
-    app.world = replacement;
+    app.world = Default::default();
+    app.world.spawn_bundle((Tag,)); // Same table index now has a different signature.
+    app.world.spawn_bundle((Value(2),));
     app.emit(&());
     assert_eq!(*log.borrow(), vec![1, 2]);
 }
 
 #[test]
 fn cached_matches_follow_new_tables_growth_and_repopulated_empty_tables() {
-    let mut world = World::<Schema>::default();
-    let original = world.spawn_bundle((Value(1),));
     let log = RefCell::new(Vec::new());
-    let mut app = App::new(world).add_systems((), |mut query: Query<&Value>| {
-        let mut values = query.iter_mut().map(|v| v.0).collect::<Vec<_>>();
-        values.sort_unstable();
-        log.borrow_mut().push(values);
-    });
+    let mut app = App::new()
+        .add_systems((), |mut query: Query<&Value>| {
+            let mut values = query.iter_mut().map(|v| v.0).collect::<Vec<_>>();
+            values.sort_unstable();
+            log.borrow_mut().push(values);
+        })
+        .register::<Tag>()
+        .register::<Gate>()
+        .build();
+    let original = app.world.spawn_bundle((Value(1),));
     app.emit(&());
     app.world.despawn(original);
     app.emit(&());
@@ -166,27 +167,28 @@ fn cached_matches_follow_new_tables_growth_and_repopulated_empty_tables() {
 
 #[test]
 fn read_only_cursors_do_not_consume_subsequent_system_writes() {
-    let mut world = World::<Schema>::default();
-    world.spawn_bundle((Value(1),));
     let before = RefCell::new(Vec::new());
     let after = RefCell::new(Vec::new());
-    let mut app = App::new(world).add_systems(
-        (),
-        (
-            |mut q: Query<&Value, Changed<Value>>| {
-                before
-                    .borrow_mut()
-                    .push(q.iter_mut().map(|v| v.0).collect::<Vec<_>>())
-            },
-            |mut value: Single<&mut Value>, _: Single<&Gate>| value.0 += 1,
-            |mut q: Query<&Value, Changed<Value>>| {
-                after
-                    .borrow_mut()
-                    .push(q.iter_mut().map(|v| v.0).collect::<Vec<_>>())
-            },
+    let mut app = App::new()
+        .add_systems(
+            (),
+            (
+                |mut q: Query<&Value, Changed<Value>>| {
+                    before
+                        .borrow_mut()
+                        .push(q.iter_mut().map(|v| v.0).collect::<Vec<_>>())
+                },
+                |mut value: Single<&mut Value>, _: Single<&Gate>| value.0 += 1,
+                |mut q: Query<&Value, Changed<Value>>| {
+                    after
+                        .borrow_mut()
+                        .push(q.iter_mut().map(|v| v.0).collect::<Vec<_>>())
+                },
+            )
+                .chain(),
         )
-            .chain(),
-    );
+        .build();
+    app.world.spawn_bundle((Value(1),));
     app.emit(&());
     app.emit(&());
     let gate = app.world.spawn_bundle((Gate,));
@@ -215,11 +217,7 @@ fn parallel_writers_are_seen_exactly_once_by_readers_before_and_after_the_join()
     let (before, after) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     let (seen_before, seen_after) = (before.clone(), after.clone());
     WorkerPool::new(3).install(|| {
-        let mut world = World::<(Components<u32>, Components<u64>)>::default();
-        let entity = world.spawn();
-        world.insert(entity, 0_u32);
-        world.insert(entity, 0_u64);
-        let mut app = App::new(world)
+        let mut app = App::new()
             .add_systems(Update, move |mut q: Query<&u32, Changed<u32>>| {
                 seen_before.fetch_add(q.iter_mut().count(), Ordering::SeqCst);
             })
@@ -244,7 +242,9 @@ fn parallel_writers_are_seen_exactly_once_by_readers_before_and_after_the_join()
                         Ordering::SeqCst,
                     );
                 },
-            );
+            )
+            .build();
+        let entity = app.world.spawn_bundle((0_u32, 0_u64));
         for _ in 0..frames {
             app.emit(&Update);
         }
