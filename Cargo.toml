@@ -10,3 +10,8 @@ resolver = "3"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Concrete schedule types have enormous names; full debug info for them
+# dominates debug builds. Keep file:line backtraces only.
+[profile.dev]
+debug = "line-tables-only"

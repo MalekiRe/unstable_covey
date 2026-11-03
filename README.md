@@ -215,6 +215,16 @@ Without `install`, a process-wide pool sized by `available_parallelism` is used.
 Callers sharing a pool serialize their invocations; nested emits inside systems
 run serially.
 
+Debug builds: every system is part of one concrete type, and those type names
+are enormous. Full debug info stores them, making debug binaries gigabytes large
+(2.3 GB for the 4,113-system benchmark). Set this in the crate that builds the
+app (where the concrete types are compiled) to roughly halve that:
+
+```toml
+[profile.dev]
+debug = "line-tables-only" # keeps file:line backtraces
+```
+
 Limits: very long continuation chains may need a higher `#![recursion_limit]` in
 the crate that builds the app. Graph compile time grows quadratically with nodes
 per graph. Parallel groups need `Send` systems and `Send + Sync` world data.
