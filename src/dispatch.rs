@@ -6,6 +6,7 @@ use crate::executor::{Second, Tail, Within, serially};
 use crate::hook::{self, Event, Hook, HookList, OnAdd, OnInsert, OnRemove, OnReplace};
 use crate::lookup::ComponentLookup;
 use crate::plan::{ExecutionMode, Shape, run_now};
+use crate::relation::{self, Relates, Relation, RelationHooks, Sources};
 use crate::vocab::{Declaration, Insert, Uses};
 use crate::{Components, IntoSystems, Storage, System, World};
 
@@ -508,6 +509,23 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
             Install<C, L, K, Listeners = L, Hooks = Cons<Hook<OnRemove<T>, P::Systems>, K>>,
     {
         self.install(hook::on_remove::<T, P, M>(systems))
+    }
+    /// Install relation `R`: its components `Relates<R>`/`Sources<R>` and the
+    /// hooks keeping them consistent. Name the world as `_`:
+    /// `.relation::<ChildOf, _>()`.
+    #[allow(clippy::type_complexity)]
+    pub fn relation<R: Relation, S>(
+        self,
+    ) -> AppBuilder<
+        <RelationHooks<R, S> as Install<C, L, K>>::Components,
+        L,
+        <RelationHooks<R, S> as Install<C, L, K>>::Hooks,
+    >
+    where
+        RelationHooks<R, S>: Install<C, L, K, Listeners = L>,
+        S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+    {
+        self.install(relation::relation::<R, S>())
     }
     /// Store `T` even though no system queries it, e.g. a tag that is only
     /// inserted, or data read through `World` methods outside systems. Keeps

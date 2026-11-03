@@ -1,0 +1,384 @@
+//! Non-fragmenting relations. A source's `Relates<R>` lists its targets, a
+//! target's `Sources<R>` lists its sources, and every entry records its index
+//! in the other side's list: unlinking swap-removes both entries and fixes the
+//! one back-index each move disturbs, in O(1). `.relation::<R>()` registers
+//! both components and the hooks that unlink, or despawn, when either side is
+//! removed or despawned.
+use std::marker::PhantomData;
+
+use crate::command::CommandQueue;
+use crate::hook::{Hook, OnReplace, on_replace};
+use crate::lookup::ComponentLookup;
+use crate::plan::FunctionSystem;
+use crate::query::QueryState;
+use crate::{Commands, Entity, Query, Storage, Trigger, World};
+
+/// A relation kind. Declare one per relation; its constants pick the
+/// bookkeeping at compile time.
+pub trait Relation: Send + Sync + 'static {
+    type Kind: Cardinality;
+    /// Despawn every source with its target (e.g. a scene hierarchy).
+    /// Otherwise a despawned target is just unlinked from its sources.
+    const LINKED: bool = false;
+}
+/// How many targets a source has, and sources a target has.
+pub trait Cardinality: 'static {
+    #[doc(hidden)]
+    type Source: Side;
+    #[doc(hidden)]
+    type Target: Side;
+}
+/// One target per source, one source per target.
+pub struct OneToOne;
+/// One target per source (e.g. a parent), any sources per target.
+pub struct OneToMany;
+/// Any targets per source and sources per target.
+pub struct ManyToMany;
+impl Cardinality for OneToOne {
+    type Source = One;
+    type Target = One;
+}
+impl Cardinality for OneToMany {
+    type Source = One;
+    type Target = Many;
+}
+impl Cardinality for ManyToMany {
+    type Source = Many;
+    type Target = Many;
+}
+
+/// One relation side: (other entity, index of the matching entry there).
+#[doc(hidden)]
+pub trait Side: Default + Send + Sync + 'static {
+    const ONE: bool;
+    fn entries(&self) -> &[(Entity, u32)];
+    fn entries_mut(&mut self) -> &mut [(Entity, u32)];
+    /// Append; returns the new entry's index. A `One` side must be empty.
+    fn push(&mut self, entry: (Entity, u32)) -> u32;
+    /// Remove entry `index`; returns the entry moved into its place, if any.
+    fn swap_remove(&mut self, index: u32) -> Option<(Entity, u32)>;
+}
+#[doc(hidden)]
+#[derive(Default)]
+pub struct One(Option<(Entity, u32)>);
+#[doc(hidden)]
+#[derive(Default)]
+pub struct Many(Vec<(Entity, u32)>);
+impl Side for One {
+    const ONE: bool = true;
+    fn entries(&self) -> &[(Entity, u32)] {
+        self.0.as_slice()
+    }
+    fn entries_mut(&mut self) -> &mut [(Entity, u32)] {
+        self.0.as_mut_slice()
+    }
+    fn push(&mut self, entry: (Entity, u32)) -> u32 {
+        debug_assert!(self.0.is_none());
+        self.0 = Some(entry);
+        0
+    }
+    fn swap_remove(&mut self, _: u32) -> Option<(Entity, u32)> {
+        self.0 = None;
+        None
+    }
+}
+impl Side for Many {
+    const ONE: bool = false;
+    fn entries(&self) -> &[(Entity, u32)] {
+        &self.0
+    }
+    fn entries_mut(&mut self) -> &mut [(Entity, u32)] {
+        &mut self.0
+    }
+    fn push(&mut self, entry: (Entity, u32)) -> u32 {
+        self.0.push(entry);
+        u32::try_from(self.0.len() - 1).expect("relation list exceeds u32 entries")
+    }
+    fn swap_remove(&mut self, index: u32) -> Option<(Entity, u32)> {
+        self.0.swap_remove(index as usize);
+        self.0.get(index as usize).copied()
+    }
+}
+
+type SourceSide<R> = <<R as Relation>::Kind as Cardinality>::Source;
+type TargetSide<R> = <<R as Relation>::Kind as Cardinality>::Target;
+
+/// A source's targets. Created and changed only through `relate`/`unrelate`.
+pub struct Relates<R: Relation> {
+    side: SourceSide<R>,
+    relation: PhantomData<fn() -> R>,
+}
+/// A target's sources. Created and changed only through `relate`/`unrelate`.
+pub struct Sources<R: Relation> {
+    side: TargetSide<R>,
+    relation: PhantomData<fn() -> R>,
+}
+macro_rules! sides {
+    ($($name:ident $side:ident $all:ident $single:ident),*) => {$(
+        impl<R: Relation> $name<R> {
+            fn new() -> Self {
+                Self { side: Default::default(), relation: PhantomData }
+            }
+            pub fn $all(&self) -> impl ExactSizeIterator<Item = Entity> + '_ {
+                self.side.entries().iter().map(|&(entity, _)| entity)
+            }
+            pub fn len(&self) -> usize {
+                self.side.entries().len()
+            }
+            pub fn is_empty(&self) -> bool {
+                self.side.entries().is_empty()
+            }
+        }
+        impl<R: Relation> $name<R> where R::Kind: Cardinality<$side = One> {
+            /// The single related entity.
+            pub fn $single(&self) -> Entity {
+                self.side.entries()[0].0
+            }
+        }
+    )*};
+}
+sides!(Relates Source targets target, Sources Target sources source);
+
+/// Both sides of relation `R`, by entity: the world, or a hook's queries.
+trait Lists<R: Relation> {
+    fn source(&mut self, entity: Entity) -> &mut SourceSide<R>;
+    fn target(&mut self, entity: Entity) -> &mut TargetSide<R>;
+}
+/// Unlink `source`'s entry `index` from both sides; returns its target.
+fn unlink<R: Relation>(lists: &mut impl Lists<R>, source: Entity, index: u32) -> Entity {
+    let (target, slot) = lists.source(source).entries()[index as usize];
+    if let Some((moved, back)) = lists.source(source).swap_remove(index) {
+        lists.target(moved).entries_mut()[back as usize].1 = index;
+    }
+    if let Some((moved, back)) = lists.target(target).swap_remove(slot) {
+        lists.source(moved).entries_mut()[back as usize].1 = slot;
+    }
+    target
+}
+fn link<R: Relation>(lists: &mut impl Lists<R>, source: Entity, target: Entity) {
+    let index = lists.source(source).entries().len() as u32;
+    let slot = lists.target(target).push((source, index));
+    lists.source(source).push((target, slot));
+}
+
+impl<S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>, R: Relation> Lists<R>
+    for World<S>
+{
+    fn source(&mut self, entity: Entity) -> &mut SourceSide<R> {
+        &mut self
+            .get_mut::<Relates<R>>(entity)
+            .unwrap()
+            .into_inner()
+            .side
+    }
+    fn target(&mut self, entity: Entity) -> &mut TargetSide<R> {
+        &mut self
+            .get_mut::<Sources<R>>(entity)
+            .unwrap()
+            .into_inner()
+            .side
+    }
+}
+struct HookLists<'q, 'a, 'b, R: Relation> {
+    sources: &'q mut Query<'a, &'static mut Relates<R>>,
+    targets: &'q mut Query<'b, &'static mut Sources<R>>,
+}
+impl<R: Relation> Lists<R> for HookLists<'_, '_, '_, R> {
+    fn source(&mut self, entity: Entity) -> &mut SourceSide<R> {
+        &mut self.sources.get_mut(entity).unwrap().into_inner().side
+    }
+    fn target(&mut self, entity: Entity) -> &mut TargetSide<R> {
+        &mut self.targets.get_mut(entity).unwrap().into_inner().side
+    }
+}
+
+impl<S: Storage> World<S> {
+    /// Relate `source` to `target`. A one-target source moves to `target`; a
+    /// one-source target drops its previous source. Relating twice is a no-op.
+    pub fn relate<R: Relation>(&mut self, source: Entity, target: Entity)
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+    {
+        assert!(
+            self.contains(source) && self.contains(target),
+            "relate: both entities must be alive"
+        );
+        assert!(
+            self.has_hook::<OnReplace<Relates<R>>>() && self.has_hook::<OnReplace<Sources<R>>>(),
+            "relate: install the relation's hooks with `.relation::<R>()`"
+        );
+        if let Some(current) = self.get::<Relates<R>>(source) {
+            if current.targets().any(|t| t == target) {
+                return;
+            }
+            if SourceSide::<R>::ONE && !current.is_empty() {
+                let previous = unlink::<R>(self, source, 0);
+                self.drop_if_empty_target::<R>(previous);
+            }
+        }
+        if TargetSide::<R>::ONE
+            && let Some(&(previous, index)) = self
+                .get::<Sources<R>>(target)
+                .and_then(|sources| sources.side.entries().first())
+        {
+            unlink::<R>(self, previous, index);
+            self.drop_if_empty_source::<R>(previous);
+        }
+        if self.get::<Sources<R>>(target).is_none() {
+            self.insert(target, Sources::<R>::new());
+        }
+        if self.get::<Relates<R>>(source).is_none() {
+            self.insert(source, Relates::<R>::new());
+        }
+        link::<R>(self, source, target);
+    }
+    /// Remove the `source` → `target` link; false if it did not exist.
+    pub fn unrelate<R: Relation>(&mut self, source: Entity, target: Entity) -> bool
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+    {
+        let Some(index) = self
+            .get::<Relates<R>>(source)
+            .and_then(|current| current.targets().position(|t| t == target))
+        else {
+            return false;
+        };
+        unlink::<R>(self, source, index as u32);
+        self.drop_if_empty_source::<R>(source);
+        self.drop_if_empty_target::<R>(target);
+        true
+    }
+    fn drop_if_empty_source<R: Relation>(&mut self, source: Entity)
+    where
+        S: ComponentLookup<Relates<R>>,
+    {
+        if self
+            .get::<Relates<R>>(source)
+            .is_some_and(Relates::is_empty)
+        {
+            self.remove::<Relates<R>>(source);
+        }
+    }
+    fn drop_if_empty_target<R: Relation>(&mut self, target: Entity)
+    where
+        S: ComponentLookup<Sources<R>>,
+    {
+        if self
+            .get::<Sources<R>>(target)
+            .is_some_and(Sources::is_empty)
+        {
+            self.remove::<Sources<R>>(target);
+        }
+    }
+}
+impl<S: Storage> Commands<'_, S> {
+    /// Deferred `World::relate`; skipped if either entity died meanwhile.
+    pub fn relate<R: Relation>(&mut self, source: Entity, target: Entity)
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+    {
+        self.queue(move |world| {
+            if world.contains(source) && world.contains(target) {
+                world.relate::<R>(source, target);
+            }
+        });
+    }
+    /// Deferred `World::unrelate`.
+    pub fn unrelate<R: Relation>(&mut self, source: Entity, target: Entity)
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+    {
+        self.queue(move |world| {
+            world.unrelate::<R>(source, target);
+        });
+    }
+}
+
+/// A source is losing `Relates<R>` (removed or despawned): unlink it from
+/// every target, dropping `Sources<R>` from targets left without sources.
+fn source_gone<
+    R: Relation,
+    S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+>(
+    trigger: Trigger,
+    mut sources: Query<&'static mut Relates<R>>,
+    mut targets: Query<&'static mut Sources<R>>,
+    mut commands: Commands<S>,
+) {
+    let mut lists = HookLists {
+        sources: &mut sources,
+        targets: &mut targets,
+    };
+    for &source in trigger.iter() {
+        // From the end: no entry moves.
+        while let Some(index) = lists.source(source).entries().len().checked_sub(1) {
+            let target = unlink::<R>(&mut lists, source, index as u32);
+            if lists.target(target).entries().is_empty() {
+                commands.remove::<(Sources<R>,)>(target);
+            }
+        }
+    }
+}
+/// A target is losing `Sources<R>`: despawn its sources if linked, otherwise
+/// unlink them, dropping `Relates<R>` from sources left without targets.
+fn target_gone<
+    R: Relation,
+    S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+>(
+    trigger: Trigger,
+    mut sources: Query<&'static mut Relates<R>>,
+    mut targets: Query<&'static mut Sources<R>>,
+    mut commands: Commands<S>,
+) {
+    let mut lists = HookLists {
+        sources: &mut sources,
+        targets: &mut targets,
+    };
+    for &target in trigger.iter() {
+        while let Some(&(source, index)) = lists.target(target).entries().last() {
+            unlink::<R>(&mut lists, source, index);
+            if R::LINKED {
+                commands.despawn(source);
+            } else if lists.source(source).entries().is_empty() {
+                commands.remove::<(Relates<R>,)>(source);
+            }
+        }
+    }
+}
+
+/// Both cleanup hooks share this signature.
+type Cleanup<R, S> = for<'a, 'b, 'c, 'd> fn(
+    Trigger<'a>,
+    Query<'b, &'static mut Relates<R>>,
+    Query<'c, &'static mut Sources<R>>,
+    Commands<'d, S>,
+);
+type CleanupSystem<R, S> = FunctionSystem<
+    Cleanup<R, S>,
+    (
+        Trigger<'static>,
+        Query<'static, &'static mut Relates<R>>,
+        Query<'static, &'static mut Sources<R>>,
+        Commands<'static, S>,
+    ),
+    ((), QueryState, QueryState, CommandQueue<S>),
+    (),
+>;
+/// The hooks keeping relation `R` consistent in world `S`.
+pub type RelationHooks<R, S> = (
+    Hook<OnReplace<Relates<R>>, CleanupSystem<R, S>>,
+    Hook<OnReplace<Sources<R>>, CleanupSystem<R, S>>,
+);
+
+/// Install relation `R`: registers `Relates<R>` and `Sources<R>` and the hooks
+/// keeping them consistent. Use `.relation::<R, _>()` or install from a plugin.
+pub fn relation<R, S>() -> RelationHooks<R, S>
+where
+    R: Relation,
+    S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+{
+    (
+        on_replace::<Relates<R>, _, _>(source_gone::<R, S> as Cleanup<R, S>),
+        on_replace::<Sources<R>, _, _>(target_gone::<R, S> as Cleanup<R, S>),
+    )
+}

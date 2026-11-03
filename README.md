@@ -236,6 +236,42 @@ assert!(app.world.get::<Alive>(entity).is_some()); // applied before spawn retur
   an operation reaches it through one table lookup and indirect call. Worlds
   without hooks skip the table entirely.
 
+### Relations
+
+A relation kind fixes its cardinality and despawn behavior at compile time:
+
+```rust
+use static_ecs::prelude::*;
+struct ChildOf;
+impl Relation for ChildOf {
+    type Kind = OneToMany;    // or OneToOne, ManyToMany
+    const LINKED: bool = true; // despawning a parent despawns its children
+}
+
+let mut app = App::new().relation::<ChildOf, _>().build();
+let world = &mut app.world;
+let (parent, child) = (world.spawn(), world.spawn());
+world.relate::<ChildOf>(child, parent);
+assert_eq!(world.get::<Relates<ChildOf>>(child).unwrap().target(), parent);
+assert_eq!(world.get::<Sources<ChildOf>>(parent).unwrap().len(), 1);
+world.despawn(parent);
+assert!(!world.contains(child));
+```
+
+- Sources hold `Relates<R>` (`targets()`, or `target()` for one target), targets
+  hold `Sources<R>` (`sources()`/`source()`). Both are ordinary components:
+  query them, filter with `With<Sources<R>>`, or read them in hooks.
+- `world.relate`/`unrelate` and `commands.relate`/`unrelate` are the only
+  writers. A one-target source moves to its new target; a one-source target
+  drops its previous source.
+- Each entry stores its index in the other side's list, so unlinking is O(1)
+  (swap-remove both sides, fix one back-index). One-sided ends store an
+  `Option`, never a `Vec`.
+- `.relation::<R, _>()` installs two hooks that unlink (or, if `LINKED`,
+  despawn) when either side is removed or despawned. Relating without them
+  panics. Relations do not fragment archetypes: entities with different targets
+  share tables.
+
 ## Execution model
 
 A frame is one compiled program:
@@ -280,7 +316,7 @@ debug = "line-tables-only" # keeps file:line backtraces
 Limits: very long continuation chains may need a higher `#![recursion_limit]` in
 the crate that builds the app. Graph compile time grows quadratically with nodes
 per graph. Parallel groups need `Send` systems and `Send + Sync` world data.
-Missing Bevy features include observers, relations, states, resources as a
-separate store, and runtime system registration.
+Missing Bevy features include observers, states, resources as a separate store,
+and runtime system registration.
 
 Benchmarks against Bevy 0.20 are in [BENCHMARKS.md](BENCHMARKS.md).

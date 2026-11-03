@@ -14,6 +14,7 @@ mod lookup;
 mod param;
 mod plan;
 mod query;
+mod relation;
 mod storage;
 mod vocab;
 
@@ -36,12 +37,16 @@ pub use plan::{
     ExclusiveSystem, ExecutionMode, IntoSystemConfigs, IntoSystems, Shape, System, exclusive,
 };
 pub use query::{ContiguousError, Query, QueryChunks, Single};
+pub use relation::{
+    ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources, relation,
+};
 
 pub mod prelude {
     pub use crate::{
         Added, App, Changed, Commands, Components, ContiguousError, Entity, ExecutionMode, Has,
-        IntoSystemConfigs, Local, Mut, MutSlice, Or, Query, Single, Sparse, Storage, Trigger, With,
-        Without, WorkerPool, World, exclusive, node, ready, system,
+        IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, OneToMany, OneToOne, Or, Query,
+        Relates, Relation, Single, Sources, Sparse, Storage, Trigger, With, Without, WorkerPool,
+        World, exclusive, node, ready, system,
     };
 }
 pub use storage::{Bundle, Components, Entity, Sparse, Storage, World};

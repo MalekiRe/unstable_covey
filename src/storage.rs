@@ -389,6 +389,16 @@ impl<S: Storage> World<S> {
     pub(crate) fn set_hooks<H: HookList<S> + Send + Sync + 'static>(&mut self, hooks: H) {
         self.hooks = Some(HookTable::new(hooks));
     }
+    /// Whether any hook listens for event `E`.
+    pub(crate) fn has_hook<E: Event>(&self) -> bool
+    where
+        S: ComponentLookup<E::Component>,
+    {
+        self.hooks.as_ref().is_some_and(|hooks| {
+            let index = <S as ComponentLookup<E::Component>>::INDEX;
+            hooks.entry(index, <E::Kind as Kind>::INDEX).is_some()
+        })
+    }
     /// The running hook's entities; empty outside hooks.
     /// # Safety
     /// The pointer is live; reads only the trigger field.
