@@ -1,19 +1,19 @@
 use demo_input::Click;
-use static_ecs::{Subscribe, subscribe};
+use static_ecs::{Callback, On, system};
 
-// Introduced here: neither the dispatcher nor analytics knows this type.
+// Introduced here: neither the app nor analytics knows this type.
 pub struct PacketReceived {
     pub bytes: usize,
 }
 
-pub type Plugin<C, P> = (Subscribe<Click, C>, Subscribe<PacketReceived, P>);
+pub type Plugin<C, P> = (On<Click, Callback<C>>, On<PacketReceived, Callback<P>>);
 
-pub fn plugin<'a>(
+pub fn plugin<'a, W>(
     clicks: &'a mut u32,
     bytes: &'a mut usize,
-) -> Plugin<impl FnMut(&Click) + 'a, impl FnMut(&PacketReceived) + 'a> {
+) -> Plugin<impl FnMut(&Click, &mut W) + 'a, impl FnMut(&PacketReceived, &mut W) + 'a> {
     (
-        subscribe(move |_: &Click| *clicks += 1),
-        subscribe(move |packet: &PacketReceived| *bytes += packet.bytes),
+        system(move |_: &Click, _: &mut W| *clicks += 1),
+        system(move |packet: &PacketReceived, _: &mut W| *bytes += packet.bytes),
     )
 }

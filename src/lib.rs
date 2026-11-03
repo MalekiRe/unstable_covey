@@ -17,8 +17,8 @@ mod vocab;
 
 pub use change::{Mut, MutSlice};
 pub use dispatch::{
-    App, AppBuilder, Bus, Callback, Cons, Dispatch, Handle, Install, Listener, MaybeHandle, Nil,
-    On, Run, Scheduled, Subscribe, subscribe, system,
+    App, AppBuilder, Callback, Cons, Dispatch, Handle, Install, MaybeHandle, Nil, On, Run,
+    Scheduled, system,
 };
 pub use executor::WorkerPool;
 pub use filter::{Added, Changed, Or, With, Without};
@@ -32,9 +32,9 @@ pub use query::{ContiguousError, Query, QueryChunks, Single};
 
 pub mod prelude {
     pub use crate::{
-        Added, App, Bus, Changed, Components, ContiguousError, Entity, ExecutionMode, Has,
+        Added, App, Changed, Components, ContiguousError, Entity, ExecutionMode, Has,
         IntoSystemConfigs, Local, Mut, MutSlice, Or, Query, Single, Sparse, Storage, With, Without,
-        WorkerPool, World, exclusive, node, ready, subscribe, system,
+        WorkerPool, World, exclusive, node, ready, system,
     };
 }
 pub use storage::{Bundle, Components, Entity, Sparse, Storage, World};

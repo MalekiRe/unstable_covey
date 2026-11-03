@@ -52,15 +52,16 @@ impl<E: 'static, S, H: Handle<E, S>> MaybeHandle<E, S> for On<E, H> {
 ```
 
 There is no runtime event-type comparison. A plugin is a value that installs into
-any list, without knowing the application or other plugins:
+any app, without knowing the application or other plugins; plugins that ignore
+the world stay generic over it:
 
 ```rust
-use static_ecs::{Bus, Subscribe, subscribe};
+use static_ecs::{App, Callback, On, system};
 struct Click { x: u32 }
 
-fn analytics(total: &mut u32) -> Subscribe<Click, impl FnMut(&Click) + '_> {
+fn analytics<W>(total: &mut u32) -> On<Click, Callback<impl FnMut(&Click, &mut W) + '_>> {
     let mut count = 0;
-    subscribe(move |event: &Click| {
+    system(move |event: &Click, _: &mut W| {
         count += 1;
         *total += event.x * count;
     })
@@ -68,18 +69,18 @@ fn analytics(total: &mut u32) -> Subscribe<Click, impl FnMut(&Click) + '_> {
 
 let mut total = 0;
 {
-    let mut bus = Bus::new().install(analytics(&mut total));
-    bus.emit(&Click { x: 3 });
-    bus.emit(&Click { x: 3 });
-    bus.emit(&42_u64); // Unhandled type: no-op, no declaration needed.
+    let mut app = App::new().install(analytics(&mut total)).build();
+    app.emit(&Click { x: 3 });
+    app.emit(&Click { x: 3 });
+    app.emit(&42_u64); // Unhandled type: no-op, no declaration needed.
 }
 assert_eq!(total, 9);
 ```
 
-`install` consumes the bus or app and returns a new type; nested tuples install
+`install` consumes the builder and returns a new type; nested tuples install
 left to right. Keep the event type visible in cross-crate return types
-(`Subscribe<E, F>` is `On<E, Listener<F>>`). Events are `'static` types. The
-`demo/` crates compose two independent plugin crates.
+(`On<E, Callback<F>>`). Events are `'static` types. The `demo/` crates compose
+two independent plugin crates.
 
 `App::new()` returns a builder. `add_systems(Label, systems)` registers systems
 for a zero-sized label; `.on(|event: &E, world: &mut World<_>| ...)` and

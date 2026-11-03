@@ -1,5 +1,5 @@
 use static_ecs::{
-    App, Bus, Entity, Has, Query, Single, Sparse, With, Without, World, exclusive, subscribe,
+    App, Entity, Has, Query, Single, Sparse, With, Without, World, exclusive, system,
 };
 use std::cell::RefCell;
 
@@ -15,20 +15,23 @@ struct Unhandled;
 fn specialization_filters_types_preserving_order_and_captures() {
     let log = RefCell::new(Vec::new());
     let mut count = 0;
-    let mut bus = Bus::new().install((
-        subscribe(|e: &first::Event| {
-            count += 1;
-            log.borrow_mut().push(("first", e.0 * count));
-        }),
-        (
-            subscribe(|e: &second::Event| log.borrow_mut().push(("other", e.0))),
-            subscribe(|e: &first::Event| log.borrow_mut().push(("last", e.0))),
-        ),
-    ));
-    bus.emit(&first::Event(3));
-    bus.emit(&Unhandled);
-    bus.emit(&second::Event(7));
-    bus.emit(&first::Event(5));
+    let mut app = App::new()
+        .install((
+            system(|e: &first::Event, _: &mut World<_>| {
+                count += 1;
+                log.borrow_mut().push(("first", e.0 * count));
+            }),
+            (
+                system(|e: &second::Event, _: &mut World<_>| log.borrow_mut().push(("other", e.0))),
+                system(|e: &first::Event, _: &mut World<_>| log.borrow_mut().push(("last", e.0))),
+            ),
+        ))
+        .build();
+    app.emit(&first::Event(3));
+    app.emit(&Unhandled);
+    app.emit(&second::Event(7));
+    app.emit(&first::Event(5));
+    drop(app);
     assert_eq!(
         *log.borrow(),
         vec![

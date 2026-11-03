@@ -57,23 +57,6 @@ impl<E, S, F: FnMut(&E, &mut S)> Handle<E, S> for Callback<F> {
     }
 }
 
-pub struct Listener<F>(F);
-pub type Subscribe<E, F> = On<E, Listener<F>>;
-
-impl<E, S, F: FnMut(&E)> Handle<E, S> for Listener<F> {
-    #[inline]
-    fn handle(&mut self, event: &E, _: &mut S) {
-        (self.0)(event);
-    }
-}
-
-pub fn subscribe<E: 'static, F: FnMut(&E)>(callback: F) -> Subscribe<E, F> {
-    On {
-        handler: Listener(callback),
-        marker: PhantomData,
-    }
-}
-
 /// An installable payload handler. Annotate the world as `&mut World<_>`, or
 /// make a plugin generic over it.
 pub fn system<E: 'static, F>(callback: F) -> On<E, Callback<F>> {
@@ -307,9 +290,6 @@ pub trait Handler {
 impl<F> Handler for Callback<F> {
     type Access = ();
 }
-impl<F> Handler for Listener<F> {
-    type Access = ();
-}
 impl<P: Shape> Handler for Run<P> {
     type Access = P::Access;
 }
@@ -350,42 +330,6 @@ impl<W, H: Fits<W>, T: Fits<W>> Fits<W> for Cons<H, T> {
 }
 impl<W, E: 'static, H: Handle<E, W>> Fits<W> for On<E, H> {
     const VALID: bool = H::VALID;
-}
-
-/// Event-only dispatcher; listeners and their captures live inline.
-#[derive(Default)]
-pub struct Bus<L = Nil>(L);
-
-impl Bus {
-    pub fn new() -> Self {
-        Self(Nil)
-    }
-}
-
-impl<L> Bus<L> {
-    pub fn install<P: Install<(), L>>(self, plugin: P) -> Bus<P::Output> {
-        Bus(plugin.install(self.0))
-    }
-
-    pub fn on<E: 'static, F: FnMut(&E)>(self, callback: F) -> Bus<Cons<Subscribe<E, F>, L>> {
-        self.install(subscribe(callback))
-    }
-
-    /// E must not contain non-static borrowed data. The event itself is borrowed
-    /// only for this call; closure captures may borrow local state.
-    /// ```compile_fail
-    /// use static_ecs::Bus;
-    /// struct Borrowed<'a>(&'a str);
-    /// let text = String::from("local");
-    /// Bus::new().emit(&Borrowed(&text));
-    /// ```
-    #[inline]
-    pub fn emit<E: 'static>(&mut self, event: &E)
-    where
-        L: Dispatch<E, ()>,
-    {
-        self.0.dispatch(event, &mut ());
-    }
 }
 
 /// Composes plugins and systems; `build` creates a world storing exactly the
