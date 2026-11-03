@@ -98,6 +98,42 @@ All differences are within run-to-run variation; all 60 processes produced
 identical final states, and per-update states still match Bevy for zero, one, and
 4,096 actors. Results: `inferred-*.json`.
 
+## Query loop (`4826f3b` → current)
+
+`examples/query_loop.rs`: one system adds `Velocity` to `Position` for 1,048,576
+entities in one dense archetype, compared against the same loop over raw slices
+(`ideal`, which compiles to SSE `addps` plus vector tick stores). Measured as a
+standalone crate with fat LTO and `panic = "abort"`, two runs each:
+
+| Variant | Before ns/entity | After ns/entity |
+|---|---:|---:|
+| raw slices | 0.24–0.27 | 0.25–0.29 |
+| `for` loop (`next`) | 1.39–1.43 (5.5×) | 0.91–0.94 (3.4×) |
+| `for_each` (`fold`) | 0.90–0.93 (3.5×) | 0.20–0.23 (≈1×) |
+| `contiguous_mut` | 0.20–0.22 | 0.19–0.22 |
+
+Per row, the old loop branched on two row maps and a summary pointer, ran the
+summary's `lock cmpxchg` when one existed, and reloaded the iterator from the
+stack. Now writable summaries are raised once per table, `fold` picks the
+direct-row loop once per table, and the outlined table search no longer takes
+the iterator's address. A `for` loop keeps two well-predicted row-map branches:
+`Query` does not name the world, so dense-only storage is not a compile-time
+fact there.
+
+Matched simulation, five alternating repetitions per row (`query-loop-paired.json`):
+
+| Actors | Workers | Before ms | After ms | Change |
+|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0666 | 0.0656 | −1.5% |
+| 0 | 4 | 0.0306 | 0.0267 | −12.9% |
+| 4,096 | 1 | 1.262 | 1.226 | −2.8% |
+| 4,096 | 4 | 1.127 | 1.057 | −6.2% |
+| 100,000 | 1 | 95.6 | 96.4 | +0.9% |
+| 100,000 | 4 | 80.0 | 80.9 | +1.1% |
+
+The 100,000-actor rows are within run-to-run variation; final-state digests
+match in all 60 processes.
+
 ## Blended microbenchmark
 
 `blend_*`: 4,096 tiny systems in four parallel lanes plus a small simulation over

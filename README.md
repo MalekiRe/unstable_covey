@@ -155,7 +155,12 @@ assert!(world.despawn(entity));
 Mutable items are `Mut<T>`: mutable dereferencing marks the row changed. Each
 system has its own change window; skipped systems keep pending changes.
 `Components<T, true>` enables per-column change summaries that let
-`Added`/`Changed` skip whole columns.
+`Added`/`Changed` skip whole columns. A summary is raised once per table when a
+query fetches the column mutably, so per-row loops do no atomic work; columns
+fetched for writing but left unchanged are scanned, not skipped.
+
+Iterate hot queries with `for_each` (or `contiguous_mut`): it runs one tight,
+vectorizable loop per table. A `for` loop goes through `next` and stays scalar.
 
 Change ticks are a Lamport clock carried along the schedule rather than a shared
 counter: a writer issues the next tick on its own path, joins take the maximum,

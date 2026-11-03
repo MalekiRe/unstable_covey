@@ -7,6 +7,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     ops::{Deref, Index},
+    ptr::NonNull,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -137,25 +138,44 @@ const fn bundle_key(indices: &[usize]) -> u64 {
 
 /// Immutable access metadata, separate from all owned component buffers.
 #[doc(hidden)]
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct ColumnPtr {
-    data: *mut u8,
-    added: *mut u64,
-    changed: *mut u64,
+    // NonNull lets optimized `Option<item>` checks fold away.
+    data: NonNull<u8>,
+    added: NonNull<u64>,
+    changed: NonNull<u64>,
     summary: *const Summary,
     rows: *const usize,
+}
+impl Default for ColumnPtr {
+    fn default() -> Self {
+        Self {
+            data: NonNull::dangling(),
+            added: NonNull::dangling(),
+            changed: NonNull::dangling(),
+            summary: std::ptr::null(),
+            rows: std::ptr::null(),
+        }
+    }
 }
 unsafe impl Send for ColumnPtr {}
 unsafe impl Sync for ColumnPtr {}
 impl ColumnPtr {
     fn new(column: &Column, rows: *const usize) -> Self {
-        Self {
-            data: column.data,
-            added: column.added,
-            changed: column.changed,
-            summary: column.summary.as_deref().map_or(std::ptr::null(), |s| s),
-            rows,
+        // Column buffers are allocated or dangling, never null.
+        unsafe {
+            Self {
+                data: NonNull::new_unchecked(column.data),
+                added: NonNull::new_unchecked(column.added),
+                changed: NonNull::new_unchecked(column.changed),
+                summary: column.summary.as_deref().map_or(std::ptr::null(), |s| s),
+                rows,
+            }
         }
+    }
+    /// Whether rows index the column directly, with no archetype row map.
+    pub(crate) fn direct(self) -> bool {
+        self.rows.is_null()
     }
     unsafe fn row(self, row: usize) -> usize {
         if self.rows.is_null() {
@@ -165,19 +185,26 @@ impl ColumnPtr {
         }
     }
     pub(crate) unsafe fn value<T>(self, row: usize) -> *mut T {
-        unsafe { self.data.cast::<T>().add(self.row(row)) }
+        unsafe { self.data.cast::<T>().add(self.row(row)).as_ptr() }
     }
     pub(crate) unsafe fn added(self, row: usize) -> *mut u64 {
-        unsafe { self.added.add(self.row(row)) }
+        unsafe { self.added.add(self.row(row)).as_ptr() }
     }
     pub(crate) unsafe fn changed(self, row: usize) -> *mut u64 {
-        unsafe { self.changed.add(self.row(row)) }
+        unsafe { self.changed.add(self.row(row)).as_ptr() }
     }
     pub(crate) unsafe fn added_summary<'a>(self) -> Option<&'a AtomicU64> {
         unsafe { self.summary.as_ref().map(|s| &s.added) }
     }
     pub(crate) unsafe fn changed_summary<'a>(self) -> Option<&'a AtomicU64> {
         unsafe { self.summary.as_ref().map(|s| &s.changed) }
+    }
+    /// Raise the changed summary before handing out mutable rows. Summaries
+    /// only bound row ticks, so raising one for rows left unchanged is exact.
+    pub(crate) unsafe fn touch(self, tick: u64) {
+        if let Some(summary) = unsafe { self.changed_summary() } {
+            summary.fetch_max(tick, Ordering::Relaxed);
+        }
     }
     pub(crate) unsafe fn contiguous(self, start: usize, len: usize) -> bool {
         if self.rows.is_null() || len < 2 {
@@ -189,9 +216,7 @@ impl ColumnPtr {
     unsafe fn mark(self, row: usize, tick: u64, added: bool) {
         unsafe {
             self.changed(row).write(tick);
-            if let Some(summary) = self.changed_summary() {
-                summary.fetch_max(tick, Ordering::Relaxed);
-            }
+            self.touch(tick);
             if added {
                 self.added(row).write(tick);
                 if let Some(summary) = self.added_summary() {
@@ -740,10 +765,10 @@ impl<S: Storage> World<S> {
         let tick = self.change_tick();
         let column = self.tables[location.table].columns[S::INDEX];
         Some(unsafe {
+            column.touch(tick);
             Mut::new(
                 &mut *column.value::<T>(location.row),
                 &mut *column.changed(location.row),
-                column.changed_summary(),
                 tick,
             )
         })

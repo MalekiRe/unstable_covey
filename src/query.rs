@@ -31,8 +31,11 @@ pub trait QueryData: sealed::Sealed {
     #[doc(hidden)]
     fn requires(indices: &Self::Indices, component: usize) -> bool;
     /// # Safety
-    /// Indices identify the correct types and the table matches.
-    unsafe fn fetch(table: &Table, indices: &Self::Indices) -> Self::Fetch;
+    /// Indices identify the correct types and the table matches. Writable
+    /// columns have their change summaries raised to `tick`.
+    unsafe fn fetch(table: &Table, indices: &Self::Indices, tick: u64) -> Self::Fetch;
+    /// Whether every column indexes rows directly, with no archetype row map.
+    fn direct(fetch: &Self::Fetch) -> bool;
     /// # Safety
     /// Row is live, access granted for 'a, and mutable rows are yielded once.
     unsafe fn get<'a>(fetch: &Self::Fetch, row: usize, tick: u64) -> Self::Item<'a>;
@@ -212,7 +215,12 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         let mut tables = self.tables();
         while let Some(table) = tables.next::<D, F>(&self.indices, &self.filter) {
             if !table.entities.is_empty()
-                && !unsafe { D::contiguous(&D::fetch(table, &self.indices), table.entities.len()) }
+                && !unsafe {
+                    D::contiguous(
+                        &D::fetch(table, &self.indices, self.window.now),
+                        table.entities.len(),
+                    )
+                }
             {
                 return Err(ContiguousError::Fragmented);
             }
@@ -258,7 +266,10 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         }
         let (table, row) = matched?;
         Some(Single {
-            item: unsafe { D::get(&D::fetch(table, &self.indices), row, self.window.now) },
+            item: unsafe {
+                let fetch = D::fetch(table, &self.indices, self.window.now);
+                D::get(&fetch, row, self.window.now)
+            },
             filter: PhantomData,
         })
     }
@@ -275,25 +286,42 @@ pub struct QueryIter<'a, D: QueryData, F: QueryFilter = ()> {
     class: TableMatch,
     lifetime: PhantomData<&'a mut ()>,
 }
-impl<D: QueryData, F: QueryFilter> QueryIter<'_, D, F> {
-    #[inline]
-    fn advance(&mut self) -> bool {
-        while let Some(table) = self.tables.next::<D, F>(&self.indices, &self.filter) {
+impl<'a, D: QueryData, F: QueryFilter> QueryIter<'a, D, F> {
+    /// The next nonempty matching table. Outlined, and the cursor travels by
+    /// value: the iterator's address never escapes, so an inlined per-row
+    /// loop keeps its state in registers.
+    #[inline(never)]
+    fn next_table(
+        mut tables: Tables<'a>,
+        indices: D::Indices,
+        filter: F::State,
+        window: ChangeWindow,
+    ) -> (Tables<'a>, Option<(&'a Table, TableMatch)>) {
+        while let Some(table) = tables.next::<D, F>(&indices, &filter) {
             if table.entities.is_empty() {
                 continue;
             }
-            let class = unsafe { F::classify(&self.filter, table, self.window) };
-            if class == TableMatch::None {
-                continue;
+            let class = unsafe { F::classify(&filter, table, window) };
+            if class != TableMatch::None {
+                return (tables, Some((table, class)));
             }
-            self.fetch = unsafe { D::fetch(table, &self.indices) };
-            self.table = Some(table);
-            self.row = 0;
-            self.end = table.entities.len();
-            self.class = class;
-            return true;
         }
-        false
+        (tables, None)
+    }
+    #[inline]
+    fn advance(&mut self) -> bool {
+        let tables = self.tables.clone();
+        let (tables, next) = Self::next_table(tables, self.indices, self.filter, self.window);
+        self.tables = tables;
+        let Some((table, class)) = next else {
+            return false;
+        };
+        self.fetch = unsafe { D::fetch(table, &self.indices, self.window.now) };
+        self.table = Some(table);
+        self.row = 0;
+        self.end = table.entities.len();
+        self.class = class;
+        true
     }
 }
 impl<'a, D: QueryData, F: QueryFilter> Iterator for QueryIter<'a, D, F> {
@@ -306,7 +334,8 @@ impl<'a, D: QueryData, F: QueryFilter> Iterator for QueryIter<'a, D, F> {
             }
             let row = self.row;
             self.row += 1;
-            if self.class == TableMatch::All
+            if const { F::ARCHETYPAL }
+                || self.class == TableMatch::All
                 || unsafe { F::row(&self.filter, self.table.unwrap(), row, self.window) }
             {
                 return Some(unsafe { D::get(&self.fetch, row, self.window.now) });
@@ -351,13 +380,24 @@ impl<'a, D: QueryData, F: QueryFilter> Iterator for QueryIter<'a, D, F> {
     #[inline]
     fn fold<B, G: FnMut(B, Self::Item) -> B>(mut self, mut result: B, mut f: G) -> B {
         loop {
-            while self.row < self.end {
-                let row = self.row;
-                self.row += 1;
-                if self.class == TableMatch::All
-                    || unsafe { F::row(&self.filter, self.table.unwrap(), row, self.window) }
-                {
-                    result = f(result, unsafe { D::get(&self.fetch, row, self.window.now) });
+            let (fetch, rows, now) = (self.fetch, self.row..self.end, self.window.now);
+            if const { F::ARCHETYPAL } || self.class == TableMatch::All {
+                // Unswitched per table: direct rows fold every row-map branch away.
+                #[expect(clippy::if_same_then_else, reason = "per-table loop unswitching")]
+                if D::direct(&fetch) {
+                    for row in rows {
+                        result = f(result, unsafe { D::get(&fetch, row, now) });
+                    }
+                } else {
+                    for row in rows {
+                        result = f(result, unsafe { D::get(&fetch, row, now) });
+                    }
+                }
+            } else if let Some(table) = self.table {
+                for row in rows {
+                    if unsafe { F::row(&self.filter, table, row, self.window) } {
+                        result = f(result, unsafe { D::get(&fetch, row, now) });
+                    }
                 }
             }
             if !self.advance() {
@@ -402,7 +442,7 @@ impl<'a, D: QueryData, F: QueryFilter> Iterator for QueryChunks<'a, D, F> {
             if !table.entities.is_empty() {
                 return Some(unsafe {
                     D::slice(
-                        &D::fetch(table, &self.indices),
+                        &D::fetch(table, &self.indices, self.tick),
                         table.entities.len(),
                         self.tick,
                     )
@@ -445,8 +485,11 @@ impl<T: 'static> QueryData for &T {
     fn requires(index: &usize, component: usize) -> bool {
         *index == component
     }
-    unsafe fn fetch(table: &Table, index: &usize) -> ColumnPtr {
+    unsafe fn fetch(table: &Table, index: &usize, _: u64) -> ColumnPtr {
         table.columns[*index]
+    }
+    fn direct(fetch: &ColumnPtr) -> bool {
+        fetch.direct()
     }
     unsafe fn get<'a>(fetch: &ColumnPtr, row: usize, _: u64) -> &'a T {
         unsafe { &*fetch.value::<T>(row) }
@@ -474,18 +517,16 @@ impl<T: 'static> QueryData for &mut T {
     fn requires(index: &usize, component: usize) -> bool {
         *index == component
     }
-    unsafe fn fetch(table: &Table, index: &usize) -> ColumnPtr {
-        table.columns[*index]
+    unsafe fn fetch(table: &Table, index: &usize, tick: u64) -> ColumnPtr {
+        let column = table.columns[*index];
+        unsafe { column.touch(tick) };
+        column
+    }
+    fn direct(fetch: &ColumnPtr) -> bool {
+        fetch.direct()
     }
     unsafe fn get<'a>(fetch: &ColumnPtr, row: usize, tick: u64) -> Mut<'a, T> {
-        unsafe {
-            Mut::new(
-                &mut *fetch.value::<T>(row),
-                &mut *fetch.changed(row),
-                fetch.changed_summary(),
-                tick,
-            )
-        }
+        unsafe { Mut::new(&mut *fetch.value::<T>(row), &mut *fetch.changed(row), tick) }
     }
     unsafe fn contiguous(fetch: &ColumnPtr, len: usize) -> bool {
         unsafe { fetch.contiguous(0, len) }
@@ -495,7 +536,6 @@ impl<T: 'static> QueryData for &mut T {
             MutSlice::new(
                 slice::from_raw_parts_mut(fetch.value::<T>(0), len),
                 slice::from_raw_parts_mut(fetch.changed(0), len),
-                fetch.changed_summary(),
                 tick,
             )
         }
@@ -517,8 +557,11 @@ impl QueryData for Entity {
     fn requires(_: &(), _: usize) -> bool {
         false
     }
-    unsafe fn fetch(table: &Table, _: &()) -> Self::Fetch {
+    unsafe fn fetch(table: &Table, _: &(), _: u64) -> Self::Fetch {
         table.entities.as_ptr()
+    }
+    fn direct(_: &Self::Fetch) -> bool {
+        true
     }
     unsafe fn get<'a>(fetch: &Self::Fetch, row: usize, _: u64) -> Self::Item<'a> {
         unsafe { *fetch.add(row) }
@@ -541,7 +584,8 @@ macro_rules! tuple_query {
             type Item<'w> = ($($data::Item<'w>,)+); type Slice<'w> = ($($data::Slice<'w>,)+);
             fn matches(indices: &Self::Indices, present: &[bool]) -> bool { true $(&& $data::matches(&indices.$index, present))+ }
             fn requires(indices: &Self::Indices, component: usize) -> bool { false $(|| $data::requires(&indices.$index, component))+ }
-            unsafe fn fetch(table: &Table, indices: &Self::Indices) -> Self::Fetch { unsafe { ($($data::fetch(table, &indices.$index),)+) } }
+            unsafe fn fetch(table: &Table, indices: &Self::Indices, tick: u64) -> Self::Fetch { unsafe { ($($data::fetch(table, &indices.$index, tick),)+) } }
+            fn direct(fetch: &Self::Fetch) -> bool { true $(&& $data::direct(&fetch.$index))+ }
             unsafe fn get<'a>(fetch: &Self::Fetch, row: usize, tick: u64) -> Self::Item<'a> { unsafe { ($($data::get(&fetch.$index, row, tick),)+) } }
             unsafe fn contiguous(fetch: &Self::Fetch, len: usize) -> bool { true $(&& unsafe { $data::contiguous(&fetch.$index, len) })+ }
             unsafe fn slice<'a>(fetch: &Self::Fetch, len: usize, tick: u64) -> Self::Slice<'a> { unsafe { ($($data::slice(&fetch.$index, len, tick),)+) } }

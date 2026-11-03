@@ -1,12 +1,11 @@
 use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A mutable component borrow. Reading it does not mark the component changed;
 /// mutable dereferencing does, even if the eventual value compares equal.
+/// Its column's change summary was raised when the borrow was fetched.
 pub struct Mut<'a, T> {
     value: &'a mut T,
     changed: &'a mut u64,
-    summary: Option<&'a AtomicU64>,
     tick: u64,
 }
 impl<T> Deref for Mut<'_, T> {
@@ -22,24 +21,15 @@ impl<T> DerefMut for Mut<'_, T> {
     }
 }
 impl<'a, T> Mut<'a, T> {
-    pub(crate) fn new(
-        value: &'a mut T,
-        changed: &'a mut u64,
-        summary: Option<&'a AtomicU64>,
-        tick: u64,
-    ) -> Self {
+    pub(crate) fn new(value: &'a mut T, changed: &'a mut u64, tick: u64) -> Self {
         Self {
             value,
             changed,
-            summary,
             tick,
         }
     }
     fn mark_changed(&mut self) {
         *self.changed = self.tick;
-        if let Some(summary) = self.summary {
-            summary.fetch_max(self.tick, Ordering::Relaxed);
-        }
     }
     pub fn into_inner(mut self) -> &'a mut T {
         self.mark_changed();
@@ -53,47 +43,29 @@ impl<'a, T> Mut<'a, T> {
 pub struct MutSlice<'a, T> {
     values: &'a mut [T],
     changed: &'a mut [u64],
-    summary: Option<&'a AtomicU64>,
     tick: u64,
 }
 impl<'a, T> MutSlice<'a, T> {
-    pub(crate) fn new(
-        values: &'a mut [T],
-        changed: &'a mut [u64],
-        summary: Option<&'a AtomicU64>,
-        tick: u64,
-    ) -> Self {
+    pub(crate) fn new(values: &'a mut [T], changed: &'a mut [u64], tick: u64) -> Self {
         Self {
             values,
             changed,
-            summary,
             tick,
         }
     }
     pub fn get_mut(&mut self, index: usize) -> Option<Mut<'_, T>> {
         let value = self.values.get_mut(index)?;
-        Some(Mut::new(
-            value,
-            &mut self.changed[index],
-            self.summary,
-            self.tick,
-        ))
+        Some(Mut::new(value, &mut self.changed[index], self.tick))
     }
     pub fn iter_mut(&mut self) -> impl ExactSizeIterator<Item = Mut<'_, T>> + DoubleEndedIterator {
-        let summary = self.summary;
         let tick = self.tick;
         self.values
             .iter_mut()
             .zip(self.changed.iter_mut())
-            .map(move |(value, changed)| Mut::new(value, changed, summary, tick))
+            .map(move |(value, changed)| Mut::new(value, changed, tick))
     }
     fn mark_all(&mut self) {
         self.changed.fill(self.tick);
-        if !self.values.is_empty()
-            && let Some(summary) = self.summary
-        {
-            summary.fetch_max(self.tick, Ordering::Relaxed);
-        }
     }
     pub fn as_mut_slice(&mut self) -> &mut [T] {
         self.mark_all();
