@@ -134,6 +134,12 @@ Matched simulation, five alternating repetitions per row (`query-loop-paired.jso
 The 100,000-actor rows are within run-to-run variation; final-state digests
 match in all 60 processes.
 
+Rewriting all 14 query loops in the shared benchmark systems as `for_each`
+(both backends, `foreach-results.json`) leaves the standings unchanged: static
+is 3.3% faster than Bevy ECS with one worker and 7.4% faster with four (8.4%
+with `for` loops). At 100,000 actors a frame is dominated by grid neighbor scans
+and pathfinding inside the loop bodies, not by iteration.
+
 ## Blended microbenchmark
 
 `blend_*`: 4,096 tiny systems in four parallel lanes plus a small simulation over
