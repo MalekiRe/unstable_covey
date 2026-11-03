@@ -172,7 +172,7 @@ or to its next one. Unordered, non-conflicting writers may share a tick value.
 ## Systems and composition
 
 Systems are functions or closures taking up to four parameters: `Query`,
-`Single`, and `Local<T>` (per-registration state).
+`Single`, `Local<T>` (per-registration state), and `Commands<_>`.
 
 ```rust,ignore
 app.add_systems(Update, ((integrate, decay).parallel(), validate).chain().run_if(running))
@@ -189,6 +189,15 @@ app.add_systems(Update, ((integrate, decay).parallel(), validate).chain().run_if
   deterministically and transitive edges removed, all during const evaluation.
 
 `ExecutionMode::Serial` runs everything on the calling thread without workers.
+
+`Commands<_>` records structural changes (`spawn`, `insert`, `remove`,
+`despawn`, or `queue` any `FnOnce(&mut World<S>)`) without structural access, so
+it runs in parallel groups. `spawn` reserves the entity immediately; later
+commands can use it. Each system's commands are stored inline in its own queue
+(no boxing, no locks) and applied when the `emit` that ran it finishes, in system
+order (`System::run` applies right after the run). Commands on entities
+despawned before they apply do nothing. Like `World<_>`, the parameter names the
+world, so components only ever inserted through commands must be registered.
 
 ## Execution model
 
@@ -234,7 +243,7 @@ debug = "line-tables-only" # keeps file:line backtraces
 Limits: very long continuation chains may need a higher `#![recursion_limit]` in
 the crate that builds the app. Graph compile time grows quadratically with nodes
 per graph. Parallel groups need `Send` systems and `Send + Sync` world data.
-Missing Bevy features include Commands, hooks, observers, states, resources as a
-separate store, and runtime system registration.
+Missing Bevy features include hooks, observers, relations, states, resources as
+a separate store, and runtime system registration.
 
 Benchmarks against Bevy 0.20 are in [BENCHMARKS.md](BENCHMARKS.md).

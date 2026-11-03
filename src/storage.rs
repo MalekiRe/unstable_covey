@@ -8,7 +8,7 @@ use std::{
     num::NonZeroUsize,
     ops::{Deref, Index},
     ptr::NonNull,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
 /// World-specific generational handle. Exhausted generations retire their slot.
@@ -288,6 +288,8 @@ pub struct World<S: Storage> {
     bundles: Transitions,
     /// The latest issued change tick; systems carry their own copy during a frame.
     clock: u64,
+    /// Fresh slots handed out by `Commands` during a frame, beyond `locations`.
+    reserved: AtomicU32,
     schema: PhantomData<S>,
 }
 impl<S: Storage> Default for World<S> {
@@ -315,6 +317,7 @@ impl<S: Storage> World<S> {
             archetypes: Vec::new(),
             bundles: Transitions::default(),
             clock: 0,
+            reserved: AtomicU32::new(0),
             schema: PhantomData,
         };
         world.add_table(vec![false; S::LEN]);
@@ -434,6 +437,30 @@ impl<S: Storage> World<S> {
             }
         }
     }
+    /// Reserve an entity without structural access; it becomes live when a
+    /// spawn command places it. Fresh slots only: no free-list race.
+    pub(crate) fn reserve_entity(&self) -> Entity {
+        let next = self.reserved.fetch_add(1, Ordering::Relaxed);
+        let slot = u32::try_from(self.locations.len())
+            .ok()
+            .and_then(|base| base.checked_add(next))
+            .expect("entity slots exhausted");
+        Entity {
+            world: self.id,
+            slot,
+            generation: 0,
+        }
+    }
+    /// Materialize reserved slots, unplaced, before any other allocation.
+    /// `reserve_entity` already bounded every reserved slot index.
+    fn flush_reserved(&mut self) {
+        let reserved = std::mem::take(self.reserved.get_mut()) as usize;
+        self.locations.extend((0..reserved).map(|_| Slot {
+            generation: 0,
+            location: None,
+            next: None,
+        }));
+    }
     fn reserve_slots(&mut self, additional: usize) {
         let fresh = additional.saturating_sub(self.free_count);
         assert!(
@@ -533,10 +560,21 @@ impl<S: Storage> World<S> {
     /// Spawn directly into the bundle's archetype; no declaration needed.
     pub fn spawn_bundle<B: Bundle<S>>(&mut self, bundle: B) -> Entity {
         Self::check_bundle::<B>();
+        self.flush_reserved();
         let table = self.destination::<B>(0, true);
         let tick = self.change_tick();
         self.reserve_slots(1);
         self.spawn_at(table, bundle, tick)
+    }
+    /// Place a bundle at an entity reserved by `Commands`.
+    pub(crate) fn spawn_reserved<B: Bundle<S>>(&mut self, entity: Entity, bundle: B) {
+        Self::check_bundle::<B>();
+        self.flush_reserved();
+        let slot = &self.locations[entity.slot as usize];
+        debug_assert!(entity.world == self.id && slot.generation == 0 && slot.location.is_none());
+        let table = self.destination::<B>(0, true);
+        let tick = self.change_tick();
+        self.place(entity, table, bundle, tick);
     }
     /// One destination, reservation, and timestamp per batch. A panicking iterator
     /// leaves its completed prefix live; unknown-length iterators grow amortized.
@@ -545,6 +583,7 @@ impl<S: Storage> World<S> {
         I::Item: Bundle<S>,
     {
         Self::check_bundle::<I::Item>();
+        self.flush_reserved();
         let mut bundles = bundles.into_iter();
         let Some(first) = bundles.next() else {
             return Vec::new();
@@ -565,8 +604,12 @@ impl<S: Storage> World<S> {
         if self.free.is_none() && self.locations.len() == self.locations.capacity() {
             self.reserve_slots(1);
         }
-        self.reserve_rows(table, 1, true);
         let entity = self.allocate();
+        self.place(entity, table, bundle, tick);
+        entity
+    }
+    fn place<B: Bundle<S>>(&mut self, entity: Entity, table: usize, bundle: B, tick: u64) {
+        self.reserve_rows(table, 1, true);
         let dense = self.archetypes[table].dense;
         let row = self.tables[table].entities.len();
         if S::HAS_SPARSE {
@@ -582,9 +625,9 @@ impl<S: Storage> World<S> {
         }
         self.locations[entity.slot as usize].location = Some(Location { table, row });
         self.refresh_len(table);
-        entity
     }
     pub fn spawn(&mut self) -> Entity {
+        self.flush_reserved();
         self.reserve_slots(1);
         self.reserve_rows(0, 1, true);
         let entity = self.allocate();

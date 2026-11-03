@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 
 use crate::access::{Access, Filtered, QueryAccess, ValidAccess};
 use crate::change::ChangeWindow;
+use crate::command::{CommandQueue, Commands};
 use crate::filter::{FilterFor, QueryFilter};
 use crate::query::{FetchQuery, QueryData, QueryState};
 use crate::{Query, Single, Storage, World};
@@ -23,6 +24,7 @@ mod sealed {
     impl<T> Sealed for super::Local<'_, T> {}
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Query<'_, D, F> {}
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Single<'_, D, F> {}
+    impl<S: super::Storage> Sealed for super::Commands<'_, S> {}
 }
 
 /// What a parameter accesses and yields, independent of any world type.
@@ -46,6 +48,9 @@ pub unsafe trait Param<S>: ParamShape {
         local: &'a mut Self::State,
         window: ChangeWindow,
     ) -> Option<Self::Item<'a>>;
+    /// Apply deferred work recorded in this parameter's state, after the
+    /// system ran, with exclusive world access.
+    fn apply(_state: &mut Self::State, _world: &mut S) {}
 }
 impl<T: Default + 'static> ParamShape for Local<'_, T> {
     type Access = ();
@@ -96,5 +101,28 @@ where
         window: ChangeWindow,
     ) -> Option<Self::Item<'a>> {
         unsafe { Query::<D, F>::from_cached(world, state, window) }.single()
+    }
+}
+impl<S: Storage> ParamShape for Commands<'_, S> {
+    type Access = ();
+    type State = CommandQueue<S>;
+    type Item<'a> = Commands<'a, S>;
+}
+// SAFETY: Commands only reserves entities atomically during the run; every
+// structural change waits for `apply`, which has exclusive world access.
+unsafe impl<S: Storage> Param<World<S>> for Commands<'_, S> {
+    const VALID: bool = true;
+    unsafe fn fetch<'a>(
+        world: *mut World<S>,
+        queue: &'a mut CommandQueue<S>,
+        _: ChangeWindow,
+    ) -> Option<Commands<'a, S>> {
+        Some(Commands {
+            queue,
+            world: unsafe { &*world },
+        })
+    }
+    fn apply(queue: &mut CommandQueue<S>, world: &mut World<S>) {
+        queue.apply(world);
     }
 }

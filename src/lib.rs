@@ -4,6 +4,7 @@
 mod access;
 mod change;
 mod column;
+mod command;
 mod dispatch;
 mod executor;
 mod filter;
@@ -16,6 +17,7 @@ mod storage;
 mod vocab;
 
 pub use change::{Mut, MutSlice};
+pub use command::Commands;
 pub use dispatch::{
     App, AppBuilder, Callback, Cons, Dispatch, Handle, Install, MaybeHandle, Nil, On, Run,
     Scheduled, system,
@@ -32,7 +34,7 @@ pub use query::{ContiguousError, Query, QueryChunks, Single};
 
 pub mod prelude {
     pub use crate::{
-        Added, App, Changed, Components, ContiguousError, Entity, ExecutionMode, Has,
+        Added, App, Changed, Commands, Components, ContiguousError, Entity, ExecutionMode, Has,
         IntoSystemConfigs, Local, Mut, MutSlice, Or, Query, Single, Sparse, Storage, With, Without,
         WorkerPool, World, exclusive, node, ready, system,
     };

@@ -55,25 +55,19 @@ pub trait System<S>: Shape {
     /// VALID must hold; world must be live and its declared access must not
     /// conflict with any other active borrow. State and captures are exclusive.
     unsafe fn run_unchecked(&mut self, world: *mut S, clock: &mut u64) -> Option<Self::Output>;
+    /// Apply deferred work (commands) recorded by the last runs, in system order.
+    #[doc(hidden)]
+    fn apply_deferred(&mut self, _world: &mut S) {}
 
+    /// Run once against an exclusive world, then apply its commands.
     #[inline]
     fn run(&mut self, world: &mut S) -> Option<Self::Output>
     where
         S: SystemWorld,
     {
-        const {
-            assert!(
-                Self::VALID,
-                "invalid system: missing/ambiguous storage or conflicting access"
-            );
-        }
-        // SAFETY: compile-time validation plus exclusive ownership of the world.
-        unsafe {
-            let mut clock = S::clock(world);
-            let output = Entry::entry(self, world, &mut clock);
-            S::set_clock(world, clock);
-            output
-        }
+        let output = run_now(self, world);
+        self.apply_deferred(world);
+        output
     }
     /// Run every nested group directly on this thread.
     #[inline]
@@ -82,6 +76,26 @@ pub trait System<S>: Shape {
         S: SystemWorld,
     {
         executor::serially(|| self.run(world))
+    }
+}
+/// Run without applying deferred work; dispatch applies it when a frame ends.
+#[inline]
+pub(crate) fn run_now<S: SystemWorld, T: System<S>>(
+    system: &mut T,
+    world: &mut S,
+) -> Option<T::Output> {
+    const {
+        assert!(
+            T::VALID,
+            "invalid system: missing/ambiguous storage or conflicting access"
+        );
+    }
+    // SAFETY: compile-time validation plus exclusive ownership of the world.
+    unsafe {
+        let mut clock = S::clock(world);
+        let output = Entry::entry(system, world, &mut clock);
+        S::set_clock(world, clock);
+        output
     }
 }
 #[inline(always)]
@@ -182,6 +196,9 @@ macro_rules! function {
                 *clock = window.now;
                 Some(result)
             }
+            fn apply_deferred(&mut self, _world: &mut S) {
+                $($p::apply(&mut self.local.$i, _world);)*
+            }
         }
     };
 }
@@ -256,6 +273,10 @@ impl<S, A: System<S, Output = ()>, B: System<S, Output = ()>> System<S> for Sequ
         let left = unsafe { self.0.run_unchecked(world, clock) };
         let right = unsafe { self.1.run_unchecked(world, clock) };
         left.or(right)
+    }
+    fn apply_deferred(&mut self, world: &mut S) {
+        self.0.apply_deferred(world);
+        self.1.apply_deferred(world);
     }
 }
 
@@ -339,6 +360,10 @@ where
         let right = unsafe { self.1.run_unchecked(world, clock) };
         left.or(right)
     }
+    fn apply_deferred(&mut self, world: &mut S) {
+        self.0.apply_deferred(world);
+        self.1.apply_deferred(world);
+    }
 }
 
 impl<P: Shape<Output = ()>, C: Shape<Output = bool>> Shape for Conditional<P, C> {
@@ -380,6 +405,10 @@ impl<S, P: System<S, Output = ()>, C: System<S, Output = bool>> System<S> for Co
         } else {
             None
         }
+    }
+    fn apply_deferred(&mut self, world: &mut S) {
+        self.1.apply_deferred(world);
+        self.0.apply_deferred(world);
     }
 }
 

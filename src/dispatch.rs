@@ -4,7 +4,7 @@ use crate::change::SystemWorld;
 use crate::executor::{self, Context, Continue, Done, Fields, First, Flow, Inner, Project, Root};
 use crate::executor::{Second, Tail, Within, serially};
 use crate::lookup::ComponentLookup;
-use crate::plan::{ExecutionMode, Shape};
+use crate::plan::{ExecutionMode, Shape, run_now};
 use crate::vocab::{Declaration, Insert, Uses};
 use crate::{Components, IntoSystems, Storage, System, World};
 
@@ -27,6 +27,9 @@ pub trait Handle<E, S> {
     #[doc(hidden)]
     const VALID: bool = true;
     fn handle(&mut self, event: &E, state: &mut S);
+    /// Apply commands recorded by `handle`/`enter`, after the frame.
+    #[doc(hidden)]
+    fn apply_deferred(&mut self, _state: &mut S) {}
     /// Handle within a frame invocation, then continue with K. The handler has
     /// exclusive world access, so the world clock follows this path meanwhile.
     /// # Safety
@@ -98,7 +101,10 @@ impl<E, S: SystemWorld, P: System<S, Output = ()>> Handle<E, S> for Run<P> {
     const VALID: bool = P::VALID;
     #[inline]
     fn handle(&mut self, _: &E, state: &mut S) {
-        let _ = self.0.run(state);
+        let _ = run_now(&mut self.0, state);
+    }
+    fn apply_deferred(&mut self, state: &mut S) {
+        self.0.apply_deferred(state);
     }
     #[inline(always)]
     unsafe fn enter<R: Send, Path: Project<R, Target = Self>, K: Continue<S, R>>(
@@ -121,6 +127,8 @@ pub trait MaybeHandle<E: 'static, S> {
     #[doc(hidden)]
     const WEIGHT: usize;
     fn maybe_handle(&mut self, event: &E, state: &mut S);
+    #[doc(hidden)]
+    fn maybe_apply(&mut self, state: &mut S);
     /// # Safety
     /// As `Handle::enter`.
     #[doc(hidden)]
@@ -138,6 +146,8 @@ impl<E: 'static, S, H> MaybeHandle<E, S> for H {
     default const WEIGHT: usize = 0;
     #[inline]
     default fn maybe_handle(&mut self, _: &E, _: &mut S) {}
+    #[inline]
+    default fn maybe_apply(&mut self, _: &mut S) {}
     #[inline(always)]
     default unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
@@ -156,6 +166,10 @@ impl<E: 'static, S, H: Handle<E, S>> MaybeHandle<E, S> for On<E, H> {
     #[inline]
     fn maybe_handle(&mut self, event: &E, state: &mut S) {
         self.handler.handle(event, state);
+    }
+    #[inline]
+    fn maybe_apply(&mut self, state: &mut S) {
+        self.handler.apply_deferred(state);
     }
     #[inline(always)]
     unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
@@ -177,6 +191,9 @@ pub trait Dispatch<E: 'static, S> {
     #[doc(hidden)]
     const WEIGHT: usize = 0;
     fn dispatch(&mut self, event: &E, state: &mut S);
+    /// Apply the matching handlers' commands, in registration order.
+    #[doc(hidden)]
+    fn apply(&mut self, state: &mut S);
     /// # Safety
     /// As `Handle::enter`.
     #[doc(hidden)]
@@ -191,6 +208,8 @@ pub trait Dispatch<E: 'static, S> {
 impl<E: 'static, S> Dispatch<E, S> for Nil {
     #[inline]
     fn dispatch(&mut self, _: &E, _: &mut S) {}
+    #[inline]
+    fn apply(&mut self, _: &mut S) {}
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
         context: &Context<'_, S, R>,
@@ -225,6 +244,11 @@ impl<E: 'static, S, H: MaybeHandle<E, S>, T: Dispatch<E, S>> Dispatch<E, S> for 
     fn dispatch(&mut self, event: &E, state: &mut S) {
         self.1.dispatch(event, state);
         self.0.maybe_handle(event, state);
+    }
+    #[inline]
+    fn apply(&mut self, state: &mut S) {
+        self.1.apply(state);
+        self.0.maybe_apply(state);
     }
     #[inline(always)]
     unsafe fn enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
@@ -467,7 +491,8 @@ impl<S: Storage, L> App<S, L> {
     pub fn set_execution_mode(&mut self, mode: ExecutionMode) {
         self.execution_mode = mode;
     }
-    /// Runs every handler registered for E, in registration order.
+    /// Runs every handler registered for E, in registration order, then
+    /// applies their commands in the same order.
     #[inline]
     pub fn emit<E: 'static>(&mut self, event: &E)
     where
@@ -477,5 +502,6 @@ impl<S: Storage, L> App<S, L> {
             ExecutionMode::Parallel => self.listeners.emit(event, &mut self.world),
             ExecutionMode::Serial => serially(|| self.listeners.dispatch(event, &mut self.world)),
         }
+        self.listeners.apply(&mut self.world);
     }
 }

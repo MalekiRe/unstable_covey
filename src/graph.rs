@@ -530,6 +530,8 @@ pub trait Nodes<S>: NodeList {
         world: *mut S,
         clock: &mut u64,
     ) -> bool;
+    /// Apply every node's deferred work, in declaration order.
+    fn apply(&mut self, world: &mut S);
 }
 impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     const VALID: bool = F::VALID;
@@ -628,6 +630,9 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     ) -> bool {
         unsafe { G::Nodes::serial::<G, Zero, Stage>(nodes, world, clock) }
     }
+    fn apply(&mut self, world: &mut S) {
+        self.system.apply_deferred(world);
+    }
 }
 impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
     const VALID: bool = A::VALID && B::VALID;
@@ -709,6 +714,10 @@ impl<S, A: Nodes<S>, B: Nodes<S>> Nodes<S> for Pair<A, B> {
                 | B::ordered::<G, Offset<Stage, A>>(nodes, world, clock)
         }
     }
+    fn apply(&mut self, world: &mut S) {
+        self.0.apply(world);
+        self.1.apply(world);
+    }
 }
 
 /// Concrete systems and cross-worker join storage. No runtime topology or order.
@@ -788,5 +797,8 @@ impl<S: Send + Sync, N: Nodes<S> + BuildRows<N> + Send> System<S> for ReadyGraph
             return ran.then_some(());
         }
         unsafe { plan::invocation(self, world, clock) }
+    }
+    fn apply_deferred(&mut self, world: &mut S) {
+        self.nodes.apply(world);
     }
 }
