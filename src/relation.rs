@@ -7,6 +7,7 @@
 use std::marker::PhantomData;
 
 use crate::command::CommandQueue;
+use crate::filter::QueryFilter;
 use crate::hook::{Hook, OnReplace, on_replace};
 use crate::lookup::ComponentLookup;
 use crate::plan::FunctionSystem;
@@ -20,6 +21,33 @@ pub trait Relation: Send + Sync + 'static {
     /// Despawn every source with its target (e.g. a scene hierarchy).
     /// Otherwise a despawned target is just unlinked from its sources.
     const LINKED: bool = false;
+    /// Give each target's sources their own tables: "every source of X" is a
+    /// table-level query (`Query::iter_related`), at the cost of a table move
+    /// per relate/unrelate and a table per distinct target set. One-to-one
+    /// relations cannot fragment:
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct Spouse;
+    /// impl Relation for Spouse {
+    ///     type Kind = OneToOne;
+    ///     const FRAGMENTING: bool = true;
+    /// }
+    /// App::new().relation::<Spouse, _>().build();
+    /// ```
+    const FRAGMENTING: bool = false;
+}
+/// Matches sources of relation `R`. With a fragmenting relation,
+/// `Query::iter_related(target)` visits only that target's tables.
+pub type Related<R> = crate::With<Relates<R>>;
+/// Compile-time checks and the relation's component index in world `S`.
+fn relation_index<R: Relation, S: ComponentLookup<Relates<R>>>() -> usize {
+    const {
+        assert!(
+            !(R::FRAGMENTING && SourceSide::<R>::ONE && TargetSide::<R>::ONE),
+            "a one-to-one relation cannot fragment: every table would hold one entity (did you mean OneToMany?)"
+        );
+    }
+    <S as ComponentLookup<Relates<R>>>::INDEX
 }
 /// How many targets a source has, and sources a target has.
 pub trait Cardinality: 'static {
@@ -213,6 +241,9 @@ impl<S: Storage> World<S> {
             }
             if SourceSide::<R>::ONE && !current.is_empty() {
                 let previous = unlink::<R>(self, source, 0);
+                if R::FRAGMENTING {
+                    self.move_pair(source, relation_index::<R, S>(), previous, false);
+                }
                 self.drop_if_empty_target::<R>(previous);
             }
         }
@@ -231,6 +262,9 @@ impl<S: Storage> World<S> {
             self.insert(source, Relates::<R>::new());
         }
         link::<R>(self, source, target);
+        if R::FRAGMENTING {
+            self.move_pair(source, relation_index::<R, S>(), target, true);
+        }
     }
     /// Remove the `source` → `target` link; false if it did not exist.
     pub fn unrelate<R: Relation>(&mut self, source: Entity, target: Entity) -> bool
@@ -244,6 +278,9 @@ impl<S: Storage> World<S> {
             return false;
         };
         unlink::<R>(self, source, index as u32);
+        if R::FRAGMENTING {
+            self.move_pair(source, relation_index::<R, S>(), target, false);
+        }
         self.drop_if_empty_source::<R>(source);
         self.drop_if_empty_target::<R>(target);
         true
@@ -317,6 +354,11 @@ fn source_gone<
                 commands.remove::<(Sources<R>,)>(target);
             }
         }
+        if R::FRAGMENTING {
+            // Removed (not despawned) sources leave their pairs' tables.
+            let relation = relation_index::<R, S>();
+            commands.queue(move |world| world.clear_pairs(source, relation));
+        }
     }
 }
 /// A target is losing `Sources<R>`: despawn its sources if linked, otherwise
@@ -339,7 +381,13 @@ fn target_gone<
             unlink::<R>(&mut lists, source, index);
             if R::LINKED {
                 commands.despawn(source);
-            } else if lists.source(source).entries().is_empty() {
+                continue;
+            }
+            if R::FRAGMENTING {
+                let relation = relation_index::<R, S>();
+                commands.queue(move |world| world.move_pair(source, relation, target, false));
+            }
+            if lists.source(source).entries().is_empty() {
                 commands.remove::<(Relates<R>,)>(source);
             }
         }
@@ -377,8 +425,47 @@ where
     R: Relation,
     S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
 {
+    relation_index::<R, S>();
     (
         on_replace::<Relates<R>, _, _>(source_gone::<R, S> as Cleanup<R, S>),
         on_replace::<Sources<R>, _, _>(target_gone::<R, S> as Cleanup<R, S>),
     )
+}
+
+/// Breadth first from `root` (excluded): every parent before its children.
+/// `sources` appends an entity's sources to the order.
+fn breadth_first(root: Entity, mut sources: impl FnMut(Entity, &mut Vec<Entity>)) -> Vec<Entity> {
+    let mut order = Vec::new();
+    sources(root, &mut order);
+    let mut next = 0;
+    while let Some(&parent) = order.get(next) {
+        sources(parent, &mut order);
+        next += 1;
+    }
+    order
+}
+impl<S: Storage> World<S> {
+    /// Every entity below `root` along `R`, parents before children (breadth
+    /// first), for either storage. With `R` as a hierarchy, propagate
+    /// transforms in this order.
+    pub fn descendants<R: Relation>(&self, root: Entity) -> Vec<Entity>
+    where
+        S: ComponentLookup<Sources<R>>,
+    {
+        breadth_first(root, |e, order| {
+            if let Some(s) = self.get::<Sources<R>>(e) {
+                order.extend(s.sources());
+            }
+        })
+    }
+}
+impl<R: Relation, F: QueryFilter> Query<'_, &Sources<R>, F> {
+    /// `World::descendants` from inside a system.
+    pub fn descendants(&mut self, root: Entity) -> Vec<Entity> {
+        breadth_first(root, |e, order| {
+            if let Some(s) = self.get_mut(e) {
+                order.extend(s.sources());
+            }
+        })
+    }
 }

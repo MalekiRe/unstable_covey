@@ -6,6 +6,7 @@ use crate::{
     lookup::ComponentLookup,
 };
 use std::{
+    collections::HashMap,
     marker::PhantomData,
     num::NonZeroUsize,
     ops::{Deref, Index},
@@ -14,7 +15,7 @@ use std::{
 };
 
 /// World-specific generational handle. Exhausted generations retire their slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Entity {
     world: u64,
     slot: u32,
@@ -278,9 +279,15 @@ unsafe impl Sync for Entities {}
 #[doc(hidden)]
 pub struct Table {
     pub(crate) present: Vec<bool>,
+    /// Fragmenting relation pairs `(index of Relates<R>, target)`, sorted.
+    pub(crate) targets: Pairs,
     pub(crate) entities: Entities,
     pub(crate) columns: Columns,
 }
+/// A table's fragmenting relation pairs, sorted.
+pub(crate) type Pairs = Box<[(usize, Entity)]>;
+/// Every table holding a pair.
+pub(crate) type PairIndex = HashMap<(usize, Entity), Vec<usize>>;
 #[derive(Clone, Copy)]
 struct Location {
     table: usize,
@@ -328,8 +335,13 @@ pub struct World<S: Storage> {
     pub(crate) component_tables: Vec<Vec<usize>>,
     info: Vec<Info>,
     dense: Vec<Store>,
+    /// Each dense store's pairs: entities with different targets never share rows.
+    dense_targets: Vec<Pairs>,
     archetypes: Vec<Archetype>,
     bundles: Transitions,
+    pub(crate) pairs: PairIndex,
+    /// Cached pair moves: (source table, relation, target, adding) -> table.
+    pair_moves: HashMap<(usize, usize, Entity, bool), usize>,
     /// The latest issued change tick; systems carry their own copy during a frame.
     clock: u64,
     /// Fresh slots handed out by `Commands` during a frame, beyond `locations`.
@@ -372,8 +384,11 @@ impl<S: Storage> World<S> {
             component_tables: (0..S::LEN).map(|_| Vec::new()).collect(),
             info,
             dense: Vec::new(),
+            dense_targets: Vec::new(),
             archetypes: Vec::new(),
             bundles: Transitions::default(),
+            pairs: HashMap::new(),
+            pair_moves: HashMap::new(),
             clock: 0,
             reserved: AtomicU32::new(0),
             queue: CommandQueue::default(),
@@ -382,8 +397,12 @@ impl<S: Storage> World<S> {
             hooks: None,
             schema: PhantomData,
         };
-        world.add_table(vec![false; S::LEN]);
+        world.add_table(vec![false; S::LEN], Box::new([]));
         world
+    }
+    /// Tables (archetypes) created so far, including empty ones.
+    pub fn archetype_count(&self) -> usize {
+        self.tables.len()
     }
     /// Install an app's hooks; a world with hooks owns and runs them.
     pub(crate) fn set_hooks<H: HookList<S> + Send + Sync + 'static>(&mut self, hooks: H) {
@@ -494,7 +513,7 @@ impl<S: Storage> World<S> {
             self.flush();
         }
     }
-    fn add_table(&mut self, present: Vec<bool>) -> usize {
+    fn add_table(&mut self, present: Vec<bool>, targets: Pairs) -> usize {
         let components: Vec<_> = present
             .iter()
             .enumerate()
@@ -510,12 +529,11 @@ impl<S: Storage> World<S> {
             .copied()
             .filter(|&i| self.info[i].sparse)
             .collect();
-        let dense = self
-            .dense
-            .iter()
-            .position(|s| s.indices == dense_indices)
+        let dense = (0..self.dense.len())
+            .find(|&d| self.dense[d].indices == dense_indices && self.dense_targets[d] == targets)
             .unwrap_or_else(|| {
                 self.dense.push(Store::new(dense_indices, &self.info));
+                self.dense_targets.push(targets.clone());
                 self.dense.len() - 1
             });
         let mut map = vec![usize::MAX; S::LEN];
@@ -538,8 +556,12 @@ impl<S: Storage> World<S> {
             components,
             transitions: vec![[None; 2]; S::LEN],
         };
+        for &pair in &targets {
+            self.pairs.entry(pair).or_default().push(id);
+        }
         self.tables.push(Table {
             present,
+            targets,
             entities: Entities {
                 pointer: std::ptr::NonNull::dangling().as_ptr(),
                 len: 0,
@@ -718,11 +740,7 @@ impl<S: Storage> World<S> {
         for &i in B::INDICES {
             signature[i] = adding;
         }
-        let destination = self
-            .tables
-            .iter()
-            .position(|t| t.present == signature)
-            .unwrap_or_else(|| self.add_table(signature));
+        let destination = self.table_for(signature, self.tables[source].targets.clone());
         if B::INDICES.len() == 1 {
             self.archetypes[source].transitions[B::INDICES[0]][adding as usize] =
                 NonZeroUsize::new(destination + 1);
@@ -736,6 +754,109 @@ impl<S: Storage> World<S> {
             self.bundles.insert(B::KEY, entry);
         }
         destination
+    }
+    /// The table with exactly these components and pairs, reusing an empty
+    /// table whose targets died before creating one.
+    #[cold]
+    fn table_for(&mut self, present: Vec<bool>, targets: Pairs) -> usize {
+        let find = |tables: &[Table]| {
+            tables
+                .iter()
+                .position(|t| t.present == present && t.targets == targets)
+        };
+        if let Some(table) = find(&self.tables) {
+            return table;
+        }
+        if !targets.is_empty()
+            && self.reuse(&present, &targets)
+            && let Some(table) = find(&self.tables)
+        {
+            return table;
+        }
+        self.add_table(present, targets)
+    }
+    /// Retarget an empty dense store whose pairs name a dead entity, so
+    /// churning parents do not accumulate tables. Query caches stay valid:
+    /// they match on components, which do not change.
+    fn reuse(&mut self, present: &[bool], targets: &Pairs) -> bool {
+        let dense_indices: Vec<_> = (0..S::LEN)
+            .filter(|&i| present[i] && !self.info[i].sparse)
+            .collect();
+        let Some(dense) = (0..self.dense.len()).find(|&d| {
+            self.dense[d].indices == dense_indices
+                && self.dense[d].entities.is_empty()
+                && self.dense_targets[d]
+                    .iter()
+                    .any(|&(_, e)| !self.contains(e))
+        }) else {
+            return false;
+        };
+        for i in 0..self.dense[dense].archetypes.len() {
+            let table = self.dense[dense].archetypes[i];
+            for pair in &self.tables[table].targets {
+                if let Some(tables) = self.pairs.get_mut(pair) {
+                    tables.retain(|&t| t != table);
+                    if tables.is_empty() {
+                        self.pairs.remove(pair);
+                    }
+                }
+            }
+            for &pair in targets {
+                self.pairs.entry(pair).or_default().push(table);
+            }
+            self.tables[table].targets = targets.clone();
+        }
+        self.dense_targets[dense] = targets.clone();
+        // Cached transitions may point into the retargeted tables.
+        for archetype in &mut self.archetypes {
+            archetype.transitions.fill([None; 2]);
+        }
+        self.bundles = Transitions::default();
+        self.pair_moves.clear();
+        true
+    }
+    /// Add or remove one fragmenting pair: a table move, no component change.
+    pub(crate) fn move_pair(
+        &mut self,
+        entity: Entity,
+        relation: usize,
+        target: Entity,
+        adding: bool,
+    ) {
+        let Some(location) = self.location(entity) else {
+            return;
+        };
+        let key = (location.table, relation, target, adding);
+        let destination = match self.pair_moves.get(&key) {
+            Some(&destination) => destination,
+            None => {
+                let mut targets = self.tables[location.table].targets.to_vec();
+                match (targets.binary_search(&(relation, target)), adding) {
+                    (Err(i), true) => targets.insert(i, (relation, target)),
+                    (Ok(i), false) => {
+                        targets.remove(i);
+                    }
+                    _ => return,
+                }
+                let present = self.tables[location.table].present.clone();
+                let destination = self.table_for(present, targets.into());
+                self.pair_moves.insert(key, destination);
+                destination
+            }
+        };
+        self.prepare_move(location, destination);
+        self.transfer(location, destination);
+    }
+    /// Remove every pair of `relation` from `entity`.
+    pub(crate) fn clear_pairs(&mut self, entity: Entity, relation: usize) {
+        while let Some((table, _)) = self.locator().find(entity)
+            && let Some(&(_, target)) = self.tables[table]
+                .targets
+                .iter()
+                .find(|&&(r, _)| r == relation)
+        {
+            self.move_pair(entity, relation, target, false);
+        }
     }
     /// Spawn directly into the bundle's archetype; no declaration needed.
     pub fn spawn_bundle<B: Bundle<S>>(&mut self, bundle: B) -> Entity {

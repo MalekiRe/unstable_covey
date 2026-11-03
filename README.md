@@ -269,8 +269,16 @@ assert!(!world.contains(child));
   `Option`, never a `Vec`.
 - `.relation::<R, _>()` installs two hooks that unlink (or, if `LINKED`,
   despawn) when either side is removed or despawned. Relating without them
-  panics. Relations do not fragment archetypes: entities with different targets
-  share tables.
+  panics.
+- By default relations do not fragment: entities with different targets share
+  tables. `const FRAGMENTING: bool = true` (one-to-many or many-to-many) keys
+  each table by its set of `(relation, target)` pairs, so one target's sources
+  are contiguous and `query.iter_related(target)` on a `Query<D, Related<R>>`
+  visits only their tables. The cost is a table move per relate/unrelate and a
+  table per distinct target set; empty tables whose target died are reused.
+  One-to-one fragmenting fails to compile.
+- `world.descendants::<R>(root)` (or `descendants` on a `Query<&Sources<R>>`)
+  lists everything below `root`, parents before children, for either storage.
 
 ## Execution model
 

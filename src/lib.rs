@@ -38,15 +38,15 @@ pub use plan::{
 };
 pub use query::{ContiguousError, Query, QueryChunks, Single};
 pub use relation::{
-    ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources, relation,
+    ManyToMany, OneToMany, OneToOne, Related, Relates, Relation, RelationHooks, Sources, relation,
 };
 
 pub mod prelude {
     pub use crate::{
         Added, App, Changed, Commands, Components, ContiguousError, Entity, ExecutionMode, Has,
         IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, OneToMany, OneToOne, Or, Query,
-        Relates, Relation, Single, Sources, Sparse, Storage, Trigger, With, Without, WorkerPool,
-        World, exclusive, node, ready, system,
+        Related, Relates, Relation, Single, Sources, Sparse, Storage, Trigger, With, Without,
+        WorkerPool, World, exclusive, node, ready, system,
     };
 }
 pub use storage::{Bundle, Components, Entity, Sparse, Storage, World};

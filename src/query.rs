@@ -4,7 +4,8 @@ use crate::{
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
     filter::{FilterFor, QueryFilter, TableMatch},
     lookup::ComponentLookup,
-    storage::{ColumnPtr, Locator, Table},
+    relation::{Relates, Relation},
+    storage::{ColumnPtr, Locator, PairIndex, Table},
 };
 use std::{
     marker::PhantomData,
@@ -104,6 +105,7 @@ impl<'a> Tables<'a> {
 pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     tables: &'w [Table],
     locator: Locator<'w>,
+    pairs: &'w PairIndex,
     matching: Option<&'w [usize]>,
     cached: bool,
     indices: D::Indices,
@@ -126,6 +128,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         Self {
             tables: unsafe { &(*world).tables },
             locator: unsafe { World::locate(world) },
+            pairs: unsafe { &(*world).pairs },
             matching: None,
             cached: false,
             indices: D::INDICES,
@@ -294,6 +297,27 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             },
             filter: PhantomData,
         })
+    }
+}
+impl<'w, D: QueryData, R: Relation> Query<'w, D, crate::With<Relates<R>>> {
+    /// Sources of `target`, visiting only tables holding that pair: a table
+    /// lookup instead of a scan. Requires a fragmenting relation.
+    pub fn iter_related(&mut self, target: Entity) -> QueryIter<'_, D, crate::With<Relates<R>>> {
+        const {
+            assert!(
+                R::FRAGMENTING,
+                "iter_related needs a fragmenting relation; read Sources<R> otherwise"
+            );
+        }
+        // The filter's state is the index of `Relates<R>`: the pair's relation.
+        let tables = self
+            .pairs
+            .get(&(self.filter, target))
+            .map_or(&[][..], Vec::as_slice);
+        let all = self.tables;
+        let mut iter = self.iter_mut();
+        iter.tables = Tables::Indexed(all, tables.iter(), false);
+        iter
     }
 }
 pub struct QueryIter<'a, D: QueryData, F: QueryFilter = ()> {

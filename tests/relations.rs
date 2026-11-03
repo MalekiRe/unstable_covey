@@ -166,3 +166,146 @@ fn relating_without_installed_hooks_panics() {
     let (a, b) = (app.world.spawn(), app.world.spawn());
     app.world.relate::<Likes>(a, b);
 }
+
+struct InSquad;
+impl Relation for InSquad {
+    type Kind = OneToMany;
+    const FRAGMENTING: bool = true;
+}
+struct Tagged;
+impl Relation for Tagged {
+    type Kind = ManyToMany;
+    const FRAGMENTING: bool = true;
+}
+
+/// Sources of `target` through the table-level path, by name.
+fn related<R: Relation>(
+    world: &mut World<impl Storage + Has<Name> + Has<Relates<R>>>,
+    target: Entity,
+) -> Vec<u32> {
+    let mut query = world.query_filtered::<&Name, Related<R>>();
+    let mut names: Vec<_> = query.iter_related(target).map(|n| n.0).collect();
+    names.sort_unstable();
+    names
+}
+
+#[test]
+fn fragmenting_one_to_many_groups_each_targets_sources_into_tables() {
+    let mut app = App::new()
+        .relation::<InSquad, _>()
+        .register::<Name>()
+        .register::<Elite>()
+        .build();
+    let world = &mut app.world;
+    let [alpha, beta] = [100, 200].map(|i| world.spawn_bundle((Name(i),)));
+    let members: Vec<_> = (0..6).map(|i| world.spawn_bundle((Name(i),))).collect();
+    for (i, &member) in members.iter().enumerate() {
+        world.relate::<InSquad>(member, if i % 2 == 0 { alpha } else { beta });
+    }
+    assert_eq!(related::<InSquad>(world, alpha), [0, 2, 4]);
+    assert_eq!(related::<InSquad>(world, beta), [1, 3, 5]);
+    // Moving a member between squads moves it between tables.
+    world.relate::<InSquad>(members[0], beta);
+    assert_eq!(related::<InSquad>(world, alpha), [2, 4]);
+    assert_eq!(related::<InSquad>(world, beta), [0, 1, 3, 5]);
+    world.unrelate::<InSquad>(members[1], beta);
+    assert_eq!(related::<InSquad>(world, beta), [0, 3, 5]);
+    // Plain iteration still sees every source, whatever its table.
+    assert_eq!(
+        world
+            .query_filtered::<&Name, Related<InSquad>>()
+            .iter_mut()
+            .count(),
+        5
+    );
+    // Components added later keep the entity in its target's table.
+    world.insert(members[3], Elite);
+    assert_eq!(related::<InSquad>(world, beta), [0, 3, 5]);
+}
+struct Elite;
+
+#[test]
+fn fragmenting_many_to_many_keys_tables_by_target_sets() {
+    let mut app = App::new()
+        .relation::<Tagged, _>()
+        .register::<Name>()
+        .build();
+    let world = &mut app.world;
+    let [red, blue] = [100, 200].map(|i| world.spawn_bundle((Name(i),)));
+    let things: Vec<_> = (0..4).map(|i| world.spawn_bundle((Name(i),))).collect();
+    world.relate::<Tagged>(things[0], red);
+    world.relate::<Tagged>(things[1], red);
+    world.relate::<Tagged>(things[1], blue);
+    world.relate::<Tagged>(things[2], blue);
+    assert_eq!(related::<Tagged>(world, red), [0, 1]);
+    assert_eq!(related::<Tagged>(world, blue), [1, 2]);
+    world.unrelate::<Tagged>(things[1], red);
+    assert_eq!(related::<Tagged>(world, red), [0]);
+    assert_eq!(related::<Tagged>(world, blue), [1, 2]);
+    // A despawned target leaves its sources in tables without its pair.
+    world.despawn(blue);
+    assert!(world.get::<Relates<Tagged>>(things[2]).is_none());
+    assert_eq!(related::<Tagged>(world, red), [0]);
+    assert_eq!(
+        world
+            .query_filtered::<&Name, Related<Tagged>>()
+            .iter_mut()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn churning_fragmenting_targets_reuses_dead_tables() {
+    let mut app = App::new()
+        .relation::<InSquad, _>()
+        .register::<Name>()
+        .build();
+    let world = &mut app.world;
+    let mut tables_after_first = None;
+    for round in 0..50 {
+        let squad = world.spawn_bundle((Name(1000),));
+        let members: Vec<_> = (0..3).map(|i| world.spawn_bundle((Name(i),))).collect();
+        for &member in &members {
+            world.relate::<InSquad>(member, squad);
+        }
+        assert_eq!(related::<InSquad>(world, squad), [0, 1, 2], "round {round}");
+        for member in members {
+            world.despawn(member);
+        }
+        world.despawn(squad);
+        let tables = world.archetype_count();
+        tables_after_first.get_or_insert(tables);
+        assert_eq!(
+            Some(tables),
+            tables_after_first,
+            "round {round}: tables grew"
+        );
+    }
+}
+
+#[test]
+fn descendants_come_parents_first_for_both_storages() {
+    let mut app = App::new()
+        .relation::<ChildOf, _>()
+        .relation::<InSquad, _>()
+        .register::<Name>()
+        .build();
+    let world = &mut app.world;
+    let names: Vec<_> = (0..7).map(|i| world.spawn_bundle((Name(i),))).collect();
+    // 0 -> {1, 2}; 1 -> {3, 4}; 2 -> {5}; 5 -> {6}
+    for (child, parent) in [(1, 0), (2, 0), (3, 1), (4, 1), (5, 2), (6, 5)] {
+        world.relate::<ChildOf>(names[child], names[parent]);
+        world.relate::<InSquad>(names[child], names[parent]);
+    }
+    for order in [
+        world.descendants::<ChildOf>(names[0]),
+        world.descendants::<InSquad>(names[0]),
+    ] {
+        let position = |i: usize| order.iter().position(|&e| e == names[i]).unwrap();
+        assert_eq!(order.len(), 6);
+        for (child, parent) in [(3, 1), (4, 1), (5, 2), (6, 5)] {
+            assert!(position(parent) < position(child));
+        }
+    }
+}
