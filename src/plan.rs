@@ -246,6 +246,7 @@ macro_rules! accesses {
     () => { () };
     ($p:ident $(, $rest:ident)*) => { ($p::Access, accesses!($($rest),*)) };
 }
+pub(crate) use accesses;
 /// Fetch every parameter, then call; shared by both function forms.
 macro_rules! invoke {
     ($this:ident, $world:ident, $clock:ident, |$args:ident| $call:expr; $($p:ident $i:tt),*) => {{

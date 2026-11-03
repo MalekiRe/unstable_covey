@@ -7,6 +7,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod access;
+mod bridge;
 mod change;
 mod column;
 mod command;
@@ -21,8 +22,10 @@ mod plan;
 mod query;
 mod relation;
 mod storage;
+mod task;
 mod vocab;
 
+pub use bridge::{AsyncWorld, Bridge, BridgeError, BridgeFn, BridgeState};
 pub use change::{Mut, MutSlice};
 pub use command::Commands;
 pub use dispatch::{
@@ -43,14 +46,15 @@ pub use query::{ContiguousError, Query, QueryChunks, Single};
 pub use relation::{
     ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources, relation,
 };
+pub use task::{Task, TaskFn, task};
 
 pub mod prelude {
     pub use crate::{
-        Added, App, Changed, Commands, Components, ContiguousError, Entity, ExecutionMode, Has,
-        IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, NoInput, OnAdd, OnInsert, OnRemove,
-        OnReplace, OneToMany, OneToOne, Or, Query, Ref, Related, Relates, Relation, Schedule,
-        Single, Sources, Sparse, Storage, Trigger, With, Without, WorkerPool, World, exclusive,
-        node, ready, schedule,
+        Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
+        Entity, ExecutionMode, Has, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, NoInput,
+        OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Query, Ref, Related,
+        Relates, Relation, Schedule, Single, Sources, Sparse, Storage, Trigger, With, Without,
+        WorkerPool, World, exclusive, node, ready, schedule, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Sparse, Storage, World};

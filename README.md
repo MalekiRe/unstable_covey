@@ -3,8 +3,8 @@
 A small ECS whose schedules are Rust types. Plugins, systems, and event routing
 compose into one concrete application type; `emit` runs a frame as statically
 dispatched, inlinable code. The world's component set is inferred from the
-systems you add, at compile time. No schema, `TypeId`, runtime registries, boxed
-systems, or external dependencies.
+systems you add, at compile time. No schema, runtime registries, boxed systems,
+or external dependencies; `TypeId` appears only in async tasks' bookkeeping.
 
 It relies on **nightly full specialization** and the minimal generic-const-argument
 features (`nightly-2026-10-25`). These are incomplete features with known
@@ -313,6 +313,70 @@ assert!(!world.contains(child));
 - `world.descendants::<R>(root)` lists everything below `root`, parents before
   children, for either storage (in systems: `descendants` on a
   `Query<&Sources<R>>`, or `related_descendants` for fragmenting relations).
+
+### Tasks and bridges
+
+`task(body)` is a plugin: an async body the app owns and polls during `emit`.
+It sits in registration order like a system, under every label at once. A
+bridge, `world.bridge(Label, |params...| ...)`, runs a closure with system
+parameters (`Query`, `Single`, `Commands`, `Local`, or `&mut World<_>` alone)
+when the task's position is reached while that label is emitted: after the
+systems registered before it, before those after. Its commands apply before
+it returns, so the next bridge sees them.
+
+```rust
+use static_ecs::prelude::*;
+struct Update;
+impl Schedule for Update {}
+struct Health(u32);
+
+let mut log = Vec::new();
+{
+    let log = &mut log;
+    let mut app = App::new()
+        .register::<Health>()
+        .add_plugins(task(|world: AsyncWorld<_>| async move {
+            let entity = world
+                .bridge(Update, |mut commands: Commands<_>| commands.spawn((Health(3),)))
+                .await
+                .unwrap();
+            loop {
+                // Closures borrow the task's locals, `&mut` included: no `Send`.
+                world
+                    .bridge(Update, |mut q: Query<&mut Health>| {
+                        let mut health = q.get_mut(entity).unwrap();
+                        health.0 -= 1;
+                        log.push(health.0);
+                    })
+                    .await
+                    .unwrap();
+            }
+        }))
+        .build();
+    app.emit(&Update);
+    app.emit(&Update);
+}
+assert_eq!(log, [2, 1]);
+```
+
+- A task starts at the first `emit`. Afterwards it is polled when an emit
+  reaches it on a label it waits on, or after a waker (e.g. a channel or I/O
+  future) wakes it; otherwise a visit is a few loads. A bridge site runs once
+  per visit: the loop above runs once per `emit`, while a chain of different
+  bridges completes in one.
+- `bridge` fails with `BridgeError::Invalid` if a parameter cannot be fetched
+  (a `Single` without exactly one match); `until` waits for the label's next
+  emit instead, e.g. until another plugin has spawned what this one needs.
+- `world.state()` keeps parameter state across bridges: `Local`s persist,
+  `Changed` sees changes since its previous bridge, and query caches stay warm,
+  so bridging through it allocates nothing (one-shot bridges build fresh state).
+- Bridges run with exclusive world access and cannot nest. Components they use
+  are checked against the world at `build` but are not inferred from them
+  (the async body is opaque): `.register::<T>()` them, as the example does, or
+  use them in a system.
+- Nothing requires `Send`. A task that is `Send` runs wherever the frame's
+  invocation reaches it, possibly a worker; with a non-`Send` task the app
+  runs each registration as its own invocation on the calling thread.
 
 ## Execution model
 

@@ -108,7 +108,7 @@ where
 
 #[derive(Default)]
 pub struct Nil;
-pub struct Cons<H, T>(H, T);
+pub struct Cons<H, T>(pub(crate) H, pub(crate) T);
 
 /// Keep E visible across crate boundaries; only hide the systems.
 pub struct On<E: 'static, H> {
