@@ -6,7 +6,7 @@ use crate::executor::{Second, Tail, Within, serially};
 use crate::hook::{self, Event, Hook, HookList, OnAdd, OnInsert, OnRemove, OnReplace};
 use crate::lookup::ComponentLookup;
 use crate::plan::{ExecutionMode, Shape, run_now};
-use crate::relation::{self, Relates, Relation, RelationHooks, Sources};
+use crate::relation::{self, Fragment, PairOf, Relates, Relation, RelationHooks, Sources};
 use crate::vocab::{Declaration, Insert, Uses};
 use crate::{Components, IntoSystems, Storage, System, World};
 
@@ -373,6 +373,14 @@ where
         (listeners, Cons(self, hooks))
     }
 }
+impl<R: Relation, C: Insert<Components<PairOf<R>>>, L, K> Install<C, L, K> for Fragment<R> {
+    type Components = <C as Insert<Components<PairOf<R>>>>::Out;
+    type Listeners = L;
+    type Hooks = Cons<Self, K>;
+    fn install(self, listeners: L, hooks: K) -> (L, Self::Hooks) {
+        (listeners, Cons(self, hooks))
+    }
+}
 impl<C, L, K, A, B> Install<C, L, K> for (A, B)
 where
     A: Install<C, L, K>,
@@ -523,7 +531,10 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
     >
     where
         RelationHooks<R, S>: Install<C, L, K, Listeners = L>,
-        S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+        S: Storage
+            + ComponentLookup<Relates<R>>
+            + ComponentLookup<Sources<R>>
+            + ComponentLookup<PairOf<R>>,
     {
         self.install(relation::relation::<R, S>())
     }

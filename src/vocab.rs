@@ -68,6 +68,11 @@ macro_rules! nothing {
     )*};
 }
 nothing!((), Exclusive);
+// Relation components come from `.relation::<R, _>()`; filtering alone does
+// not create storage.
+impl<C: Storage, R> Uses<C> for crate::filter::Related<R> {
+    type Out = C;
+}
 macro_rules! component {
     ($($name:ident),*) => {$(
         impl<C: Insert<Components<T>>, T: 'static> Uses<C> for $name<T> {

@@ -157,8 +157,8 @@ fn commands_relate_freshly_spawned_entities() {
 }
 
 #[test]
-#[should_panic(expected = "install the relation's hooks")]
-fn relating_without_installed_hooks_panics() {
+#[should_panic(expected = "install the relation")]
+fn relating_without_installing_the_relation_panics() {
     let mut app = App::new()
         .register::<Relates<Likes>>()
         .register::<Sources<Likes>>()
@@ -204,12 +204,19 @@ fn fragmenting_one_to_many_groups_each_targets_sources_into_tables() {
     }
     assert_eq!(related::<InSquad>(world, alpha), [0, 2, 4]);
     assert_eq!(related::<InSquad>(world, beta), [1, 3, 5]);
-    // Moving a member between squads moves it between tables.
+    // Nothing besides the source's table key stores the relation.
+    assert!(world.get::<Relates<InSquad>>(members[0]).is_none());
+    assert!(world.get::<Sources<InSquad>>(alpha).is_none());
+    assert_eq!(world.targets::<InSquad>(members[0]), [alpha]);
+    // Reparenting is one move between the squads' tables.
     world.relate::<InSquad>(members[0], beta);
     assert_eq!(related::<InSquad>(world, alpha), [2, 4]);
     assert_eq!(related::<InSquad>(world, beta), [0, 1, 3, 5]);
-    world.unrelate::<InSquad>(members[1], beta);
+    assert_eq!(world.targets::<InSquad>(members[0]), [beta]);
+    assert!(world.unrelate::<InSquad>(members[1], beta));
+    assert!(!world.unrelate::<InSquad>(members[1], beta));
     assert_eq!(related::<InSquad>(world, beta), [0, 3, 5]);
+    assert_eq!(world.sources::<InSquad>(beta).len(), 3);
     // Plain iteration still sees every source, whatever its table.
     assert_eq!(
         world
@@ -244,7 +251,8 @@ fn fragmenting_many_to_many_keys_tables_by_target_sets() {
     assert_eq!(related::<Tagged>(world, blue), [1, 2]);
     // A despawned target leaves its sources in tables without its pair.
     world.despawn(blue);
-    assert!(world.get::<Relates<Tagged>>(things[2]).is_none());
+    assert!(world.targets::<Tagged>(things[2]).is_empty());
+    assert_eq!(world.targets::<Tagged>(things[1]), Vec::<Entity>::new());
     assert_eq!(related::<Tagged>(world, red), [0]);
     assert_eq!(
         world
@@ -308,4 +316,71 @@ fn descendants_come_parents_first_for_both_storages() {
             assert!(position(parent) < position(child));
         }
     }
+}
+
+struct Mount;
+impl Relation for Mount {
+    type Kind = OneToMany;
+    const FRAGMENTING: bool = true;
+    const LINKED: bool = true;
+}
+
+#[test]
+fn linked_fragmenting_relations_despawn_subtrees_and_terminate_on_cycles() {
+    let mut app = App::new().relation::<Mount, _>().register::<Name>().build();
+    let world = &mut app.world;
+    let names: Vec<_> = (0..6).map(|i| world.spawn_bundle((Name(i),))).collect();
+    // 0 -> {1, 2}; 1 -> {3}; 3 -> {4}; 5 stays separate.
+    for (child, parent) in [(1, 0), (2, 0), (3, 1), (4, 3)] {
+        world.relate::<Mount>(names[child], names[parent]);
+    }
+    assert!(world.despawn(names[0]));
+    for gone in &names[..5] {
+        assert!(!world.contains(*gone));
+    }
+    assert!(world.contains(names[5]));
+    // A cycle: each despawn reaches the other, and both go exactly once.
+    let [a, b] = [7, 8].map(|i| world.spawn_bundle((Name(i),)));
+    world.relate::<Mount>(a, b);
+    world.relate::<Mount>(b, a);
+    assert!(world.despawn(a));
+    assert!(!world.contains(a) && !world.contains(b));
+    assert_eq!(world.query::<&Name>().iter_mut().count(), 1);
+}
+
+#[test]
+fn fragmenting_queries_read_targets_and_subtrees_inside_systems() {
+    struct Update;
+    struct Log(Vec<(u32, Option<u32>)>, usize);
+    let mut app = App::new()
+        .relation::<InSquad, _>()
+        .add_systems(
+            Update,
+            |members: Query<(Entity, &Name), Related<InSquad>>,
+             names: Query<&Name>,
+             mut log: Single<&mut Log>| {
+                let mut members = members;
+                let mut names = names;
+                let pairs: Vec<_> = members.iter_mut().map(|(e, n)| (e, n.0)).collect();
+                for (entity, name) in pairs {
+                    let target = members.target(entity);
+                    let target = target.and_then(|t| names.get_mut(t)).map(|n| n.0);
+                    log.0.push((name, target));
+                }
+                let root = members.iter_mut().find(|(_, n)| n.0 == 1).map(|(e, _)| e);
+                let parent = root.and_then(|r| members.target(r)).unwrap();
+                log.1 = members.related_descendants(parent).len();
+            },
+        )
+        .build();
+    let world = &mut app.world;
+    let [top, mid, leaf] = [0, 1, 2].map(|i| world.spawn_bundle((Name(i),)));
+    world.relate::<InSquad>(mid, top);
+    world.relate::<InSquad>(leaf, mid);
+    let log = world.spawn_bundle((Log(Vec::new(), 0),));
+    app.emit(&Update);
+    let mut seen = app.world.get::<Log>(log).unwrap().0.clone();
+    seen.sort_unstable();
+    assert_eq!(seen, [(1, Some(0)), (2, Some(1))]);
+    assert_eq!(app.world.get::<Log>(log).unwrap().1, 2);
 }

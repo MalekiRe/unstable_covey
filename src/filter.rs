@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 
 use crate::access::{Access, Read};
 use crate::change::ChangeWindow;
+use crate::relation::{PairOf, Relates, Relation};
 use crate::storage::Table;
 use crate::{Storage, access::Same, lookup::ComponentLookup};
 
@@ -128,6 +129,52 @@ impl<T: 'static, S: Storage + ComponentLookup<T>> FilterFor<S> for Without<T> {
     const STATE: usize = <S as ComponentLookup<T>>::INDEX;
 }
 
+/// Matches sources of relation `R`, through `Relates<R>` or, for fragmenting
+/// relations, the table's pairs. Its queries add `iter_related`/`target`.
+pub struct Related<R>(PhantomData<fn() -> R>);
+impl<R: Relation> Related<R> {
+    /// The component whose presence marks a source table.
+    const fn index<S: ComponentLookup<PairOf<R>> + ComponentLookup<Relates<R>>>() -> usize {
+        if R::FRAGMENTING {
+            <S as ComponentLookup<PairOf<R>>>::INDEX
+        } else {
+            <S as ComponentLookup<Relates<R>>>::INDEX
+        }
+    }
+}
+impl<R: Relation> sealed::Sealed for Related<R> {}
+impl<R: Relation> QueryFilter for Related<R> {
+    type State = usize;
+    type Access = ();
+    fn requires(state: &usize, index: usize) -> bool {
+        *state == index
+    }
+    unsafe fn row(state: &usize, table: &Table, _: usize, _: ChangeWindow) -> bool {
+        Self::matches(state, &table.present)
+    }
+    fn matches(state: &usize, present: &[bool]) -> bool {
+        present[*state]
+    }
+}
+impl<R: Relation, S: Storage + ComponentLookup<PairOf<R>> + ComponentLookup<Relates<R>>>
+    FilterFor<S> for Related<R>
+{
+    const VALID: bool = if R::FRAGMENTING {
+        <S as ComponentLookup<PairOf<R>>>::COUNT == 1
+    } else {
+        <S as ComponentLookup<Relates<R>>>::COUNT == 1
+    };
+    const STATE: usize = Self::index::<S>();
+}
+/// The component a `Related<R>` table is guaranteed to contain.
+const fn marks<T: 'static, R: Relation>() -> bool {
+    if R::FRAGMENTING {
+        <T as Same<PairOf<R>>>::VALUE
+    } else {
+        <T as Same<Relates<R>>>::VALUE
+    }
+}
+
 /// Whether a matching archetype is guaranteed to contain `T`.
 #[doc(hidden)]
 pub trait Required<T: 'static> {
@@ -174,6 +221,19 @@ impl<T: 'static, F: Excluded<T>> Disjoint<F> for With<T> {
 }
 impl<T: 'static, F: Required<T>> Disjoint<F> for Without<T> {
     const VALUE: bool = F::VALUE;
+}
+impl<T: 'static, R: Relation> Required<T> for Related<R> {
+    const VALUE: bool = marks::<T, R>();
+}
+impl<T: 'static, R: Relation> Excluded<T> for Related<R> {
+    const VALUE: bool = false;
+}
+impl<R: Relation, F: Excluded<PairOf<R>> + Excluded<Relates<R>>> Disjoint<F> for Related<R> {
+    const VALUE: bool = if R::FRAGMENTING {
+        <F as Excluded<PairOf<R>>>::VALUE
+    } else {
+        <F as Excluded<Relates<R>>>::VALUE
+    };
 }
 
 macro_rules! filter_access {

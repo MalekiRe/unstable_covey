@@ -64,7 +64,7 @@ macro_rules! events {
     )*};
 }
 events!(OnAdd Add 0, OnInsert Insert 1, OnReplace Replace 2, OnRemove Remove 3);
-const KINDS: usize = 4;
+pub(crate) const KINDS: usize = 4;
 
 /// The entities a hook fired for: one per structural call, all of a batch.
 pub struct Trigger<'a>(pub(crate) &'a [Entity]);
@@ -106,7 +106,7 @@ macro_rules! constructors {
 constructors!(on_add OnAdd, on_insert OnInsert, on_replace OnReplace, on_remove OnRemove);
 
 /// Runs every hook of one event in an erased hook list.
-type Entry<S> = unsafe fn(*mut u8, *mut World<S>);
+pub(crate) type Entry<S> = unsafe fn(*mut u8, *mut World<S>);
 
 /// Every registered hook, statically dispatched by event type.
 pub trait HookList<S: Storage> {
@@ -119,6 +119,8 @@ pub trait HookList<S: Storage> {
     unsafe fn fire<E: Event>(this: *mut Self, world: *mut World<S>);
     /// Point the table entry of every registered event at `Root`'s runner.
     fn register<Root: HookList<S>>(table: &mut [[Option<Entry<S>>; KINDS]]);
+    /// Fragmenting relations as (pair id, linked).
+    fn relations(_: &mut Vec<(usize, bool)>) {}
 }
 impl<S: Storage> HookList<S> for Nil {
     const VALID: bool = true;
@@ -140,6 +142,10 @@ impl<S: Storage, A: HookList<S>, B: HookList<S>> HookList<S> for Cons<A, B> {
     fn register<Root: HookList<S>>(table: &mut [[Option<Entry<S>>; KINDS]]) {
         B::register::<Root>(table);
         A::register::<Root>(table);
+    }
+    fn relations(relations: &mut Vec<(usize, bool)>) {
+        B::relations(relations);
+        A::relations(relations);
     }
 }
 impl<S, E, P> HookList<S> for Hook<E, P>
@@ -189,6 +195,8 @@ pub(crate) struct HookTable<S: Storage> {
     entries: Box<[[Option<Entry<S>>; KINDS]]>,
     /// Components with any hook, for despawns.
     hooked: Box<[usize]>,
+    /// Fragmenting relations as (pair id, linked), for despawn cascades.
+    relations: Box<[(usize, bool)]>,
 }
 // The hook list is Send + Sync (checked where it is installed).
 unsafe impl<S: Storage> Send for HookTable<S> {}
@@ -203,11 +211,14 @@ impl<S: Storage> HookTable<S> {
         let hooked = (0..S::LEN)
             .filter(|&i| entries[i].iter().any(Option::is_some))
             .collect();
+        let mut relations = Vec::new();
+        H::relations(&mut relations);
         Self {
             hooks: Box::into_non_null(Box::new(hooks)).cast(),
             drop: drop_hooks::<H>,
             entries,
             hooked,
+            relations: relations.into(),
         }
     }
     /// The runner for kind `K` of component `index`, if any hook listens.
@@ -217,6 +228,9 @@ impl<S: Storage> HookTable<S> {
     }
     pub(crate) fn hooked(&self) -> &[usize] {
         &self.hooked
+    }
+    pub(crate) fn relations(&self) -> &[(usize, bool)] {
+        &self.relations
     }
 }
 impl<S: Storage> Drop for HookTable<S> {

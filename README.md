@@ -258,27 +258,32 @@ world.despawn(parent);
 assert!(!world.contains(child));
 ```
 
-- Sources hold `Relates<R>` (`targets()`, or `target()` for one target), targets
-  hold `Sources<R>` (`sources()`/`source()`). Both are ordinary components:
-  query them, filter with `With<Sources<R>>`, or read them in hooks.
 - `world.relate`/`unrelate` and `commands.relate`/`unrelate` are the only
   writers. A one-target source moves to its new target; a one-source target
-  drops its previous source.
-- Each entry stores its index in the other side's list, so unlinking is O(1)
-  (swap-remove both sides, fix one back-index). One-sided ends store an
-  `Option`, never a `Vec`.
-- `.relation::<R, _>()` installs two hooks that unlink (or, if `LINKED`,
-  despawn) when either side is removed or despawned. Relating without them
-  panics.
-- By default relations do not fragment: entities with different targets share
-  tables. `const FRAGMENTING: bool = true` (one-to-many or many-to-many) keys
-  each table by its set of `(relation, target)` pairs, so one target's sources
-  are contiguous and `query.iter_related(target)` on a `Query<D, Related<R>>`
-  visits only their tables. The cost is a table move per relate/unrelate and a
-  table per distinct target set; empty tables whose target died are reused.
-  One-to-one fragmenting fails to compile.
-- `world.descendants::<R>(root)` (or `descendants` on a `Query<&Sources<R>>`)
-  lists everything below `root`, parents before children, for either storage.
+  drops its previous source. `world.targets`/`sources` read either storage.
+- **Non-fragmenting** (default): entities with different targets share tables.
+  Sources hold `Relates<R>` (`targets()`, or `target()` for one target),
+  targets hold `Sources<R>` (`sources()`/`source()`); both are ordinary
+  components. Each entry stores its index in the other side's list, so
+  unlinking is O(1); one-sided ends store an `Option`, never a `Vec`. Two
+  hooks unlink (or, if `LINKED`, despawn) when either side goes.
+- **Fragmenting** (`const FRAGMENTING: bool = true`, one-to-many or
+  many-to-many): the `(relation, target)` pair is part of the source's table
+  key and stored nowhere else. One target's sources are contiguous; relating
+  or reparenting is one table move and leaves the target untouched. A
+  `Query<D, Related<R>>` adds `iter_related(target)` (only that pair's
+  tables, via a pair index), `target(source)`, and `related_descendants`.
+  Despawning a target despawns (`LINKED`) or detaches its sources through the
+  pair index, terminating on cycles. Costs: a table per distinct target set
+  (empty tables whose target died are reused) and a pair-index lookup per
+  fragmenting relation on each despawn. One-to-one fragmenting fails to
+  compile.
+- `Related<R>` matches sources of either storage. `.relation::<R, _>()`
+  installs a relation; relating an uninstalled one panics (non-fragmenting) or
+  fails to compile (fragmenting).
+- `world.descendants::<R>(root)` lists everything below `root`, parents before
+  children, for either storage (in systems: `descendants` on a
+  `Query<&Sources<R>>`, or `related_descendants` for fragmenting relations).
 
 ## Execution model
 

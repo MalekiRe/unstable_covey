@@ -25,7 +25,7 @@ pub use dispatch::{
     Scheduled, system,
 };
 pub use executor::WorkerPool;
-pub use filter::{Added, Changed, Or, With, Without};
+pub use filter::{Added, Changed, Or, Related, With, Without};
 pub use graph::{GraphConfig, MAX_NODES, Node, ReadyGraph, node, ready};
 pub use hook::{
     Event, Hook, OnAdd, OnInsert, OnRemove, OnReplace, Trigger, on_add, on_insert, on_remove,
@@ -38,7 +38,7 @@ pub use plan::{
 };
 pub use query::{ContiguousError, Query, QueryChunks, Single};
 pub use relation::{
-    ManyToMany, OneToMany, OneToOne, Related, Relates, Relation, RelationHooks, Sources, relation,
+    ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources, relation,
 };
 
 pub mod prelude {

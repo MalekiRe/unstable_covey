@@ -1,14 +1,15 @@
-//! Non-fragmenting relations. A source's `Relates<R>` lists its targets, a
+//! Relations. Non-fragmenting: a source's `Relates<R>` lists its targets, a
 //! target's `Sources<R>` lists its sources, and every entry records its index
-//! in the other side's list: unlinking swap-removes both entries and fixes the
-//! one back-index each move disturbs, in O(1). `.relation::<R>()` registers
-//! both components and the hooks that unlink, or despawn, when either side is
-//! removed or despawned.
+//! in the other side's list, so unlinking is O(1); hooks unlink, or despawn,
+//! when either side goes. Fragmenting: the `(relation, target)` pair is part of
+//! the source's table key and nothing else stores it; relating is one table
+//! move, sources come from the world's pair index, and despawning a target
+//! cascades through that index.
 use std::marker::PhantomData;
 
 use crate::command::CommandQueue;
 use crate::filter::QueryFilter;
-use crate::hook::{Hook, OnReplace, on_replace};
+use crate::hook::{Hook, HookList, OnReplace, on_replace};
 use crate::lookup::ComponentLookup;
 use crate::plan::FunctionSystem;
 use crate::query::QueryState;
@@ -36,18 +37,33 @@ pub trait Relation: Send + Sync + 'static {
     /// ```
     const FRAGMENTING: bool = false;
 }
-/// Matches sources of relation `R`. With a fragmenting relation,
-/// `Query::iter_related(target)` visits only that target's tables.
-pub type Related<R> = crate::With<Relates<R>>;
-/// Compile-time checks and the relation's component index in world `S`.
-fn relation_index<R: Relation, S: ComponentLookup<Relates<R>>>() -> usize {
+/// Present in exactly the tables holding a pair of fragmenting relation `R`;
+/// its component index is the relation's id in pair keys.
+#[doc(hidden)]
+pub struct PairOf<R>(PhantomData<fn() -> R>);
+/// The pair id of fragmenting relation `R` in world `S`, with the
+/// compile-time cardinality check.
+pub(crate) fn pair_index<R: Relation, S: ComponentLookup<PairOf<R>>>() -> usize {
     const {
         assert!(
             !(R::FRAGMENTING && SourceSide::<R>::ONE && TargetSide::<R>::ONE),
             "a one-to-one relation cannot fragment: every table would hold one entity (did you mean OneToMany?)"
         );
     }
-    <S as ComponentLookup<Relates<R>>>::INDEX
+    <S as ComponentLookup<PairOf<R>>>::INDEX
+}
+/// Registers fragmenting relation `R` with the world, for despawn cascades.
+#[doc(hidden)]
+pub struct Fragment<R>(PhantomData<fn() -> R>);
+impl<R: Relation, S: Storage + ComponentLookup<PairOf<R>>> HookList<S> for Fragment<R> {
+    const VALID: bool = <S as ComponentLookup<PairOf<R>>>::COUNT == 1;
+    unsafe fn fire<E: crate::Event>(_: *mut Self, _: *mut World<S>) {}
+    fn register<Root: HookList<S>>(_: &mut [[Option<crate::hook::Entry<S>>; crate::hook::KINDS]]) {}
+    fn relations(relations: &mut Vec<(usize, bool)>) {
+        if R::FRAGMENTING {
+            relations.push((pair_index::<R, S>(), R::LINKED));
+        }
+    }
 }
 /// How many targets a source has, and sources a target has.
 pub trait Cardinality: 'static {
@@ -223,17 +239,46 @@ impl<R: Relation> Lists<R> for HookLists<'_, '_, '_, R> {
 impl<S: Storage> World<S> {
     /// Relate `source` to `target`. A one-target source moves to `target`; a
     /// one-source target drops its previous source. Relating twice is a no-op.
+    /// Install the relation first. Relating a fragmenting relation that was
+    /// never installed does not compile; a non-fragmenting one panics.
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct InSquad;
+    /// impl Relation for InSquad {
+    ///     type Kind = OneToMany;
+    ///     const FRAGMENTING: bool = true;
+    /// }
+    /// let mut app = App::new().build();
+    /// let (a, b) = (app.world.spawn(), app.world.spawn());
+    /// app.world.relate::<InSquad>(a, b);
+    /// ```
     pub fn relate<R: Relation>(&mut self, source: Entity, target: Entity)
     where
-        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
     {
         assert!(
             self.contains(source) && self.contains(target),
             "relate: both entities must be alive"
         );
+        if const { R::FRAGMENTING } {
+            let relation = pair_index::<R, S>();
+            assert!(
+                self.fragmenting(relation).is_some(),
+                "relate: install the relation with `.relation::<R, _>()`"
+            );
+            let previous = self.pair_targets(source, relation).next();
+            if previous == Some(target)
+                || !SourceSide::<R>::ONE && self.has_pair(source, relation, target)
+            {
+                return;
+            }
+            let replaced = if SourceSide::<R>::ONE { previous } else { None };
+            self.move_pair(source, relation, replaced, Some(target));
+            return;
+        }
         assert!(
             self.has_hook::<OnReplace<Relates<R>>>() && self.has_hook::<OnReplace<Sources<R>>>(),
-            "relate: install the relation's hooks with `.relation::<R>()`"
+            "relate: install the relation with `.relation::<R, _>()`"
         );
         if let Some(current) = self.get::<Relates<R>>(source) {
             if current.targets().any(|t| t == target) {
@@ -241,9 +286,6 @@ impl<S: Storage> World<S> {
             }
             if SourceSide::<R>::ONE && !current.is_empty() {
                 let previous = unlink::<R>(self, source, 0);
-                if R::FRAGMENTING {
-                    self.move_pair(source, relation_index::<R, S>(), previous, false);
-                }
                 self.drop_if_empty_target::<R>(previous);
             }
         }
@@ -262,15 +304,20 @@ impl<S: Storage> World<S> {
             self.insert(source, Relates::<R>::new());
         }
         link::<R>(self, source, target);
-        if R::FRAGMENTING {
-            self.move_pair(source, relation_index::<R, S>(), target, true);
-        }
     }
     /// Remove the `source` → `target` link; false if it did not exist.
     pub fn unrelate<R: Relation>(&mut self, source: Entity, target: Entity) -> bool
     where
-        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
     {
+        if const { R::FRAGMENTING } {
+            let relation = pair_index::<R, S>();
+            if !self.has_pair(source, relation, target) {
+                return false;
+            }
+            self.move_pair(source, relation, Some(target), None);
+            return true;
+        }
         let Some(index) = self
             .get::<Relates<R>>(source)
             .and_then(|current| current.targets().position(|t| t == target))
@@ -278,12 +325,41 @@ impl<S: Storage> World<S> {
             return false;
         };
         unlink::<R>(self, source, index as u32);
-        if R::FRAGMENTING {
-            self.move_pair(source, relation_index::<R, S>(), target, false);
-        }
         self.drop_if_empty_source::<R>(source);
         self.drop_if_empty_target::<R>(target);
         true
+    }
+    /// `source`'s targets along `R`, for either storage.
+    pub fn targets<R: Relation>(&self, source: Entity) -> Vec<Entity>
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<PairOf<R>>,
+    {
+        if const { R::FRAGMENTING } {
+            return self.pair_targets(source, pair_index::<R, S>()).collect();
+        }
+        self.get::<Relates<R>>(source)
+            .map_or_else(Vec::new, |r| r.targets().collect())
+    }
+    /// `target`'s sources along `R`, for either storage.
+    pub fn sources<R: Relation>(&self, target: Entity) -> Vec<Entity>
+    where
+        S: ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
+    {
+        let mut sources = Vec::new();
+        self.append_sources::<R>(target, &mut sources);
+        sources
+    }
+    fn append_sources<R: Relation>(&self, target: Entity, out: &mut Vec<Entity>)
+    where
+        S: ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
+    {
+        if const { R::FRAGMENTING } {
+            self.pair_sources(pair_index::<R, S>(), target, out);
+            return;
+        }
+        if let Some(sources) = self.get::<Sources<R>>(target) {
+            out.extend(sources.sources());
+        }
     }
     fn drop_if_empty_source<R: Relation>(&mut self, source: Entity)
     where
@@ -354,11 +430,6 @@ fn source_gone<
                 commands.remove::<(Sources<R>,)>(target);
             }
         }
-        if R::FRAGMENTING {
-            // Removed (not despawned) sources leave their pairs' tables.
-            let relation = relation_index::<R, S>();
-            commands.queue(move |world| world.clear_pairs(source, relation));
-        }
     }
 }
 /// A target is losing `Sources<R>`: despawn its sources if linked, otherwise
@@ -382,10 +453,6 @@ fn target_gone<
             if R::LINKED {
                 commands.despawn(source);
                 continue;
-            }
-            if R::FRAGMENTING {
-                let relation = relation_index::<R, S>();
-                commands.queue(move |world| world.move_pair(source, relation, target, false));
             }
             if lists.source(source).entries().is_empty() {
                 commands.remove::<(Relates<R>,)>(source);
@@ -412,23 +479,33 @@ type CleanupSystem<R, S> = FunctionSystem<
     ((), QueryState, QueryState, CommandQueue<S>),
     (),
 >;
-/// The hooks keeping relation `R` consistent in world `S`.
+/// The hooks and registration keeping relation `R` consistent in world `S`.
 pub type RelationHooks<R, S> = (
     Hook<OnReplace<Relates<R>>, CleanupSystem<R, S>>,
-    Hook<OnReplace<Sources<R>>, CleanupSystem<R, S>>,
+    (
+        Hook<OnReplace<Sources<R>>, CleanupSystem<R, S>>,
+        Fragment<R>,
+    ),
 );
 
-/// Install relation `R`: registers `Relates<R>` and `Sources<R>` and the hooks
-/// keeping them consistent. Use `.relation::<R, _>()` or install from a plugin.
+/// Install relation `R`: its components, and either the hooks keeping the
+/// lists consistent or, if fragmenting, its registration for despawn
+/// cascades. Use `.relation::<R, _>()` or install from a plugin.
 pub fn relation<R, S>() -> RelationHooks<R, S>
 where
     R: Relation,
-    S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
+    S: Storage
+        + ComponentLookup<Relates<R>>
+        + ComponentLookup<Sources<R>>
+        + ComponentLookup<PairOf<R>>,
 {
-    relation_index::<R, S>();
+    pair_index::<R, S>();
     (
         on_replace::<Relates<R>, _, _>(source_gone::<R, S> as Cleanup<R, S>),
-        on_replace::<Sources<R>, _, _>(target_gone::<R, S> as Cleanup<R, S>),
+        (
+            on_replace::<Sources<R>, _, _>(target_gone::<R, S> as Cleanup<R, S>),
+            Fragment(PhantomData),
+        ),
     )
 }
 
@@ -450,15 +527,13 @@ impl<S: Storage> World<S> {
     /// transforms in this order.
     pub fn descendants<R: Relation>(&self, root: Entity) -> Vec<Entity>
     where
-        S: ComponentLookup<Sources<R>>,
+        S: ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
     {
-        breadth_first(root, |e, order| {
-            if let Some(s) = self.get::<Sources<R>>(e) {
-                order.extend(s.sources());
-            }
-        })
+        breadth_first(root, |e, order| self.append_sources::<R>(e, order))
     }
 }
+/// Non-fragmenting relations from inside a system; fragmenting ones use
+/// `Query<D, Related<R>>::related_descendants`.
 impl<R: Relation, F: QueryFilter> Query<'_, &Sources<R>, F> {
     /// `World::descendants` from inside a system.
     pub fn descendants(&mut self, root: Entity) -> Vec<Entity> {

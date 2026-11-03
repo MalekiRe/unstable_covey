@@ -340,8 +340,10 @@ pub struct World<S: Storage> {
     archetypes: Vec<Archetype>,
     bundles: Transitions,
     pub(crate) pairs: PairIndex,
-    /// Cached pair moves: (source table, relation, target, adding) -> table.
-    pair_moves: HashMap<(usize, usize, Entity, bool), usize>,
+    /// Cached pair moves: (source table, relation, removed, added) -> table.
+    pair_moves: HashMap<(usize, usize, Option<Entity>, Option<Entity>), usize>,
+    /// Entities whose fragmenting cascade is running, so cycles terminate.
+    dying: Vec<Entity>,
     /// The latest issued change tick; systems carry their own copy during a frame.
     clock: u64,
     /// Fresh slots handed out by `Commands` during a frame, beyond `locations`.
@@ -389,6 +391,7 @@ impl<S: Storage> World<S> {
             bundles: Transitions::default(),
             pairs: HashMap::new(),
             pair_moves: HashMap::new(),
+            dying: Vec::new(),
             clock: 0,
             reserved: AtomicU32::new(0),
             queue: CommandQueue::default(),
@@ -815,48 +818,114 @@ impl<S: Storage> World<S> {
         self.pair_moves.clear();
         true
     }
-    /// Add or remove one fragmenting pair: a table move, no component change.
+    /// Replace pair `(relation, remove)` with `(relation, add)` in one table
+    /// move; either side may be absent. No component changes, no hooks. The
+    /// relation's marker is present exactly while a pair of it remains.
     pub(crate) fn move_pair(
         &mut self,
         entity: Entity,
         relation: usize,
-        target: Entity,
-        adding: bool,
+        remove: Option<Entity>,
+        add: Option<Entity>,
     ) {
         let Some(location) = self.location(entity) else {
             return;
         };
-        let key = (location.table, relation, target, adding);
+        let key = (location.table, relation, remove, add);
         let destination = match self.pair_moves.get(&key) {
             Some(&destination) => destination,
             None => {
                 let mut targets = self.tables[location.table].targets.to_vec();
-                match (targets.binary_search(&(relation, target)), adding) {
-                    (Err(i), true) => targets.insert(i, (relation, target)),
-                    (Ok(i), false) => {
-                        targets.remove(i);
-                    }
-                    _ => return,
+                if let Some(target) = remove
+                    && let Ok(i) = targets.binary_search(&(relation, target))
+                {
+                    targets.remove(i);
                 }
-                let present = self.tables[location.table].present.clone();
+                if let Some(target) = add
+                    && let Err(i) = targets.binary_search(&(relation, target))
+                {
+                    targets.insert(i, (relation, target));
+                }
+                let mut present = self.tables[location.table].present.clone();
+                present[relation] = targets.iter().any(|&(r, _)| r == relation);
                 let destination = self.table_for(present, targets.into());
                 self.pair_moves.insert(key, destination);
                 destination
             }
         };
-        self.prepare_move(location, destination);
+        let row = self.prepare_move(location, destination);
+        let appears = !self.tables[location.table].present[relation]
+            && self.tables[destination].present[relation];
         self.transfer(location, destination);
-    }
-    /// Remove every pair of `relation` from `entity`.
-    pub(crate) fn clear_pairs(&mut self, entity: Entity, relation: usize) {
-        while let Some((table, _)) = self.locator().find(entity)
-            && let Some(&(_, target)) = self.tables[table]
-                .targets
-                .iter()
-                .find(|&&(r, _)| r == relation)
-        {
-            self.move_pair(entity, relation, target, false);
+        if appears {
+            // The zero-sized marker has no value, but its tick slots do.
+            let tick = self.change_tick();
+            unsafe { self.tables[destination].columns[relation].mark(row, tick, true) };
         }
+    }
+    /// Whether `relation` is installed as fragmenting, and if so, linked.
+    pub(crate) fn fragmenting(&self, relation: usize) -> Option<bool> {
+        let hooks = self.hooks.as_ref()?;
+        let &(_, linked) = hooks.relations().iter().find(|&&(r, _)| r == relation)?;
+        Some(linked)
+    }
+    /// `entity`'s targets along fragmenting `relation`, from its table key.
+    pub(crate) fn pair_targets(
+        &self,
+        entity: Entity,
+        relation: usize,
+    ) -> impl Iterator<Item = Entity> + '_ {
+        let pairs = self
+            .location(entity)
+            .map_or(&[][..], |location| &self.tables[location.table].targets);
+        pairs
+            .iter()
+            .filter(move |&&(r, _)| r == relation)
+            .map(|&(_, target)| target)
+    }
+    pub(crate) fn has_pair(&self, entity: Entity, relation: usize, target: Entity) -> bool {
+        self.location(entity).is_some_and(|location| {
+            self.tables[location.table]
+                .targets
+                .binary_search(&(relation, target))
+                .is_ok()
+        })
+    }
+    /// Append the entities of every table holding `(relation, target)`.
+    pub(crate) fn pair_sources(&self, relation: usize, target: Entity, out: &mut Vec<Entity>) {
+        for &table in self.pairs.get(&(relation, target)).into_iter().flatten() {
+            out.extend_from_slice(&self.tables[table].entities);
+        }
+    }
+    /// Before `entity` is despawned: despawn the sources of every linked
+    /// fragmenting relation targeting it, and move the others out of its pair.
+    fn cascade(&mut self, entity: Entity) {
+        let Some(hooks) = &self.hooks else {
+            return;
+        };
+        if hooks.relations().is_empty() {
+            return;
+        }
+        self.dying.push(entity);
+        let mut sources = Vec::new();
+        let mut i = 0;
+        while let Some(&(relation, linked)) = self
+            .hooks
+            .as_ref()
+            .and_then(|hooks| hooks.relations().get(i))
+        {
+            i += 1;
+            sources.clear();
+            self.pair_sources(relation, entity, &mut sources);
+            for &source in &sources {
+                if !linked {
+                    self.move_pair(source, relation, Some(entity), None);
+                } else if !self.dying.contains(&source) {
+                    self.despawn(source);
+                }
+            }
+        }
+        self.dying.pop();
     }
     /// Spawn directly into the bundle's archetype; no declaration needed.
     pub fn spawn_bundle<B: Bundle<S>>(&mut self, bundle: B) -> Entity {
@@ -1139,9 +1208,12 @@ impl<S: Storage> World<S> {
         })
     }
     pub fn despawn(&mut self, entity: Entity) -> bool {
-        let Some(location) = self.location(entity) else {
+        if self.location(entity).is_none() {
             return false;
-        };
+        }
+        self.cascade(entity);
+        // The cascade may have moved rows of this entity's table.
+        let location = self.location(entity).unwrap();
         self.fire_present::<Replace>(entity, location.table);
         self.fire_present::<Remove>(entity, location.table);
         let dense = self.archetypes[location.table].dense;

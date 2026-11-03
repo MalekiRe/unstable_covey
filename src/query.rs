@@ -2,9 +2,10 @@ use crate::{
     Entity, Storage, World,
     access::{Access, Read, ValidAccess, Write},
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
+    filter::Related,
     filter::{FilterFor, QueryFilter, TableMatch},
     lookup::ComponentLookup,
-    relation::{Relates, Relation},
+    relation::Relation,
     storage::{ColumnPtr, Locator, PairIndex, Table},
 };
 use std::{
@@ -299,17 +300,18 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         })
     }
 }
-impl<'w, D: QueryData, R: Relation> Query<'w, D, crate::With<Relates<R>>> {
+/// Fragmenting relations: a source's targets live in its table key, and a
+/// target's sources are the tables the pair index lists for it.
+impl<'w, D: QueryData, R: Relation> Query<'w, D, Related<R>> {
+    const FRAGMENTING: () = assert!(
+        R::FRAGMENTING,
+        "needs a fragmenting relation; read Relates<R>/Sources<R> otherwise"
+    );
     /// Sources of `target`, visiting only tables holding that pair: a table
-    /// lookup instead of a scan. Requires a fragmenting relation.
-    pub fn iter_related(&mut self, target: Entity) -> QueryIter<'_, D, crate::With<Relates<R>>> {
-        const {
-            assert!(
-                R::FRAGMENTING,
-                "iter_related needs a fragmenting relation; read Sources<R> otherwise"
-            );
-        }
-        // The filter's state is the index of `Relates<R>`: the pair's relation.
+    /// lookup instead of a scan.
+    pub fn iter_related(&mut self, target: Entity) -> QueryIter<'_, D, Related<R>> {
+        let () = Self::FRAGMENTING;
+        // The filter's state is the relation's pair id.
         let tables = self
             .pairs
             .get(&(self.filter, target))
@@ -318,6 +320,33 @@ impl<'w, D: QueryData, R: Relation> Query<'w, D, crate::With<Relates<R>>> {
         let mut iter = self.iter_mut();
         iter.tables = Tables::Indexed(all, tables.iter(), false);
         iter
+    }
+    /// `source`'s first target (its only one, for one-to-many).
+    pub fn target(&self, source: Entity) -> Option<Entity> {
+        let () = Self::FRAGMENTING;
+        let (table, _) = self.locator.find(source)?;
+        let pairs = &self.tables[table].targets;
+        pairs
+            .iter()
+            .find(|&&(relation, _)| relation == self.filter)
+            .map(|&(_, target)| target)
+    }
+    /// Everything below `root`, parents before children (breadth first).
+    pub fn related_descendants(&self, root: Entity) -> Vec<Entity> {
+        let () = Self::FRAGMENTING;
+        let mut order = Vec::new();
+        let mut next = 0;
+        let mut parent = root;
+        loop {
+            for &table in self.pairs.get(&(self.filter, parent)).into_iter().flatten() {
+                order.extend_from_slice(&self.tables[table].entities);
+            }
+            let Some(&child) = order.get(next) else {
+                return order;
+            };
+            parent = child;
+            next += 1;
+        }
     }
 }
 pub struct QueryIter<'a, D: QueryData, F: QueryFilter = ()> {
