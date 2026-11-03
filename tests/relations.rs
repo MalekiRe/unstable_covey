@@ -180,7 +180,7 @@ impl Relation for Tagged {
 
 /// Sources of `target` through the table-level path, by name.
 fn related<R: Relation>(
-    world: &mut World<impl Storage + Has<Name> + Has<Relates<R>>>,
+    world: &mut World<impl Has<Name> + Has<Relates<R>>>,
     target: Entity,
 ) -> Vec<u32> {
     let mut query = world.query_filtered::<&Name, Related<R>>();
