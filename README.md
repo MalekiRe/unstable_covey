@@ -14,6 +14,7 @@ sealed traits. This is an experiment.
 
 ```sh
 cargo run --release --example simulation
+cargo run --release --example tokio_web # remote bridges from tokio (network)
 cargo run --release -p dispatch-demo
 cargo test --workspace --release
 cargo clippy --workspace --all-targets -- -D clippy::all
@@ -384,6 +385,8 @@ Futures on other threads or runtimes (tokio, a thread pool) bridge in through
 a sync point. `sync_point()` returns a `SyncPoint`, which is a system, and a
 `Remote` handle; wherever the system runs (`add_systems(Update, point)`, or
 inside a chain or graph), it drives the remote bridges queued so far.
+[`examples/tokio_web.rs`](examples/tokio_web.rs) fetches pages on a tokio
+runtime and inserts the responses as components while frames keep running.
 
 ```rust
 use static_ecs::prelude::*;
