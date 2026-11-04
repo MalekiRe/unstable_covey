@@ -581,7 +581,7 @@ on tokio and inserts the responses while frames keep running.
 - Very long chains may need a higher `#![recursion_limit]`; graph compile time
   grows quadratically with nodes per graph; parallel groups need `Send`
   systems.
-- Not yet: observers, and Bevy's broader engine (rendering, assets, input).
+- Not yet: Bevy's broader engine (rendering, assets, input).
   The [`demo/`](demo) crates show apps built on plugins, including a
   CPU-rendered Wayland client whose first frame is drawn 1.5 ms after launch.
 
