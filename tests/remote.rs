@@ -1,4 +1,3 @@
-use static_ecs::SyncPoint;
 use static_ecs::prelude::*;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,6 +8,18 @@ use std::time::{Duration, Instant};
 
 struct Update;
 impl Schedule for Update {}
+/// An exclusive sync point.
+struct Net;
+impl SyncPoint for Net {}
+/// Envelope sync points.
+struct Writes;
+impl SyncPoint for Writes {
+    type Env = Query<'static, &'static mut A>;
+}
+struct Reads;
+impl SyncPoint for Reads {
+    type Env = Query<'static, &'static A>;
+}
 #[derive(Debug, PartialEq)]
 struct A(u32);
 struct B(u32);
@@ -40,7 +51,9 @@ fn block_on<F: Future>(future: F, queued: Option<&AtomicUsize>) -> F::Output {
 fn wait_until(mut condition: impl FnMut() -> bool) {
     let start = Instant::now();
     while !condition() {
-        assert!(start.elapsed() < Duration::from_secs(10), "timed out");
+        // Miri's virtual clock runs fast relative to its slow execution.
+        let limit = Duration::from_secs(if cfg!(miri) { 600 } else { 10 });
+        assert!(start.elapsed() < limit, "timed out");
         thread::yield_now();
     }
 }
@@ -49,7 +62,6 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
 fn bridges_run_at_the_sync_points_position_and_apply_commands_there() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (before, after) = (log.clone(), log.clone());
-    let (point, remote) = sync_point();
     let mut app = App::new()
         .add_systems(Update, move |mut q: Query<&A>| {
             before
@@ -57,17 +69,18 @@ fn bridges_run_at_the_sync_points_position_and_apply_commands_there() {
                 .unwrap()
                 .push(("before", q.iter_mut().count()))
         })
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .add_systems(Update, move |mut q: Query<&A, With<Player>>| {
             after.lock().unwrap().push(("after", q.iter_mut().count()))
         })
         .build();
+    let remote = app.world.remote();
     let queued = AtomicUsize::new(0);
     thread::scope(|scope| {
         let worker = scope.spawn(|| {
             let mut local = 0;
             let entity = block_on(
-                remote.bridge(|mut commands: Commands<_>| {
+                remote.bridge(Net, |mut commands: Commands<_>| {
                     local += 1; // captures the caller's locals mutably
                     commands.spawn((A(5), Player))
                 }),
@@ -87,12 +100,12 @@ fn bridges_run_at_the_sync_points_position_and_apply_commands_there() {
 
 #[test]
 fn disjoint_bridges_run_in_parallel_in_one_wave() {
-    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
         .register::<B>()
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .build();
+    let remote = app.world.remote();
     app.world.spawn_bundle((A(0), B(0)));
     let barrier = Barrier::new(2);
     let queued = AtomicUsize::new(0);
@@ -100,7 +113,7 @@ fn disjoint_bridges_run_in_parallel_in_one_wave() {
         // Each closure waits for the other: only a shared wave completes.
         scope.spawn(|| {
             block_on(
-                remote.bridge(|mut q: Query<&mut A>| {
+                remote.bridge(Net, |mut q: Query<&mut A>| {
                     barrier.wait();
                     q.iter_mut().for_each(|mut a| a.0 += 1);
                 }),
@@ -110,7 +123,7 @@ fn disjoint_bridges_run_in_parallel_in_one_wave() {
         });
         scope.spawn(|| {
             block_on(
-                remote.bridge(|mut q: Query<&mut B>| {
+                remote.bridge(Net, |mut q: Query<&mut B>| {
                     barrier.wait();
                     q.iter_mut().for_each(|mut b| b.0 += 1);
                 }),
@@ -144,12 +157,12 @@ impl InFlight {
 
 #[test]
 fn conflicting_shared_state_and_exclusive_bridges_never_share_a_wave() {
-    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
         .register::<B>()
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .build();
+    let remote = app.world.remote();
     app.world.spawn_bundle((A(0), B(0)));
     let state = remote.state();
     for case in 0..3 {
@@ -161,22 +174,27 @@ fn conflicting_shared_state_and_exclusive_bridges_never_share_a_wave() {
                 scope.spawn(move || match (case, side) {
                     // Two writers of A.
                     (0, _) => block_on(
-                        remote.bridge(|_: Query<&mut A>| flight.enter()),
+                        remote.bridge(Net, |_: Query<&mut A>| flight.enter()),
                         Some(queued),
                     )
                     .unwrap(),
                     // Two readers sharing one state.
-                    (1, _) => {
-                        block_on(state.bridge(|_: Query<&B>| flight.enter()), Some(queued)).unwrap()
-                    }
-                    // An exclusive bridge and a disjoint reader.
-                    (_, 0) => block_on(
-                        remote.bridge(|_: &mut World<_>| flight.enter()),
+                    (1, _) => block_on(
+                        state.bridge(Net, |_: Query<&B>| flight.enter()),
                         Some(queued),
                     )
                     .unwrap(),
-                    _ => block_on(remote.bridge(|_: Query<&B>| flight.enter()), Some(queued))
-                        .unwrap(),
+                    // An exclusive bridge and a disjoint reader.
+                    (_, 0) => block_on(
+                        remote.bridge(Net, |_: &mut World<_>| flight.enter()),
+                        Some(queued),
+                    )
+                    .unwrap(),
+                    _ => block_on(
+                        remote.bridge(Net, |_: Query<&B>| flight.enter()),
+                        Some(queued),
+                    )
+                    .unwrap(),
                 });
             }
             wait_until(|| queued.load(Ordering::SeqCst) == 2);
@@ -189,23 +207,23 @@ fn conflicting_shared_state_and_exclusive_bridges_never_share_a_wave() {
 
 #[test]
 fn invalid_parameters_fail_and_until_retries_at_later_drives() {
-    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
         .register::<Player>()
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .build();
+    let remote = app.world.remote();
     let queued = AtomicUsize::new(0);
     let done = AtomicBool::new(false);
     thread::scope(|scope| {
         scope.spawn(|| {
             let missing = block_on(
-                remote.bridge(|_: Single<&A, With<Player>>| ()),
+                remote.bridge(Net, |_: Single<&A, With<Player>>| ()),
                 Some(&queued),
             );
             assert_eq!(missing, Err(BridgeError::Invalid));
             let value = block_on(
-                remote.until(|a: Single<&A, With<Player>>| a.0),
+                remote.until(Net, |a: Single<&A, With<Player>>| a.0),
                 Some(&queued),
             );
             assert_eq!(value, Ok(9));
@@ -228,11 +246,11 @@ fn invalid_parameters_fail_and_until_retries_at_later_drives() {
 
 #[test]
 fn a_loop_runs_once_per_drive_while_a_chain_may_finish_in_one() {
-    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .build();
+    let remote = app.world.remote();
     let runs = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let queued = AtomicUsize::new(0);
@@ -241,7 +259,7 @@ fn a_loop_runs_once_per_drive_while_a_chain_may_finish_in_one() {
             let waker = Waker::from(Arc::new(ThreadWaker(thread::current())));
             let mut cx = Context::from_waker(&waker);
             loop {
-                let mut bridge = pin!(remote.bridge(|_: Query<&A>| {
+                let mut bridge = pin!(remote.bridge(Net, |_: Query<&A>| {
                     runs.fetch_add(1, Ordering::SeqCst);
                     stop.load(Ordering::SeqCst)
                 }));
@@ -275,29 +293,29 @@ fn a_loop_runs_once_per_drive_while_a_chain_may_finish_in_one() {
 #[test]
 fn dropping_the_app_or_a_granted_bridge_never_strands_anyone() {
     // A request queued when its app drops fails, as does any later one.
-    let (point, remote) = sync_point();
     let app = App::new()
         .register::<A>()
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .build();
+    let remote = app.world.remote();
     let queued = AtomicUsize::new(0);
     thread::scope(|scope| {
-        let waiter = scope.spawn(|| block_on(remote.bridge(|_: Query<&A>| ()), Some(&queued)));
+        let waiter = scope.spawn(|| block_on(remote.bridge(Net, |_: Query<&A>| ()), Some(&queued)));
         wait_until(|| queued.load(Ordering::SeqCst) == 1);
         drop(app);
         assert_eq!(waiter.join().unwrap(), Err(BridgeError::Closed));
     });
     assert_eq!(
-        block_on(remote.bridge(|_: Query<&A>| ()), None),
+        block_on(remote.bridge(Net, |_: Query<&A>| ()), None),
         Err(BridgeError::Closed)
     );
 
     // A bridge granted, then dropped without running, releases the driver.
-    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .build();
+    let remote = app.world.remote();
     let woken = Arc::new(AtomicBool::new(false));
     struct Flag(Arc<AtomicBool>);
     impl Wake for Flag {
@@ -306,7 +324,7 @@ fn dropping_the_app_or_a_granted_bridge_never_strands_anyone() {
         }
     }
     let waker = Waker::from(Arc::new(Flag(woken.clone())));
-    let mut bridge = Box::pin(remote.bridge(|_: Query<&A>| unreachable!()));
+    let mut bridge = Box::pin(remote.bridge(Net, |_: Query<&A>| unreachable!()));
     assert!(
         bridge
             .as_mut()
@@ -331,12 +349,15 @@ fn dropping_the_app_or_a_granted_bridge_never_strands_anyone() {
 #[test]
 #[should_panic(expected = "inside a task, use `AsyncWorld::bridge`")]
 fn awaiting_a_remote_bridge_inside_a_task_panics_instead_of_deadlocking() {
-    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
-        .add_systems(Update, point)
-        .add_plugins(task(move |_: AsyncWorld<_>| async move {
-            let _ = remote.bridge(|_: Query<&A>| ()).await;
+        .add_systems(Update, sync_point(Net))
+        .add_plugins(task(|world: AsyncWorld<_>| async move {
+            let remote = world
+                .bridge(Update, |world: &mut World<_>| world.remote())
+                .await
+                .unwrap();
+            let _ = remote.bridge(Net, |_: Query<&A>| ()).await;
         }))
         .build();
     app.emit(&Update);
@@ -347,7 +368,7 @@ fn rendezvous(mine: &AtomicBool, theirs: &AtomicBool) -> bool {
     mine.store(true, Ordering::SeqCst);
     let start = Instant::now();
     while !theirs.load(Ordering::SeqCst) {
-        if start.elapsed() > Duration::from_secs(5) {
+        if start.elapsed() > Duration::from_secs(if cfg!(miri) { 600 } else { 5 }) {
             return false;
         }
         thread::yield_now();
@@ -365,11 +386,10 @@ fn an_envelope_point_runs_beside_disjoint_systems_and_infers_its_components() {
     let (mine, theirs, system_met) = (system_side.clone(), bridge_side.clone(), met.clone());
     WorkerPool::new(3).install(|| {
         // `A` is stored only because the envelope mentions it.
-        let (point, remote) = SyncPoint::within::<Query<&mut A>>();
         let mut app = App::new()
             .add_systems(
                 Update,
-                (point, move |mut q: Query<&mut B>| {
+                (sync_point(Writes), move |mut q: Query<&mut B>| {
                     if rendezvous(&mine, &theirs) {
                         system_met.fetch_add(1, Ordering::SeqCst);
                     }
@@ -378,12 +398,13 @@ fn an_envelope_point_runs_beside_disjoint_systems_and_infers_its_components() {
                     .parallel(),
             )
             .build();
+        let remote = app.world.remote();
         let entity = app.world.spawn_bundle((A(1), B(1)));
         let queued = AtomicUsize::new(0);
         thread::scope(|scope| {
             scope.spawn(|| {
                 block_on(
-                    remote.bridge(|mut q: Query<&mut A>| {
+                    remote.bridge(Writes, |mut q: Query<&mut A>| {
                         if rendezvous(&bridge_side, &system_side) {
                             met.fetch_add(1, Ordering::SeqCst);
                         }
@@ -410,21 +431,21 @@ fn an_envelope_point_runs_beside_disjoint_systems_and_infers_its_components() {
 fn envelope_commands_apply_when_the_emit_ends() {
     let seen = Arc::new(AtomicUsize::new(usize::MAX));
     let during = seen.clone();
-    let (point, remote) = SyncPoint::within::<Query<&A>>();
     let mut app = App::new()
         .add_systems(
             Update,
-            (point, move |mut q: Query<&A>| {
+            (sync_point(Reads), move |mut q: Query<&A>| {
                 during.store(q.iter_mut().count(), Ordering::SeqCst)
             })
                 .chain(),
         )
         .build();
+    let remote = app.world.remote();
     let queued = AtomicUsize::new(0);
     thread::scope(|scope| {
         scope.spawn(|| {
             block_on(
-                remote.bridge(|mut commands: Commands<_>| {
+                remote.bridge(Reads, |mut commands: Commands<_>| {
                     commands.spawn((A(3),));
                 }),
                 Some(&queued),
@@ -446,7 +467,6 @@ fn a_waiting_envelope_point_runs_work_published_to_its_worker() {
     let caller = thread::current().id();
     let (gate_started, y_flag, y_where) = (started.clone(), y_ran.clone(), y_thread.clone());
     WorkerPool::new(2).install(|| {
-        let (point, remote) = SyncPoint::within::<Query<&mut A>>();
         // The driver lends its worker before granting, so once the bridge runs,
         // a fork can hand work to the driver.
         let gate = move || wait_until(|| gate_started.load(Ordering::SeqCst));
@@ -460,15 +480,16 @@ fn a_waiting_envelope_point_runs_work_published_to_its_worker() {
         let mut app = App::new()
             .add_systems(
                 Update,
-                (point, (gate, (x, y).parallel()).chain()).parallel(),
+                (sync_point(Writes), (gate, (x, y).parallel()).chain()).parallel(),
             )
             .build();
+        let remote = app.world.remote();
         app.world.spawn_bundle((A(0), B(0)));
         let queued = AtomicUsize::new(0);
         thread::scope(|scope| {
             scope.spawn(|| {
                 block_on(
-                    remote.bridge(|_: Query<&mut A>| {
+                    remote.bridge(Writes, |_: Query<&mut A>| {
                         started.store(true, Ordering::SeqCst);
                         wait_until(|| y_ran.load(Ordering::SeqCst));
                     }),
@@ -483,4 +504,81 @@ fn a_waiting_envelope_point_runs_work_published_to_its_worker() {
     // The other worker was busy in `x`: the waiting driver (the calling
     // thread) ran `y`. A driver that blocked would leave `x` waiting forever.
     assert_eq!(*y_thread.lock().unwrap(), Some(caller));
+}
+
+#[test]
+fn systems_hand_the_remote_to_other_threads() {
+    let done = Arc::new(AtomicBool::new(false));
+    let worker = Arc::new(Mutex::new(None));
+    let (finished, spawned) = (done.clone(), worker.clone());
+    let mut app = App::new()
+        .register::<A>()
+        // Any system can reach every sync point: no handle threading.
+        .add_systems(
+            Update,
+            move |remote: &Remote<_>, mut started: Local<bool>| {
+                if !std::mem::replace(&mut *started, true) {
+                    let (remote, finished) = (remote.clone(), finished.clone());
+                    *spawned.lock().unwrap() = Some(thread::spawn(move || {
+                        block_on(
+                            remote.bridge(Net, |mut commands: Commands<_>| {
+                                commands.spawn((A(7),));
+                            }),
+                            None,
+                        )
+                        .unwrap();
+                        finished.store(true, Ordering::SeqCst);
+                    }));
+                }
+            },
+        )
+        .add_systems(Update, sync_point(Net))
+        .build();
+    wait_until(|| {
+        app.emit(&Update);
+        done.load(Ordering::SeqCst)
+    });
+    worker.lock().unwrap().take().unwrap().join().unwrap();
+    assert_eq!(app.world.query::<&A>().iter_mut().next(), Some(&A(7)));
+}
+
+#[test]
+fn one_point_placed_twice_is_driven_by_one_driver_at_a_time() {
+    const THREADS: usize = if cfg!(miri) { 3 } else { 8 };
+    const BRIDGES: usize = if cfg!(miri) { 4 } else { 20 };
+    WorkerPool::new(3).install(|| {
+        let mut app = App::new()
+            // Read-only envelopes do not conflict, so both drivers may run at
+            // once; the point lets one of them drive.
+            .add_systems(
+                Update,
+                (sync_point(Reads), sync_point(Reads), |_: Query<&B>| {}).parallel(),
+            )
+            .register::<B>()
+            .build();
+        app.world.spawn_bundle((A(1), B(1)));
+        let remote = app.world.remote();
+        let done = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..BRIDGES {
+                        let sum = block_on(
+                            remote.bridge(Reads, |mut q: Query<&A>| {
+                                q.iter_mut().map(|a| a.0).sum::<u32>()
+                            }),
+                            None,
+                        )
+                        .unwrap();
+                        assert_eq!(sum, 1);
+                    }
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+            wait_until(|| {
+                app.emit(&Update);
+                done.load(Ordering::SeqCst) == THREADS
+            });
+        });
+    });
 }

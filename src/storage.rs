@@ -4,6 +4,7 @@ use crate::{
     command::CommandQueue,
     hook::{Add, Event, HookList, HookTable, Insert, Kind, Remove, Replace},
     lookup::ComponentLookup,
+    remote::{Points, Remote},
 };
 use std::{
     collections::HashMap,
@@ -58,17 +59,29 @@ impl<T, const B: bool> Default for Sparse<T, B> {
         Self(PhantomData)
     }
 }
+/// Declares a sync point `P`'s request queue: a schema entry that is not a
+/// component. Added by placing `sync_point(P)` in the app.
+pub struct Point<P>(PhantomData<fn() -> P>);
+impl<P> Default for Point<P> {
+    fn default() -> Self {
+        Self(PhantomData)
+    }
+}
 mod sealed {
     pub trait Sealed {}
     impl Sealed for () {}
     impl<T, const B: bool> Sealed for super::Components<T, B> {}
     impl<T, const B: bool> Sealed for super::Sparse<T, B> {}
+    impl<P> Sealed for super::Point<P> {}
     impl<A: super::Storage, B: super::Storage> Sealed for (A, B) {}
 }
 /// Sealed, statically composed component vocabulary.
 pub trait Storage: sealed::Sealed + Default + 'static {
     const LEN: usize;
     const HAS_SPARSE: bool;
+    /// Sync points declared, numbered apart from components.
+    #[doc(hidden)]
+    const POINTS: usize = 0;
     #[doc(hidden)]
     fn describe(output: &mut Vec<Info>);
 }
@@ -90,9 +103,16 @@ macro_rules! schema {
 }
 schema!(Components, false);
 schema!(Sparse, true);
+impl<P: 'static> Storage for Point<P> {
+    const LEN: usize = 0;
+    const HAS_SPARSE: bool = false;
+    const POINTS: usize = 1;
+    fn describe(_: &mut Vec<Info>) {}
+}
 impl<A: Storage, B: Storage> Storage for (A, B) {
     const LEN: usize = A::LEN + B::LEN;
     const HAS_SPARSE: bool = A::HAS_SPARSE || B::HAS_SPARSE;
+    const POINTS: usize = A::POINTS + B::POINTS;
     fn describe(output: &mut Vec<Info>) {
         A::describe(output);
         B::describe(output);
@@ -352,6 +372,8 @@ pub struct World<S: Storage> {
     queue: CommandQueue<S>,
     flushing: bool,
     hooks: Option<HookTable<S>>,
+    /// Request queues of the schema's sync points; dropping closes them.
+    pub(crate) points: Points<S>,
     schema: PhantomData<S>,
 }
 impl<S: Storage> Default for World<S> {
@@ -387,10 +409,16 @@ impl<S: Storage> World<S> {
             queue: CommandQueue::default(),
             flushing: false,
             hooks: None,
+            points: Points::new(),
             schema: PhantomData,
         };
         world.add_table(vec![false; S::LEN], Box::new([]));
         world
+    }
+    /// A handle for bridging into this world from any thread, through its
+    /// sync points; systems can also take it as a `&Remote<_>` parameter.
+    pub fn remote(&self) -> Remote<S> {
+        self.points.remote.clone()
     }
     /// Tables (archetypes) created so far, including empty ones.
     pub fn archetype_count(&self) -> usize {

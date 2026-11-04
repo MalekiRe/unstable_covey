@@ -100,11 +100,13 @@ fn warm_remote_bridges_allocate_nothing_on_either_side() {
             self.0.unpark();
         }
     }
-    let (point, remote) = sync_point();
+    struct Net;
+    impl SyncPoint for Net {}
     let mut app = App::new()
         .register::<Health>()
-        .add_systems(Update, point)
+        .add_systems(Update, sync_point(Net))
         .build();
+    let remote = app.world.remote();
     app.world.spawn_bundle((Health(0),));
     const WARM: usize = 3;
     const ROUNDS: usize = 50;
@@ -120,12 +122,14 @@ fn warm_remote_bridges_allocate_nothing_on_either_side() {
             let mut cx = Context::from_waker(&waker);
             let state = remote.state();
             let mut round = |_| {
-                let mut bridge =
-                    std::pin::pin!(state.bridge(|mut q: Query<&mut Health>, _: Commands<_>| {
+                let mut bridge = std::pin::pin!(state.bridge(
+                    Net,
+                    |mut q: Query<&mut Health>, _: Commands<_>| {
                         for mut health in &mut q {
                             health.0 += 1;
                         }
-                    }));
+                    }
+                ));
                 let mut first = true;
                 while bridge.as_mut().poll(&mut cx).is_pending() {
                     if std::mem::take(&mut first) {

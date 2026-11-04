@@ -17,6 +17,9 @@ pub struct Write<T>(PhantomData<fn() -> T>);
 pub struct Exclusive;
 /// Component access restricted to archetypes matching `F`.
 pub struct Filtered<A, F>(PhantomData<fn() -> (A, F)>);
+/// Drives sync point `P`: no component access, so it conflicts with nothing;
+/// it only adds `P` to the inferred schema.
+pub struct Drives<P>(PhantomData<fn() -> P>);
 
 pub trait Access {
     const WRITES: bool;
@@ -43,6 +46,9 @@ impl<A: Access, F> Access for Filtered<A, F> {
     const WRITES: bool = A::WRITES;
     const EXCLUSIVE: bool = A::EXCLUSIVE;
 }
+impl<P> Access for Drives<P> {
+    const WRITES: bool = false;
+}
 
 pub trait Against<T: 'static, const WRITE: bool> {
     const VALUE: bool;
@@ -64,6 +70,9 @@ impl<T: 'static, const W: bool, A: Against<T, W>, B: Against<T, W>> Against<T, W
 }
 impl<T: 'static, const W: bool, A: Against<T, W>, F> Against<T, W> for Filtered<A, F> {
     const VALUE: bool = A::VALUE;
+}
+impl<T: 'static, const W: bool, P> Against<T, W> for Drives<P> {
+    const VALUE: bool = false;
 }
 
 pub trait Conflict<B> {
@@ -114,6 +123,12 @@ where
         || B::EXCLUSIVE
         || (<A as Conflict<B>>::VALUE && !<F as Disjoint<G>>::VALUE && !<G as Disjoint<F>>::VALUE);
 }
+impl<B, P> Conflict<B> for Drives<P> {
+    const VALUE: bool = false;
+}
+impl<A: Access, F, P> Conflict<Drives<P>> for Filtered<A, F> {
+    const VALUE: bool = A::EXCLUSIVE;
+}
 
 pub trait ValidAccess {
     const VALID: bool;
@@ -133,6 +148,12 @@ impl<A: ValidAccess, F> ValidAccess for Filtered<A, F> {
 }
 impl<A: ValidAccess + Conflict<B>, B: ValidAccess> ValidAccess for (A, B) {
     const VALID: bool = A::VALID && B::VALID && !<A as Conflict<B>>::VALUE;
+}
+impl<P> ValidAccess for Drives<P> {
+    const VALID: bool = true;
+}
+impl ValidAccess for Exclusive {
+    const VALID: bool = true;
 }
 
 /// Query data and filter reads may overlap inside one query (e.g.

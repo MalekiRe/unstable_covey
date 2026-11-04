@@ -382,9 +382,14 @@ assert_eq!(log, [2, 1]);
 ### Remote bridges
 
 Futures on other threads or runtimes (tokio, a thread pool) bridge in through
-a sync point. `sync_point()` returns a `SyncPoint`, which is a system, and a
-`Remote` handle; wherever the system runs (`add_systems(Update, point)`, or
-inside a chain or graph), it drives the remote bridges queued so far.
+sync points. A sync point is a marker type: `impl SyncPoint for Net {}`.
+`sync_point(Net)` is the system that drives it; place it under a label like
+any system (`add_systems(Update, sync_point(Net))`, or inside a chain,
+parallel group, or graph). A world's `Remote` (`world.remote()`, or a
+`&Remote<_>` system parameter) reaches every sync point from anywhere:
+`remote.bridge(Net, ...)`. Placing the driver declares `Net` in the inferred
+schema, so its queue sits at a compile-time index in the world, and bridging
+to a point the app never places fails to compile.
 [`examples/tokio_web.rs`](examples/tokio_web.rs) fetches pages on a tokio
 runtime and inserts the responses as components while frames keep running.
 
@@ -392,14 +397,19 @@ runtime and inserts the responses as components while frames keep running.
 use static_ecs::prelude::*;
 struct Update;
 impl Schedule for Update {}
+struct Net;
+impl SyncPoint for Net {}
 struct Score(u32);
 
-let (point, remote) = sync_point();
-let mut app = App::new().register::<Score>().add_systems(Update, point).build();
+let mut app = App::new()
+    .register::<Score>()
+    .add_systems(Update, sync_point(Net))
+    .build();
 let entity = app.world.spawn_bundle((Score(0),));
+let remote = app.world.remote();
 let worker = std::thread::spawn(move || {
     let mut fetched = 40; // e.g. from the network; borrowed mutably below
-    let bridge = remote.bridge(|mut q: Query<&mut Score>| {
+    let bridge = remote.bridge(Net, |mut q: Query<&mut Score>| {
         fetched += 2;
         q.get_mut(entity).unwrap().0 = fetched;
     });
@@ -432,21 +442,22 @@ assert_eq!(app.world.get::<Score>(entity).unwrap().0, 42);
   emit, and a chain of different bridges may finish in one drive if each step
   is queued before the driver's last wave.
 - `until` retries at later drives; dropping a pending future withdraws it,
-  even after it was granted. Dropping the app closes its sync points: pending
-  and later bridges fail with `BridgeError::Closed`.
+  even after it was granted. Dropping the world closes its sync points:
+  pending and later bridges fail with `BridgeError::Closed`.
 - The driver waits for granted bridges, so poll remote bridges on threads
   other than the app's. Inside a task, use `AsyncWorld::bridge`; awaiting a
   remote bridge there panics rather than deadlocking.
-- **Envelopes.** `sync_point()` is exclusive: it orders against everything
-  and applies each wave's commands at once. `SyncPoint::within::<Env>()`
-  bounds its bridges by the access of system parameters `Env` (one, or a
-  tuple of up to four, e.g. `(Query<&mut Score>, Query<&Name>)`): it runs in
-  parallel with systems that do not conflict with `Env`, `Env`'s components
-  join the inferred world, a bridge reaching outside `Env` fails to compile,
-  and commands (always allowed) apply when the emit ends.
-- While an envelope point waits for its bridges, its worker stays useful: it
-  lends its slot to the pool before granting, runs branches published to it
-  meanwhile, and holds the slot again once the wave is done.
+- **Envelopes.** By default a sync point is exclusive: it orders against
+  everything and applies each wave's commands at once. With `type Env =
+  Query<'static, &'static mut Score>;` (system parameters: one, or a tuple
+  of up to four) its driver runs in parallel with systems that do not
+  conflict with the envelope, the envelope's components join the inferred
+  world, a bridge reaching outside it fails to compile, and commands (always
+  allowed) apply when the emit ends.
+- One point placed twice is driven by one driver at a time. While an
+  envelope point waits for its bridges, its worker stays useful: it lends its
+  slot to the pool before granting, runs branches published to it meanwhile,
+  and holds the slot again once the wave is done.
 
 ## Execution model
 

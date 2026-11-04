@@ -1,6 +1,7 @@
 //! A tokio runtime fetches web pages while the app keeps running frames.
-//! Requests read what to fetch from the world, and responses come back as
-//! components, all through a remote sync point.
+//! A system starts a request for each new `Fetch` entity, handing tokio the
+//! world's `Remote`; responses come back as components through the `Net`
+//! sync point.
 //!
 //! ```sh
 //! cargo run --release --example tokio_web
@@ -13,6 +14,9 @@ use tokio::time::timeout;
 
 struct Update;
 impl Schedule for Update {}
+/// Where responses enter the frame.
+struct Net;
+impl SyncPoint for Net {}
 
 /// A host whose front page should be fetched.
 struct Fetch(&'static str);
@@ -39,10 +43,41 @@ async fn get(host: &str) -> std::io::Result<(String, usize)> {
 }
 
 fn main() {
-    let (point, remote) = sync_point();
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let tokio = runtime.handle().clone();
     let mut app = App::new()
-        // Where in the frame remote bridges run.
-        .add_systems(Update, point)
+        // Each new `Fetch` starts a request on tokio. Any system can take the
+        // world's `Remote` and hand it to async code.
+        .add_systems(
+            Update,
+            move |remote: &Remote<_>, mut added: Query<(Entity, &Fetch), Added<Fetch>>| {
+                for (entity, fetch) in &mut added {
+                    let (remote, host) = (remote.clone(), fetch.0);
+                    tokio.spawn(async move {
+                        let start = Instant::now();
+                        let (status, bytes) =
+                            match timeout(Duration::from_secs(10), get(host)).await {
+                                Ok(Ok(response)) => response,
+                                Ok(Err(error)) => (format!("error: {error}"), 0),
+                                Err(_) => ("error: timed out".to_owned(), 0),
+                            };
+                        let page = Page {
+                            status,
+                            bytes,
+                            elapsed: start.elapsed(),
+                        };
+                        remote
+                            .bridge(Net, move |mut commands: Commands<_>| {
+                                commands.insert(entity, (page,));
+                            })
+                            .await
+                            .expect("the app is running");
+                    });
+                }
+            },
+        )
+        // Where in the frame responses arrive.
+        .add_systems(Update, sync_point(Net))
         // Runs after the sync point, so it sees pages the frame they arrive.
         .add_systems(
             Update,
@@ -56,57 +91,17 @@ fn main() {
             },
         )
         .build();
-    for host in ["example.com", "example.org", "example.net"] {
+    let hosts = ["example.com", "example.org", "example.net"];
+    for host in hosts {
         app.world.spawn_bundle((Fetch(host),));
     }
 
-    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
-    let fetching = runtime.spawn(async move {
-        // Read the work list from the world. The closure borrows this task's
-        // local mutably; only the request crosses into the app's frame.
-        let mut hosts = Vec::new();
-        remote
-            .bridge(|mut fetches: Query<(Entity, &Fetch)>| {
-                hosts.extend(fetches.iter_mut().map(|(entity, fetch)| (entity, fetch.0)));
-            })
-            .await
-            .expect("the app is running");
-
-        // Fetch concurrently on tokio; each response bridges back on its own.
-        let mut requests = tokio::task::JoinSet::new();
-        for (entity, host) in hosts {
-            let remote = remote.clone();
-            requests.spawn(async move {
-                let start = Instant::now();
-                let (status, bytes) = match timeout(Duration::from_secs(10), get(host)).await {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(error)) => (format!("error: {error}"), 0),
-                    Err(_) => ("error: timed out".to_owned(), 0),
-                };
-                let page = Page {
-                    status,
-                    bytes,
-                    elapsed: start.elapsed(),
-                };
-                remote
-                    .bridge(move |mut commands: Commands<_>| {
-                        commands.insert(entity, (page,));
-                    })
-                    .await
-                    .expect("the app is running");
-            });
-        }
-        requests.join_all().await;
-    });
-
     // The app's own loop: frames keep running while requests are in flight.
     let mut frames = 0;
-    while !fetching.is_finished() {
+    while app.world.query::<&Page>().iter_mut().count() < hosts.len() {
         app.emit(&Update);
         frames += 1;
         std::thread::sleep(Duration::from_millis(16));
     }
-    runtime.block_on(fetching).expect("fetching task");
-    let fetched = app.world.query::<&Page>().iter_mut().count();
-    println!("{fetched} pages over {frames} frames");
+    println!("{} pages over {frames} frames", hosts.len());
 }

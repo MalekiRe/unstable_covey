@@ -5,7 +5,7 @@ use crate::change::{ChangeWindow, SystemWorld};
 use crate::command::{CommandQueue, Commands};
 use crate::filter::{FilterFor, QueryFilter};
 use crate::query::{FetchQuery, QueryData, QueryState};
-use crate::{Query, Single, Storage, World};
+use crate::{Query, Remote, Single, Storage, World};
 
 pub struct Local<'s, T: 'static>(&'s mut T);
 impl<T> Deref for Local<'_, T> {
@@ -25,6 +25,7 @@ mod sealed {
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Query<'_, D, F> {}
     impl<D: super::QueryData, F: super::QueryFilter> Sealed for super::Single<'_, D, F> {}
     impl<S: super::Storage> Sealed for super::Commands<'_, S> {}
+    impl<S: super::Storage> Sealed for &super::Remote<S> {}
 }
 
 /// What a parameter accesses and yields, independent of any world type.
@@ -62,6 +63,19 @@ unsafe impl<S: SystemWorld, T: Default + 'static> Param<S> for Local<'_, T> {
     const VALID: bool = true;
     unsafe fn fetch<'a>(_: *mut S, local: &'a mut T, _: ChangeWindow) -> Option<Local<'a, T>> {
         Some(Local(local))
+    }
+}
+impl<S: Storage> ParamShape for &Remote<S> {
+    type Access = ();
+    type State = ();
+    type Item<'a> = &'a Remote<S>;
+}
+// SAFETY: borrows only the world's remote handle, which never changes; it
+// touches no component storage.
+unsafe impl<S: Storage> Param<World<S>> for &Remote<S> {
+    const VALID: bool = true;
+    unsafe fn fetch(world: *mut World<S>, _: &mut (), _: ChangeWindow) -> Option<&Remote<S>> {
+        Some(unsafe { &(*world).points.remote })
     }
 }
 impl<D: QueryData, F: QueryFilter> ParamShape for Query<'_, D, F> {

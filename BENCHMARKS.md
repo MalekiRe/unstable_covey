@@ -180,26 +180,39 @@ Frame times are within run-to-run variation; final states match in all 60
 processes. Initialization (build plus the first frame) is 0.3–0.5 ms slower in
 the small cases, consistently across repetitions.
 
-## Idle async (`1cb8313`)
+## Idle async
 
-The same simulation, plus an idle exclusive sync point registered under
-`Update` and a task waiting on a label that is never emitted, against the
-unchanged simulation, built from the same commit. Five alternating
-repetitions per row (`async-paired.json`):
+The same simulation, plus an idle exclusive sync point under `Update` and a
+task waiting on a label that is never emitted, against the unchanged
+simulation built from the same commit. Five alternating repetitions per row.
 
-| Actors | Workers | Without ms | With ms | Change | Init without/with ms |
-|---:|---:|---:|---:|---:|---:|
-| 0 | 1 | 0.0679 | 0.0673 | −0.8% | 1.5 / 1.5 |
-| 0 | 4 | 0.0279 | 0.0278 | −0.4% | 1.3 / 1.6 |
-| 4,096 | 1 | 1.254 | 1.224 | −2.4% | 3.5 / 3.5 |
-| 4,096 | 4 | 1.096 | 1.051 | −4.1% | 3.2 / 3.2 |
-| 100,000 | 1 | 98.7 | 96.0 | −2.7% | 125 / 129 |
-| 100,000 | 4 | 88.0 | 85.3 | −3.1% | 122 / 111 |
+With sync points as values (`1cb8313`, `async-paired.json`), the world type
+was unchanged:
 
-An idle sync point costs one load and an idle task a few loads, so the
-consistently lower times with them are code-layout or background-load
-effects, not a speedup; the result is "no measurable cost". Final states
-match in all 60 processes.
+| Actors | Workers | Without ms | With ms | Change |
+|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0679 | 0.0673 | −0.8% |
+| 0 | 4 | 0.0279 | 0.0278 | −0.4% |
+| 4,096 | 1 | 1.254 | 1.224 | −2.4% |
+| 4,096 | 4 | 1.096 | 1.051 | −4.1% |
+| 100,000 | 1 | 98.7 | 96.0 | −2.7% |
+| 100,000 | 4 | 88.0 | 85.3 | −3.1% |
+
+With sync points as marker types, placing one adds `Point<Net>` to the
+inferred schema, so every system compiles against a different world type.
+Two runs (`async-paired-markers*.json`) were 0.2–4.8% slower. A third
+variant with the same schema but no running sync point and no task
+(`schema-check.json`) is as slow:
+
+| Actors | Workers | Baseline ms | Schema only | With async |
+|---:|---:|---:|---:|---:|
+| 4,096 | 1 | 1.244 | +2.0% | +2.1% |
+| 4,096 | 4 | 1.055 | +3.2% | +0.9% |
+| 100,000 | 4 | 79.9 | +3.4% | +2.2% |
+
+So the difference is code generation for the changed world type, not the
+idle point (one load per frame) or task (a few loads). Final states match in
+every process.
 
 ## Blended microbenchmark
 

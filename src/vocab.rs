@@ -1,9 +1,9 @@
 //! Infers a world's component vocabulary from the systems an app composes.
 //! The result is an ordinary nested-pair schema, deduplicated by component type.
-use crate::access::{Exclusive, Filtered, QueryAccess, Read, Write};
+use crate::access::{Drives, Exclusive, Filtered, QueryAccess, Read, Write};
 use crate::filter::{Added, Changed, Or, With, Without};
-use crate::lookup::ComponentLookup;
-use crate::storage::{Components, Sparse, Storage};
+use crate::lookup::{ComponentLookup, PointLookup};
+use crate::storage::{Components, Point, Sparse, Storage};
 
 /// A storage declaration for one component type.
 pub trait Declaration: Storage {
@@ -95,4 +95,18 @@ impl<C, A: Uses<C>, B: Uses<A::Out>> Uses<C> for QueryAccess<A, B> {
 }
 impl<C, F: Uses<C>> Uses<C> for Or<F> {
     type Out = F::Out;
+}
+#[doc(hidden)]
+pub trait Placed<P: 'static> {
+    const VALUE: bool;
+}
+impl<P: 'static, S: PointLookup<P>> Placed<P> for S {
+    const VALUE: bool = <S as PointLookup<P>>::COUNT != 0;
+}
+/// A driven sync point adds its `Point` declaration, once.
+impl<C: Storage + Placed<P>, P: 'static> Uses<C> for Drives<P>
+where
+    If<{ core::gca!(<C as Placed<P>>::VALUE) }>: Choose<C, (C, Point<P>), Out: Storage>,
+{
+    type Out = <If<{ core::gca!(<C as Placed<P>>::VALUE) }> as Choose<C, (C, Point<P>)>>::Out;
 }

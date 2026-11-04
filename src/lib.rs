@@ -47,7 +47,9 @@ pub use query::{ContiguousError, Query, QueryChunks, Single};
 pub use relation::{
     ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources, relation,
 };
-pub use remote::{Envelope, Remote, RemoteBridge, RemoteState, SyncPoint, sync_point};
+pub use remote::{
+    Envelope, Everything, Remote, RemoteBridge, RemoteState, SyncPoint, SyncPointSystem, sync_point,
+};
 pub use task::{Task, TaskFn, task};
 
 pub mod prelude {
@@ -55,11 +57,11 @@ pub mod prelude {
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
         Entity, ExecutionMode, Has, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, NoInput,
         OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Query, Ref, Related,
-        Relates, Relation, Schedule, Single, Sources, Sparse, Storage, Trigger, With, Without,
-        WorkerPool, World, exclusive, node, ready, schedule, sync_point, task,
+        Relates, Relation, Remote, Schedule, Single, Sources, Sparse, Storage, SyncPoint, Trigger,
+        With, Without, WorkerPool, World, exclusive, node, ready, schedule, sync_point, task,
     };
 }
-pub use storage::{Bundle, Components, Entity, Sparse, Storage, World};
+pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};
 
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
