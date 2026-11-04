@@ -797,3 +797,190 @@ fn relinked_matches_changed_links_for_both_storages() {
     assert_eq!(seen[3], [2]);
     assert_eq!(seen[4], Vec::<u32>::new());
 }
+
+struct Attached;
+impl Relation for Attached {
+    type Kind = OneToMany;
+    const ACYCLIC: bool = true;
+}
+struct Carried;
+impl Relation for Carried {
+    type Kind = OneToMany;
+    const FRAGMENTING: bool = true;
+    const ACYCLIC: bool = true;
+}
+struct Precedes;
+impl Relation for Precedes {
+    type Kind = ManyToMany;
+    const ACYCLIC: bool = true;
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Local(i64);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Global(i64);
+struct Skip;
+
+/// Random forests: relate (only edges the model allows), unrelate, and
+/// exclude rows; after each step a cascade propagates `Global` and must
+/// visit every row once, after its parent when the parent is a row.
+macro_rules! cascade_matches_model {
+    ($name:ident, $relation:ident) => {
+        #[test]
+        fn $name() {
+            use static_ecs::To;
+            let mut app = App::new()
+                .relation::<$relation, _>()
+                .register::<Local>()
+                .register::<Global>()
+                .register::<Skip>()
+                .build();
+            let world = &mut app.world;
+            let n = if cfg!(miri) { 24 } else { 120 };
+            let nodes: Vec<Entity> = (0..n)
+                .map(|i| world.spawn_bundle((Local(i as i64 + 1), Global(0))))
+                .collect();
+            let mut parent: Vec<Option<usize>> = vec![None; n];
+            let mut skipped = vec![false; n];
+            let mut seed = 0x2545f4914f6cdd1d_u64;
+            let mut next = |n: usize| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % n as u64) as usize
+            };
+            let reaches = |parent: &[Option<usize>], mut at: usize, to: usize| loop {
+                if at == to {
+                    return true;
+                }
+                match parent[at] {
+                    Some(up) => at = up,
+                    None => return false,
+                }
+            };
+            let steps = if cfg!(miri) { 60 } else { 1500 };
+            for step in 0..steps {
+                let (a, b) = (next(n), next(n));
+                match next(10) {
+                    0..=5 if !reaches(&parent, b, a) => {
+                        world.relate(nodes[a], $relation, nodes[b]);
+                        parent[a] = Some(b);
+                    }
+                    6 if parent[a].is_some() => {
+                        assert!(world.unrelate::<$relation>(nodes[a], nodes[parent[a].unwrap()]));
+                        parent[a] = None;
+                    }
+                    7 => {
+                        if skipped[a] {
+                            world.remove::<Skip>(nodes[a]);
+                        } else {
+                            world.insert(nodes[a], Skip);
+                        }
+                        skipped[a] = !skipped[a];
+                    }
+                    _ => {}
+                }
+                let mut order = Vec::new();
+                world
+                    .query_filtered::<(To<$relation, &Global>, (Entity, &Local, &mut Global)), Without<Skip>>()
+                    .cascade(|(up, (entity, local, mut global))| {
+                        global.0 = up.map_or(0, |up| up.0) + local.0;
+                        order.push(entity);
+                    });
+                let index = |e: Entity| nodes.iter().position(|&x| x == e).unwrap();
+                let order: Vec<usize> = order.into_iter().map(index).collect();
+                let mut position = vec![None; n];
+                for (at, &i) in order.iter().enumerate() {
+                    assert!(position[i].replace(at).is_none(), "{i} twice at step {step}");
+                }
+                for i in 0..n {
+                    assert_eq!(position[i].is_some(), !skipped[i], "{i} at step {step}");
+                    if let (Some(at), Some(up)) = (position[i], parent[i])
+                        && let Some(up_at) = position[up]
+                    {
+                        assert!(up_at < at, "{i} before its parent {up} at step {step}");
+                    }
+                    if !skipped[i] {
+                        let up = parent[i].map_or(0, |up| world.get::<Global>(nodes[up]).unwrap().0);
+                        let global = world.get::<Global>(nodes[i]).unwrap().0;
+                        assert_eq!(global, up + i as i64 + 1, "{i} at step {step}");
+                    }
+                }
+            }
+        }
+    };
+}
+cascade_matches_model!(cascade_orders_parents_first_through_relates, Attached);
+cascade_matches_model!(cascade_orders_parents_first_through_pairs, Carried);
+
+#[test]
+#[should_panic(expected = "would close a cycle")]
+fn acyclic_relations_refuse_closing_a_chain() {
+    let mut app = App::new().relation::<Attached, _>().build();
+    let world = &mut app.world;
+    let [a, b, c] = [(); 3].map(|()| world.spawn());
+    world.relate(a, Attached, b);
+    world.relate(b, Attached, c);
+    world.relate(c, Attached, a);
+}
+
+#[test]
+#[should_panic(expected = "would close a cycle")]
+fn acyclic_fragmenting_bundles_refuse_cycles() {
+    let mut app = App::new().relation::<Carried, _>().build();
+    let world = &mut app.world;
+    let a = world.spawn();
+    let b = world.spawn_bundle((Carried.to(a),));
+    world.insert(a, Carried.to(b));
+}
+
+#[test]
+fn acyclic_many_to_many_allows_diamonds_and_refuses_back_edges() {
+    let mut app = App::new().relation::<Precedes, _>().build();
+    let world = &mut app.world;
+    let [top, left, right, bottom] = [(); 4].map(|()| world.spawn());
+    for (source, target) in [(left, top), (right, top), (bottom, left), (bottom, right)] {
+        world.relate(source, Precedes, target);
+    }
+    for (source, target) in [(top, bottom), (left, bottom), (top, top)] {
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            world.relate(source, Precedes, target);
+        }));
+        assert!(refused.is_err());
+    }
+    assert_eq!(ids(world.targets::<Precedes>(bottom)).len(), 2);
+    assert!(ids(world.targets::<Precedes>(top)).is_empty());
+}
+
+#[test]
+fn cascade_inside_a_system_propagates_every_frame() {
+    use static_ecs::To;
+    struct Update;
+    impl Schedule for Update {}
+    type Transforms = (
+        To<Attached, &'static Global>,
+        (&'static Local, &'static mut Global),
+    );
+    let mut app = App::new()
+        .relation::<Attached, _>()
+        .add_systems(Update, |mut tree: Query<Transforms>| {
+            tree.cascade(|(up, (local, mut global))| {
+                global.0 = up.map_or(0, |up| up.0) + local.0;
+            });
+        })
+        .build();
+    let world = &mut app.world;
+    // Children spawned before their parents: plain iteration would see stale parents.
+    let [leaf, mid, root] = [100, 10, 1].map(|i| world.spawn_bundle((Local(i), Global(0))));
+    world.relate(leaf, Attached, mid);
+    world.relate(mid, Attached, root);
+    let globals = |world: &World<_>| [leaf, mid, root].map(|e| world.get::<Global>(e).unwrap().0);
+    app.emit(&Update);
+    assert_eq!(globals(&app.world), [111, 11, 1]);
+    app.world.insert(root, Local(2));
+    app.emit(&Update);
+    assert_eq!(globals(&app.world), [112, 12, 2]);
+    // Reparent the leaf to the root.
+    app.world.relate(leaf, Attached, root);
+    app.emit(&Update);
+    assert_eq!(globals(&app.world), [102, 12, 2]);
+}

@@ -296,7 +296,7 @@ impl<R: Relation, Q: JoinCheck> QueryData for To<R, Q> {
     const JOINS: bool = true;
     const JOINS_VALID: bool = join_valid::<R, Q>(<R::Kind as JoinKind>::TO_MANY);
     const WRITES_LINKS: bool = Q::WRITES_LINKS;
-    type Indices = (usize, usize, Q::Indices);
+    type Indices = JoinIndices<Q::Indices>;
     type Fetch = JoinFetch<Q>;
     type Item<'w> = <R::Kind as JoinKind>::To<'w, Q>;
     type Slice<'w> = ();
@@ -312,14 +312,15 @@ impl<R: Relation, Q: JoinCheck> QueryData for To<R, Q> {
         indices: &Self::Indices,
         tick: u64,
     ) -> Self::Fetch {
-        let mut fetch = unsafe { JoinFetch::new(reach, table, indices.0, indices.1, indices.2) };
+        let i = indices;
+        let mut fetch = unsafe { JoinFetch::new(reach, table, i.relates, i.pair, i.inner) };
         if R::FRAGMENTING && !<R::Kind as JoinKind>::MANY_TO_MANY {
             // Every row of this table has the same target: resolve it once.
-            let target = table.targets.iter().find(|&&(r, _)| r == indices.1);
+            let target = table.targets.iter().find(|&&(r, _)| r == i.pair);
             fetch.resolved = target.and_then(|&(_, target)| {
                 let (table, row) = unsafe { reach.find(target) }?;
-                Q::matches(&indices.2, &table.present)
-                    .then(|| (unsafe { Q::fetch(reach, table, &indices.2, tick) }, row))
+                Q::matches(&i.inner, &table.present)
+                    .then(|| (unsafe { Q::fetch(reach, table, &i.inner, tick) }, row))
             });
         }
         fetch
@@ -349,7 +350,7 @@ impl<R: Relation, Q: JoinCheck> QueryData for From<R, Q> {
     const JOINS: bool = true;
     const JOINS_VALID: bool = join_valid::<R, Q>(<R::Kind as JoinKind>::FROM_MANY);
     const WRITES_LINKS: bool = Q::WRITES_LINKS;
-    type Indices = (usize, usize, Q::Indices);
+    type Indices = JoinIndices<Q::Indices>;
     type Fetch = JoinFetch<Q>;
     type Item<'w> = <R::Kind as JoinKind>::From<'w, Q>;
     type Slice<'w> = ();
@@ -360,7 +361,8 @@ impl<R: Relation, Q: JoinCheck> QueryData for From<R, Q> {
         false
     }
     unsafe fn fetch(reach: Reach, table: &Table, indices: &Self::Indices, _: u64) -> Self::Fetch {
-        unsafe { JoinFetch::new(reach, table, indices.0, indices.1, indices.2) }
+        let i = indices;
+        unsafe { JoinFetch::new(reach, table, i.sources, i.pair, i.inner) }
     }
     fn direct(_: &Self::Fetch) -> bool {
         true
@@ -384,13 +386,27 @@ impl<R: Relation, Q: JoinCheck> QueryData for From<R, Q> {
     unsafe fn slice<'a>(_: &Self::Fetch, _: usize, _: u64) -> Self::Slice<'a> {}
 }
 
+/// A join's component indices: the relation's link columns and pair id,
+/// and the inner query's.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct JoinIndices<I> {
+    relates: usize,
+    sources: usize,
+    pair: usize,
+    inner: I,
+}
+
 macro_rules! fetch_join {
     ($join:ident, $links:ident) => {
-        // SAFETY: indices name the relation's own link column and pair id;
+        // SAFETY: indices name the relation's own link columns and pair id;
         // `Q`'s are its own.
         unsafe impl<S, R, Q> FetchQuery<S> for $join<R, Q>
         where
-            S: Storage + ComponentLookup<$links<R>> + ComponentLookup<PairOf<R>>,
+            S: Storage
+                + ComponentLookup<Relates<R>>
+                + ComponentLookup<Sources<R>>
+                + ComponentLookup<PairOf<R>>,
             R: Relation,
             Q: FetchQuery<S> + JoinCheck,
         {
@@ -400,13 +416,89 @@ macro_rules! fetch_join {
                 } else {
                     <S as ComponentLookup<$links<R>>>::COUNT == 1
                 };
-            const INDICES: Self::Indices = (
-                <S as ComponentLookup<$links<R>>>::INDEX,
-                <S as ComponentLookup<PairOf<R>>>::INDEX,
-                Q::INDICES,
-            );
+            const INDICES: Self::Indices = JoinIndices {
+                relates: <S as ComponentLookup<Relates<R>>>::INDEX,
+                sources: <S as ComponentLookup<Sources<R>>>::INDEX,
+                pair: <S as ComponentLookup<PairOf<R>>>::INDEX,
+                inner: Q::INDICES,
+            };
         }
     };
 }
 fetch_join!(To, Relates);
 fetch_join!(From, Sources);
+
+/// Query data led by `To<R, _>`: `Query::cascade` walks `R` parents first.
+#[doc(hidden)]
+pub trait Cascading: QueryData {
+    /// `R` is one-target and `ACYCLIC`.
+    const CASCADES: bool;
+    /// `row`'s parent along `R`, if linked.
+    /// # Safety
+    /// `table` matches the query; `row` is live.
+    unsafe fn parent(indices: &Self::Indices, table: &Table, row: usize) -> Option<Entity>;
+    /// Calls `f` with each of `entity`'s children along `R`.
+    /// # Safety
+    /// The reach is live; links are not written meanwhile.
+    unsafe fn children(
+        indices: &Self::Indices,
+        reach: Reach,
+        entity: Entity,
+        f: impl FnMut(Entity),
+    );
+}
+impl<R: Relation, Q: JoinCheck> Cascading for To<R, Q> {
+    const CASCADES: bool = R::ACYCLIC && !<R::Kind as JoinKind>::TO_MANY;
+    unsafe fn parent(i: &Self::Indices, table: &Table, row: usize) -> Option<Entity> {
+        if R::FRAGMENTING {
+            let pair = table.targets.iter().find(|&&(r, _)| r == i.pair);
+            return pair.map(|&(_, target)| target);
+        }
+        if !table.present[i.relates] {
+            return None;
+        }
+        let relates = unsafe { &*table.columns[i.relates].value::<Relates<R>>(row) };
+        let first = relates
+            .entries()
+            .first()
+            .filter(|&&(_, slot)| slot != PENDING);
+        first.map(|&(target, _)| target)
+    }
+    unsafe fn children(i: &Self::Indices, reach: Reach, entity: Entity, mut f: impl FnMut(Entity)) {
+        if R::FRAGMENTING {
+            for &table in unsafe { reach.pair_tables(i.pair, entity) } {
+                unsafe { reach.table(table) }
+                    .entities
+                    .iter()
+                    .copied()
+                    .for_each(&mut f);
+            }
+            return;
+        }
+        let Some((table, row)) = (unsafe { reach.find(entity) }) else {
+            return;
+        };
+        if table.present[i.sources] {
+            let sources = unsafe { &*table.columns[i.sources].value::<Sources<R>>(row) };
+            sources.sources().for_each(f);
+        }
+    }
+}
+impl<A: Cascading, B: QueryData> Cascading for (A, B) {
+    const CASCADES: bool = A::CASCADES;
+    unsafe fn parent(i: &Self::Indices, table: &Table, row: usize) -> Option<Entity> {
+        unsafe { A::parent(&i.0, table, row) }
+    }
+    unsafe fn children(i: &Self::Indices, reach: Reach, entity: Entity, f: impl FnMut(Entity)) {
+        unsafe { A::children(&i.0, reach, entity, f) }
+    }
+}
+impl<A: Cascading, B: QueryData, C: QueryData> Cascading for (A, B, C) {
+    const CASCADES: bool = A::CASCADES;
+    unsafe fn parent(i: &Self::Indices, table: &Table, row: usize) -> Option<Entity> {
+        unsafe { A::parent(&i.0, table, row) }
+    }
+    unsafe fn children(i: &Self::Indices, reach: Reach, entity: Entity, f: impl FnMut(Entity)) {
+        unsafe { A::children(&i.0, reach, entity, f) }
+    }
+}

@@ -3,6 +3,7 @@ use crate::{
     access::{Access, Conflict, Read, Union, ValidAccess, Write},
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
     filter::{FilterFor, QueryFilter, TableMatch},
+    join::Cascading,
     lookup::ComponentLookup,
     relation::LinkComponent,
     storage::{ColumnPtr, Locator, PairIndex, Reach, Table},
@@ -114,6 +115,8 @@ struct MatchingTables {
     scanned: usize,
     candidate: Option<usize>,
     matching: Vec<usize>,
+    /// `Query::cascade`'s visit order, kept to reuse its allocation.
+    order: Vec<(u32, u32)>,
 }
 fn candidate<D: QueryData, F: QueryFilter>(
     indices: &D::Indices,
@@ -164,6 +167,7 @@ pub struct Query<'w, D: QueryData, F: QueryFilter = ()> {
     indices: D::Indices,
     filter: F::State,
     window: ChangeWindow,
+    order: Option<&'w mut Vec<(u32, u32)>>,
 }
 impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     pub(crate) unsafe fn from_world<S: Storage>(world: *mut World<S>, window: ChangeWindow) -> Self
@@ -198,6 +202,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             indices: D::INDICES,
             filter: F::STATE,
             window,
+            order: None,
         }
     }
     pub(crate) unsafe fn from_cached<S: Storage>(
@@ -219,6 +224,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
                 scanned: 0,
                 candidate: None,
                 matching: Vec::new(),
+                order: Vec::new(),
             })
         });
         if state.world != id {
@@ -251,7 +257,11 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             }
             state.scanned = query.tables.len();
         }
-        query.matching = Some(&state.matching);
+        let MatchingTables {
+            matching, order, ..
+        } = &mut **state;
+        query.matching = Some(matching);
+        query.order = Some(order);
         query.cached = true;
         query
     }
@@ -264,22 +274,31 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             None => Tables::All(self.tables.iter()),
         }
     }
-    /// The item for `entity`, if it is live and matches this query and its
-    /// filters (including row filters such as `Changed`).
-    pub fn get_mut(&mut self, entity: Entity) -> Option<D::Item<'_>> {
-        let (table, row) = self.locator.find(entity)?;
-        let table = &self.tables[table];
+    /// `entity`'s table index and row, if it is a row of this query.
+    fn row_of(&self, entity: Entity) -> Option<(usize, usize)> {
+        let (index, row) = self.locator.find(entity)?;
+        let table = &self.tables[index];
         if !D::matches(&self.indices, &table.present) || !F::matches(&self.filter, &table.present) {
             return None;
         }
-        // SAFETY: the table matches, the row is live, and `&mut self` keeps
-        // every other item of this query from being alive meanwhile.
-        unsafe {
+        // SAFETY: filters read only tick metadata of a live row.
+        let row_matches = unsafe {
             match F::classify(&self.filter, table, self.window) {
-                TableMatch::None => return None,
-                TableMatch::Maybe if !F::row(&self.filter, table, row, self.window) => return None,
-                _ => {}
+                TableMatch::None => false,
+                TableMatch::Maybe => F::row(&self.filter, table, row, self.window),
+                TableMatch::All => true,
             }
+        };
+        row_matches.then_some((index, row))
+    }
+    /// The item for `entity`, if it is live and matches this query and its
+    /// filters (including row filters such as `Changed`).
+    pub fn get_mut(&mut self, entity: Entity) -> Option<D::Item<'_>> {
+        let (table, row) = self.row_of(entity)?;
+        let table = &self.tables[table];
+        // SAFETY: the row matches, and `&mut self` keeps every other item of
+        // this query from being alive meanwhile.
+        unsafe {
             let fetch = D::fetch(self.reach(), table, &self.indices, self.window.now);
             Some(D::get(&fetch, row, self.window.now))
         }
@@ -309,6 +328,82 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     /// iterator until the next `fetch_next`, so every query can use it.
     pub fn iter_lending(&mut self) -> QueryLending<'_, D, F> {
         QueryLending(self.iter_rows())
+    }
+    /// Call `f` for every row, one at a time, each after its parent: the
+    /// query leads with `To<R, P>` along a one-target `ACYCLIC` relation,
+    /// so `P` reads the parent as already updated (e.g. transforms). Rows
+    /// whose parent is not a row of the query come first. The order is fixed
+    /// before `f` runs, so writes cannot reorder or repeat rows.
+    pub fn cascade(&mut self, mut f: impl for<'r> FnMut(D::Item<'r>))
+    where
+        D: Cascading,
+    {
+        const {
+            assert!(
+                D::CASCADES,
+                "cascade needs a query led by `To<R, _>` with R one-target and ACYCLIC"
+            );
+        }
+        let reach = self.reach();
+        let mut stored = self.order.take();
+        let mut fresh = Vec::new();
+        let order = match stored.as_deref_mut() {
+            Some(order) => order,
+            None => &mut fresh,
+        };
+        order.clear();
+        // Roots: rows whose parent is not a row.
+        let mut tables = self.tables();
+        while let Some(table) = tables.next::<D, F>(&self.indices, &self.filter) {
+            // SAFETY: filters read only tick metadata.
+            let class = unsafe { F::classify(&self.filter, table, self.window) };
+            if class == TableMatch::None {
+                continue;
+            }
+            let index = unsafe { (table as *const Table).offset_from(self.tables.as_ptr()) } as u32;
+            for row in 0..table.entities.len() {
+                if class == TableMatch::Maybe
+                    && !unsafe { F::row(&self.filter, table, row, self.window) }
+                {
+                    continue;
+                }
+                let parent = unsafe { D::parent(&self.indices, table, row) };
+                if parent.is_none_or(|parent| self.row_of(parent).is_none()) {
+                    order.push((index, row as u32));
+                }
+            }
+        }
+        // Then breadth first: each row's children that are rows. A child's
+        // parent is unique, so every row is queued exactly once.
+        let mut next = 0;
+        while let Some(&(table, row)) = order.get(next) {
+            let entity = self.tables[table as usize].entities[row as usize];
+            unsafe {
+                D::children(&self.indices, reach, entity, |child| {
+                    if let Some((table, row)) = self.row_of(child) {
+                        order.push((table as u32, row as u32));
+                    }
+                });
+            }
+            next += 1;
+        }
+        let mut fetched: Option<(u32, D::Fetch)> = None;
+        for &(table, row) in order.iter() {
+            let now = self.window.now;
+            let fetch = match &fetched {
+                Some((current, fetch)) if *current == table => fetch,
+                _ => {
+                    // SAFETY: the table matches; rows are visited one at a time.
+                    let fetch = unsafe {
+                        D::fetch(reach, &self.tables[table as usize], &self.indices, now)
+                    };
+                    &fetched.insert((table, fetch)).1
+                }
+            };
+            // SAFETY: each row once; its item ends before the next begins.
+            f(unsafe { D::get(fetch, row as usize, now) });
+        }
+        self.order = stored;
     }
     fn iter_rows(&mut self) -> QueryIter<'_, D, F> {
         QueryIter {

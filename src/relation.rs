@@ -40,6 +40,9 @@ pub trait Relation: Send + Sync + 'static {
     /// App::new().relation::<Spouse, _>().build();
     /// ```
     const FRAGMENTING: bool = false;
+    /// Refuse edges that would close a cycle (relating panics), so walks
+    /// along it end: `Query::cascade` needs it.
+    const ACYCLIC: bool = false;
     /// This relation from the entity it is inserted on to `target`, as a
     /// bundle part: `commands.spawn((Name("Raider"), Targets.to(station)))`.
     /// Inserting replaces the entity's previous link (every edge, for
@@ -458,7 +461,7 @@ impl<S: Storage> World<S> {
             self.contains(source) && self.contains(target),
             "relate: both entities must be alive"
         );
-        check_self_edge::<R>(source, target);
+        self.check_edge::<R>(source, target);
         if const { R::FRAGMENTING } {
             self.relate_pair::<R>(source, target);
             return;
@@ -534,7 +537,7 @@ impl<S: Storage> World<S> {
             self.remove::<Relates<R>>(source);
             for &(target, _) in pending.entries() {
                 if self.contains(target) {
-                    check_self_edge::<R>(source, target);
+                    self.check_edge::<R>(source, target);
                     self.relate_pair::<R>(source, target);
                 }
             }
@@ -564,7 +567,7 @@ impl<S: Storage> World<S> {
                 }
                 continue;
             }
-            check_self_edge::<R>(source, target);
+            self.check_edge::<R>(source, target);
             self.displace_source::<R>(target);
             if self.get::<Sources<R>>(target).is_none() {
                 self.insert(target, Sources::<R>::new());
@@ -842,12 +845,52 @@ where
     )
 }
 
-/// Self-edges would alias a row's own `&mut T` with a join's.
-fn check_self_edge<R: Relation>(source: Entity, target: Entity) {
-    if SourceSide::<R>::ONE || TargetSide::<R>::ONE {
-        assert!(
-            source != target,
-            "relate: an entity cannot relate to itself through a relation with a one-side"
-        );
+impl<S: Storage> World<S> {
+    /// Refuse edges that break `R`'s rules. Self-edges through a one-side
+    /// would alias a row's own `&mut T` with a join's; an `ACYCLIC` edge must
+    /// not close a cycle, i.e. `target` must not already reach `source`.
+    fn check_edge<R: Relation>(&self, source: Entity, target: Entity)
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<PairOf<R>>,
+    {
+        if SourceSide::<R>::ONE || TargetSide::<R>::ONE {
+            assert!(
+                source != target,
+                "relate: an entity cannot relate to itself through a relation with a one-side"
+            );
+        }
+        if R::ACYCLIC {
+            assert!(
+                !self.reaches::<R>(target, source),
+                "relate: the edge would close a cycle in an ACYCLIC relation"
+            );
+        }
+    }
+    /// Whether `to` is `from` or above it along `R` (`R` acyclic, so the walk ends).
+    fn reaches<R: Relation>(&self, from: Entity, to: Entity) -> bool
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<PairOf<R>>,
+    {
+        if SourceSide::<R>::ONE {
+            let mut at = Some(from);
+            while let Some(entity) = at {
+                if entity == to {
+                    return true;
+                }
+                at = self.targets::<R>(entity).next();
+            }
+            return false;
+        }
+        let (mut stack, mut seen) = (vec![from], Vec::new());
+        while let Some(entity) = stack.pop() {
+            if entity == to {
+                return true;
+            }
+            if !seen.contains(&entity) {
+                seen.push(entity);
+                stack.extend(self.targets::<R>(entity));
+            }
+        }
+        false
     }
 }

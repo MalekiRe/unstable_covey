@@ -679,6 +679,7 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         ("join_parallel_conflict", Some("E0080")),
         ("link_write_query", Some("E0080")),
         ("link_write_world", Some("E0080")),
+        ("cascade_cyclic", Some("E0080")),
     ] {
         std::fs::copy(
             root.join("tests/ui").join(format!("{fixture}.rs")),
