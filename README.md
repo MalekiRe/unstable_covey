@@ -1,56 +1,215 @@
 # static-ecs
 
-A small ECS whose schedules are Rust types. Plugins, systems, and event routing
-compose into one concrete application type; `emit` runs a frame as statically
-dispatched, inlinable code. The world's component set is inferred from the
-systems you add, at compile time. No schema, runtime registries, boxed systems,
-or external dependencies; `TypeId` appears only in async tasks' bookkeeping.
-
-It relies on **nightly full specialization** and the minimal generic-const-argument
-features (`nightly-2026-10-25`). These are incomplete features with known
-soundness holes; the compiler warnings are left visible. Typed parameter fetching
-and the executor use internal `unsafe`, guarded by compile-time access checks and
-sealed traits. This is an experiment.
-
-```sh
-cargo run --release --example simulation
-cargo run --release --example tokio_web # remote bridges from tokio (network)
-cargo run --release -p dispatch-demo
-cargo run --release -p flappy        # CPU-rendered Wayland client (space flaps)
-cargo run --release -p flappy --bin flappy-launch  # launch-to-pixels timing
-cargo test --workspace --release
-cargo clippy --workspace --all-targets -- -D clippy::all
-```
+Bevy's ECS model (entities, components, systems, schedules, plugins) with one
+difference that changes everything else: **the whole app is a single Rust
+type**. Every system, its parameters, its place in the schedule, every plugin,
+and the set of components the world stores are part of that type, so the
+compiler sees the entire frame at once. It checks access conflicts, wiring,
+and storage at compile time, and emits each frame as one program of direct,
+inlinable calls.
 
 ```rust
 use static_ecs::prelude::*;
+
 struct Update;
 impl Schedule for Update {}
-struct Position(f32);
+
+struct Position(f32); // any 'static type is a component: no derives
 struct Velocity(f32);
 
 let mut app = App::new()
     .add_systems(Update, |mut query: Query<(&mut Position, &Velocity)>| {
-        for (mut position, velocity) in &mut query {
-            position.0 += velocity.0;
-        }
+        query.iter_mut().for_each(|(mut position, velocity)| position.0 += velocity.0);
     })
-    .build(); // The world stores Position and Velocity: what the systems use.
+    .build(); // the world stores exactly what the systems use: Position, Velocity
+
 let entity = app.world.spawn_bundle((Position(0.0), Velocity(2.0)));
 app.emit(&Update);
 assert_eq!(app.world.get::<Position>(entity).unwrap().0, 2.0);
 ```
 
-## Schedules
+> **Status: an experiment.** It needs nightly Rust (`nightly-2026-10-25`, pinned
+> in `rust-toolchain.toml`) for full specialization and generic const
+> arguments; their incomplete-feature warnings are left visible.
+> Specialization is the one with known soundness holes, and they all come from
+> impls that differ only in lifetimes: lifetimes are erased before code
+> generation picks an impl. This crate avoids them deliberately: every
+> specializing impl is keyed on types that must be `'static` (components,
+> labels, groups, states), so impl selection never depends on a lifetime. The
+> library also uses internal `unsafe`, behind compile-time access checks and
+> sealed traits.
 
-`add_systems(label, systems)` is the only way to register systems. The label's
-`Schedule` impl fixes what every system under it takes **first**:
+## Why not just Bevy?
+
+### A frame is one compiled program
+
+In Bevy, systems are boxed trait objects stored in a schedule. Each frame, the
+executor decides from runtime access bitsets which systems may run, calls each
+through a vtable, and looks components up by runtime ids. None of that exists
+here:
+
+- **Systems are types, sequences are direct calls.** A system's successor is a
+  type parameter, so `(a, b, c).chain()` compiles to `a(); b(); c();` and LLVM
+  inlines system bodies into each other. Emitting a label nobody registered
+  for compiles to nothing.
+- **Component lookups are constants.** The world's component set is a type, so
+  "which column is `Position`" is a compile-time index. Queries resolve column
+  pointers once per table, then run plain loops: `for_each` over 1M entities
+  runs as fast as hand-written slice code (0.20–0.23 vs 0.25–0.29 ns/entity,
+  vectorized, in [`examples/query_loop.rs`](examples/query_loop.rs)).
+- **Access checking costs nothing at runtime.** Which systems may run in
+  parallel is decided while compiling; the executor never compares access
+  sets.
+- **Synchronization only where the schedule forks or joins.** A fork hands its
+  second branch to a worker only if one is idle; otherwise both branches run
+  inline with no atomic writes. A join costs two atomic operations per arrival.
+- **No shared change counter.** Change ticks are a Lamport clock carried along
+  the schedule in a register; parallel systems never contend on a world-wide
+  tick.
+- **Code size stays linear.** A continuation reachable from several places (after
+  a join, either side of a condition) is emitted once, out of line, and
+  returned to a loop rather than called, so stack depth stays constant across
+  any number of joins.
+
+Measured on a matched simulation (4,113 systems, 100,000 actors, the same
+system bodies on both; differential checks confirm identical state every
+frame), Ryzen 9 5900X:
+
+| Workers | | static-ecs | Bevy 0.20.1 ECS |
+|---:|---|---:|---:|
+| 1 | frame (median) | **94.9 ms** | 98.1 ms |
+| 4 | frame (median) | **80.3 ms** | 87.7 ms |
+| 4 | startup (build + first frame) | **107 ms** | 1,466 ms |
+| 4 | peak memory | **63 MiB** | 1,052 MiB |
+
+With 4,096 tiny systems, where scheduling overhead dominates, a frame takes
+0.177 ms against Bevy's 2.495 ms on four workers. Methodology, raw data, and
+every per-change measurement are in [BENCHMARKS.md](BENCHMARKS.md).
+
+### Mistakes are compile errors, not panics
+
+Bevy validates system parameters when a system first initializes and panics
+on conflicts (error B0001); here the same mistakes do not compile:
+
+```rust,compile_fail,E0080
+use static_ecs::prelude::*;
+struct Update;
+impl Schedule for Update {}
+struct Health(u32);
+// Two parameters alias Health: rejected while compiling.
+App::new()
+    .add_systems(Update, |_: Query<&mut Health>, _: Query<&Health>| {})
+    .build();
+```
+
+```rust,compile_fail,E0080
+use static_ecs::prelude::*;
+struct Health(u32);
+// Asked to run in parallel, but both touch Health.
+App::new()
+    .add_systems((), (
+        |mut q: Query<&mut Health>| q.iter_mut().for_each(|mut h| h.0 += 1),
+        |mut q: Query<&Health>| q.iter_mut().for_each(|h| assert!(h.0 > 0)),
+    ).parallel())
+    .build();
+```
+
+The compiler also rejects:
+
+- using a component the world does not store, or a storage choice made after
+  systems already use the component;
+- writing an `Immutable` component in place, through queries, `get_mut`, or
+  `ResMut`;
+- a bundle that repeats a component or holds two members of one `OneOf` group;
+- a system that does not take its label's input (`&Damage` under `Damage`);
+- dependency graphs with cycles, missing nodes, or unknown labels (checked
+  during const evaluation);
+- relation joins whose mutable access could alias across edges;
+- bridging into a sync point the app never places, or outside its declared
+  envelope;
+- `insert_resource` of a state, which would skip its transitions.
+
+Disjointness is proven too: `With<T>`/`Without<T>` filters, and filters on
+members of one `OneOf` group, let two `&mut` queries coexist in one system or
+run in parallel. Bevy needs `ParamSet` or explicit `Without` filters for the
+same.
+
+### Less to write
+
+- **No derives or registration.** `struct Pos(f32);` is a component; resources,
+  states, and relations are plain types with one-line trait impls.
+- **The world is inferred.** `build` creates a world storing exactly the
+  components your systems and plugins mention. Lookups stay compile-time
+  constants; there is no registry to populate.
+- **Events are labels.** `impl Schedule for Damage { type In = Ref<Self>; }`,
+  then every system under `Damage` takes `&Damage` first. `app.emit(&Damage(5))`
+  runs them; there are no event queues to read or clear.
+- **Plugins are types** that name their components and build their systems for
+  whatever world the app ends up with, without ever naming it.
+- **Fewer special cases.** Resources are components of a hidden entity, states
+  are resources, and hooks and state transitions are systems under lifecycle
+  labels, so one set of parameters (`Query`, `Single`, `Res`, `Commands`, ...)
+  works everywhere.
+
+### Features Bevy does not have
+
+- **Mutually exclusive components** (`OneOf`): inserting `Running` removes
+  `Walking` in the same table move, and the scheduler knows queries filtered on
+  each never overlap. Open in Bevy as
+  [#17707](https://github.com/bevyengine/bevy/issues/17707).
+- **Many-to-many relations and relational queries**: `To<R, Q>` and
+  `From<R, Q>` fetch data across edges inside a query, with item types that
+  follow the relation's cardinality, mutable access checked per cardinality,
+  and `cascade` for parent-first walks. Bevy's relationships are one-to-many
+  ([#18121](https://github.com/bevyengine/bevy/issues/18121)); relational
+  queries are being designed
+  ([#23018](https://github.com/bevyengine/bevy/issues/23018)). Relations can
+  also be fragmenting: the target becomes part of the table key.
+- **Async tasks** that are part of the schedule: a task awaits *bridges* that
+  run closures with system parameters at its place in the frame. Closures may
+  borrow the task's locals mutably; nothing needs to be `Send`.
+- **Remote bridges**: futures on any thread or runtime (tokio, a thread pool)
+  queue closures that run inside the frame, granted in parallel waves of
+  non-conflicting access checked with compile-time masks.
+- **Compile-time dependency graphs**: `ready((node(A, a), node(B, b).after(A)))`
+  is validated, ordered, and transitively reduced during const evaluation.
+
+### Smaller
+
+The library is about 12,000 lines with no dependencies; `bevy_ecs` 0.20.1's
+`src/` alone is about 120,000. Startup is 14× faster and peak memory 17×
+lower in the simulation above, mostly because nothing is built at runtime that
+the compiler already knows.
+
+## Coming from Bevy
+
+| Bevy | static-ecs |
+|---|---|
+| `#[derive(Component)] struct Pos;` | `struct Pos;` |
+| `#[derive(Resource)]`, `Res`, `ResMut` | plain type, `Res`, `ResMut` |
+| `app.add_systems(Update, f)` then `app.update()` | `app.add_systems(Update, f).build()` then `app.emit(&Update)` |
+| events or observers | payload labels: `app.emit(&Damage(5))` |
+| `impl Plugin { fn build(&self, app) }` | `impl Plugin { type Components; fn systems<S>() }` |
+| `#[require(Pos)]` | `impl Requires for Bird { type Required = (Pos,); }` |
+| `#[component(immutable)]` | `impl Immutable for T {}` |
+| `#[derive(States)] enum`, `OnEnter(Game::Playing)` | `impl State for Playing { type Group = Game; }`, `OnEnter::<Playing>` |
+| component hooks, `on_add` | `add_systems(OnAdd::<T>, ...)` |
+| `ChildOf` / `Children` | `impl Relation for ChildOf { type Kind = OneToMany; }`, `To` / `From` |
+| `ParamSet` | disjoint filters, proven at compile time |
+| `ApplyDeferred` | commands apply when the `emit` finishes (hooks: before the operation returns) |
+
+## Guide
+
+### Schedules and events
+
+`add_systems(label, systems)` registers systems. The label's `Schedule` impl
+fixes what each system under it takes first:
 
 | Label | `impl` | First parameter | Runs |
 |---|---|---|---|
 | plain, e.g. `Update` | `impl Schedule for Update {}` | none | `app.emit(&Update)` |
 | payload, e.g. `Damage(u32)` | `type In = Ref<Self>;` | `&Damage` | `app.emit(&Damage(5))` |
-| lifecycle `OnAdd`/`OnInsert`/`OnReplace`/`OnRemove::<T>` | provided | `Trigger` | inside structural operations |
+| lifecycle `OnAdd`/`OnInsert`/`OnReplace`/`OnRemove::<T>` | provided | `Trigger` | inside structural changes |
 
 ```rust
 use static_ecs::prelude::*;
@@ -62,9 +221,7 @@ struct Health(u32);
 
 let mut app = App::new()
     .add_systems(Damage, |hit: &Damage, mut health: Query<&mut Health>| {
-        for mut health in &mut health {
-            health.0 = health.0.saturating_sub(hit.0);
-        }
+        health.iter_mut().for_each(|mut health| health.0 = health.0.saturating_sub(hit.0));
     })
     .build();
 let entity = app.world.spawn_bundle((Health(10),));
@@ -72,21 +229,13 @@ app.emit(&Damage(3));
 assert_eq!(app.world.get::<Health>(entity).unwrap().0, 7);
 ```
 
-- The input is mandatory for every system under a label, including each member
-  of a group (`(a, b).chain()`), `run_if` conditions, and graph nodes; a system
-  that does not take it fails to compile. Exclusive systems take it before the
-  world: `exclusive(|hit: &Damage, world: &mut World<_>| ...)`.
-- A label is a unit value (`Update`) or a tuple struct's constructor (`Damage`,
-  `OnInsert::<ChildOf>`), so payload labels need no dummy value. `()` is a
-  ready-made plain label.
-- Systems registered for the same label run in registration order as one
-  frame; emitting a label nobody registered for compiles to nothing. Lists live
-  inline as `Cons<On<Label, Systems>, Tail>`, and specialization selects the
-  matching registrations; there is no runtime label comparison.
+Systems registered for one label run in registration order as one frame.
+`()` is a ready-made plain label.
 
-A plugin is a type. It names the components (and relations) its systems use,
-then builds those systems for whatever world the app ends up with, so it never
-names that world:
+### Plugins
+
+A plugin names the components its systems use and builds those systems for the
+app's final world `S`:
 
 ```rust
 use static_ecs::prelude::*;
@@ -98,19 +247,15 @@ impl Schedule for Click {
 }
 pub struct Clicks(u32);
 
-pub struct Analytics<'a> {
-    pub total: &'a mut u32,
-}
-impl Plugin for Analytics<'_> {
+pub struct Analytics;
+impl Plugin for Analytics {
     type Components = (Clicks,);
     fn systems<S: Storage>(self) -> impl Systems<S> {
-        let mut count = 0;
         (
-            schedule(Click, move |click: &Click| {
-                count += 1;
-                *self.total += click.0 * count;
+            schedule(Click, |click: &Click, mut clicks: Query<&mut Clicks>| {
+                clicks.iter_mut().for_each(|mut c| c.0 += click.0)
             }),
-            // `S` is the app's world: systems that name it take it from here.
+            // Systems that name the world take it from `S`.
             schedule(Update, |mut commands: Commands<S>, mut q: Query<&Clicks>| {
                 if q.iter_mut().next().is_none() {
                     commands.spawn((Clicks(0),));
@@ -120,118 +265,84 @@ impl Plugin for Analytics<'_> {
     }
 }
 
-let mut total = 0;
-{
-    let mut app = App::new().add_plugins(Analytics { total: &mut total }).build();
-    app.emit(&Click(3));
-    app.emit(&Click(3));
-    app.emit(&Update);
-    assert_eq!(app.world.query::<&Clicks>().iter_mut().count(), 1);
-}
-assert_eq!(total, 9);
+let mut app = App::new().add_plugins(Analytics).build();
+app.emit(&Update);
+app.emit(&Click(3));
+assert_eq!(app.world.query::<&Clicks>().iter_mut().next().unwrap().0, 3);
 ```
 
-- `type Components` is a tuple of up to 32 component types; `type Relations`
-  (default `()`) a tuple of relations, installed once however many plugins
-  name them. A system using a component the plugin did not declare (and
-  nothing else stores) fails to compile at `build`.
-- `systems` returns `schedule(label, systems)`, `task(body)`, another plugin's
-  `systems::<S>()`, or a tuple of up to 16 of them, nested freely. Inside, `S`
-  is the final world: `Commands<S>`, `&mut World<S>`, `AsyncWorld<S>` (or
-  `_`). It is called once, by `build`, and its systems run where the plugin was
-  added among the app's registrations. A plugin's hooks run after the app's
-  own, and like all hooks they own what they capture (`'static`).
-- `add_plugins` takes a plugin, a `task(...)`, or a tuple of up to 16 of them,
-  applied left to right. The `demo/` crates compose two independent plugin
-  crates.
-- A plugin's systems are `Send` (they capture `Mutex`, atomics, or owned data,
-  not `RefCell` or `Rc`), so an app built from plugins can move to another
-  thread whenever its own systems can. They stay opaque in the app's type;
-  dispatch into them is resolved when the app is compiled, statically as for
-  any other system.
+`systems` returns `schedule(label, systems)`, `task(body)`, another plugin's
+systems, or tuples of them. `type Relations` (default `()`) installs relations
+once, however many plugins name them. A plugin's systems are checked against
+the world once, at `build`, which also keeps compile times down for large apps.
 
-`.build()` creates the world and checks every system against it.
+### The world
 
-## The inferred world
-
-Each system's type records what it accesses: `Query<(&mut Position, &Velocity),
-With<Active>>` mentions `Position`, `Velocity`, and `Active`. As the builder
-grows, it folds these into a component set, deduplicated by type at compile time,
-and `build` creates a `World` storing exactly that set. Component lookups stay
-compile-time constants.
-
-- `.register::<T>()` adds a component no system mentions, such as a tag only
-  inserted by `main` or an exclusive system. Using an unstored component is a
-  compile error that says so.
-- `.storage::<Sparse<T>>()` (or `Components<T, true>` for column change summaries)
-  chooses a component's storage. It must precede systems that use `T`; otherwise
-  compilation fails rather than silently keeping dense storage.
-- Exclusive systems name the world as `World<_>`, inferred at `build`. A
-  plugin's exclusive system can instead be generic over any world storing what
-  it needs: `fn tag_new<S: Stores<Tag>>() -> ExclusiveSystem<impl FnMut(&mut
-  World<S>)>`.
-
-The world exists only after `build`, so spawn entities afterwards. Changing a
-system changes the world's type; that is purely a compile-time effect.
-
-## Storage
-
-Entities are generational handles; archetype tables hold dense columns, and sparse
-components move without moving dense rows. A world can also be used without an
-app, by spelling its schema as nested pairs of `Components<T>` and `Sparse<T>`:
+`build` creates the world from what systems mention. `.register::<T>()` adds a
+component no system names (say, a tag only `main` inserts);
+`.storage::<Sparse<T>>()` picks sparse storage, which toggles without moving
+dense rows. A world can also be used alone, with its schema spelled out:
 
 ```rust
 use static_ecs::prelude::*;
 struct Position(f32);
 struct Velocity(f32);
 struct Active;
-type State = (Components<Position>, (Components<Velocity>, Components<Active>));
-let mut world = World::<State>::default();
+type Schema = (Components<Position>, (Components<Velocity>, Sparse<Active>));
+
+let mut world = World::<Schema>::default();
 let entity = world.spawn_bundle((Position(0.0), Velocity(2.0), Active));
-for (mut position, velocity) in &mut world.query_filtered::<(&mut Position, &Velocity), With<Active>>() {
-    position.0 += velocity.0;
-}
+world
+    .query_filtered::<(&mut Position, &Velocity), With<Active>>()
+    .iter_mut()
+    .for_each(|(mut p, v)| p.0 += v.0);
 assert_eq!(world.get::<Position>(entity).unwrap().0, 2.0);
 assert!(world.remove::<Active>(entity).is_some());
 assert!(world.despawn(entity));
 ```
 
-- `spawn`, `insert`, `remove`, `despawn`, `get`, `get_mut` work on any stored
-  component. `insert` and `remove` return the previous value.
-- `impl Immutable for T {}` makes `T` immutable: `&mut T` in queries and
-  `get_mut` do not compile, so it changes only by inserting a new value or
-  removing it, and its `OnReplace`/`OnInsert` hooks see every change.
-- `impl Requires for Bird { type Required = (Pos, Vel); }`: inserting `Bird`
-  also inserts `Pos::default()` and `Vel::default()` unless the entity has
-  them or the same bundle provides them, recursively and in the same table
-  move; their `OnAdd`/`OnInsert` hooks run after the bundle's. Storing `Bird`
-  stores what it requires, so required types need no registration. Each
-  archetype caches the result per bundle; bundles without requirements
-  compile to the plain path.
-- `impl OneOf for Walking { type Groups = (Locomotion, Life); }`: an entity
-  holds at most one member of each group. Inserting `Walking` removes the
-  entity's other `Locomotion` and `Life` members in the same table move:
-  their `OnReplace` and `OnRemove` hooks run first, with the old values
-  readable, then they are dropped. Membership is per group, not transitive:
-  `Running` (`Locomotion`) and `Dead` (`Life`) may coexist. A bundle with two
-  members sharing a group does not compile; a requirement shared with an
-  inserted member's group panics on the first such insert. Bundles without
-  members or requirements compile to the plain path. Filters on members
-  sharing a group (`With<Walking>`, `With<Running>`, `Added`, `Changed`)
-  never match one entity, so writers filtered by each run in parallel and
-  may share a system; members of unrelated groups still conflict.
-- Tuple bundles (1–16 components) work with `spawn_bundle`, `spawn_batch`,
-  `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
-  multi-component transitions in a small table keyed by a compile-time hash of
-  the bundle's component indices; single components use per-archetype arrays.
-- Structural changes need `&mut World`: between emissions, in `exclusive`
-  systems, or in payload handlers.
+Entities are generational handles; tables hold dense columns. Tuple bundles of
+1–16 components need no declaration.
 
-## Resources
+### Component behavior
 
-Resources are components of one hidden entity, made by the first insert.
-Queries never see it: its tables stay out of the component index, so this
-costs nothing per query or row.
+Three one-line traits change what a component means. Types without them
+compile to the plain insert path.
+
+```rust
+use static_ecs::prelude::*;
+struct Locomotion;
+#[derive(Default)]
+struct Speed(f32);
+struct Walking;
+struct Running;
+impl OneOf for Walking { type Groups = (Locomotion,); }
+impl OneOf for Running { type Groups = (Locomotion,); }
+// Walking or running brings a Speed.
+impl Requires for Walking { type Required = (Speed,); }
+impl Requires for Running { type Required = (Speed,); }
+// An id that never changes in place.
+struct Id(u64);
+impl Immutable for Id {}
+
+let mut world = App::new().register::<Walking>().register::<Running>().register::<Id>().build().world;
+let entity = world.spawn_bundle((Id(7), Walking));
+assert!(world.get::<Speed>(entity).is_some()); // required, as Default
+world.insert(entity, Running); // replaces Walking in the same move
+assert!(world.get::<Walking>(entity).is_none());
+```
+
+- **`Requires`**: inserting the component also inserts what it requires as
+  `Default`, recursively, unless present or given, in one table move.
+- **`OneOf`**: an entity holds at most one member of each group; a component
+  may join up to 8 groups. Removed members' `OnReplace`/`OnRemove` hooks run
+  first, with the old value readable. Exclusion is per group, not transitive.
+- **`Immutable`**: no `&mut` access compiles, so the value changes only by
+  insert or removal, and its hooks see every change.
+
+### Resources
+
+Resources are components of a hidden entity that queries never see.
 
 ```rust,ignore
 App::new()
@@ -240,19 +351,13 @@ App::new()
     .add_systems(Update, |gravity: Res<Gravity>, mut score: ResMut<Score>| score.0 += 1)
 ```
 
-- `Res<T>` reads (as `Read<T>`), `ResMut<T>` writes with change detection (as
-  `Write<T>`), so they schedule like queries of `T`. A missing resource skips
-  the system, like `Single`; `Option<Res<T>>` (any `Option<P>`) runs anyway.
-- `world.insert_resource`, `init_resource`, `remove_resource`, `resource`,
-  `resource_mut`; `commands.insert_resource`/`remove_resource`. Builder
-  resources are inserted at `build` in order, after hooks are installed.
-- Hooks fire as for any component. `ResMut` of an `Immutable` resource does
-  not compile.
+`Res`/`ResMut` schedule like queries of `T`. A missing resource skips the
+system; `Option<Res<T>>` (any `Option<P>`) runs anyway. Worlds and `Commands`
+insert and remove resources too.
 
-## States
+### States
 
-One type per state; a group has at most one active state, stored as an
-`Immutable` resource.
+Each state is its own type, so its data needs no enum matching:
 
 ```rust,ignore
 struct Game;
@@ -265,98 +370,48 @@ App::new()
     .init_state(Menu)
     .add_sub_state::<Playing, Running>() // Running::default() while Playing
     .add_computed_state(|p: &Playing| (p.level >= 3).then_some(Hard))
-    .add_systems(OnEnter::<Playing>, |mut commands: Commands<_>| { /* ... */ })
+    .add_systems(OnEnter::<Playing>, |playing: Res<Playing>| { /* ... */ })
     .add_systems(OnTransition::<Menu, Playing>, spawn_level)
     .add_systems(Update, tick.run_if(in_state::<Playing>()))
 ```
 
-- `world.set_state(Playing { level: 2 })` (or `commands.set_state`) exits the
-  group's active state, then enters the new one; `clear_state::<Game>()`
-  leaves none. New data in the same state type is a transition too: states
-  are never compared.
-- `OnExit<T>` runs before `T` is removed (still readable as `Res<T>`),
-  `OnEnter<T>` after it is inserted, `OnTransition<A, B>` after entering `B`
-  directly from `A`. They are `OnReplace`/`OnInsert` hooks of the state
-  resource and take no `Trigger`.
-- Substates and computed states follow one parent state: they exit before it,
-  innermost first, and enter after it, outermost first. A computed state is
-  recomputed whenever its parent is entered. Setting a substate while its
-  parent is inactive is ignored (a debug panic). Each group follows at most
-  one parent, so substates cannot form a cycle.
-- A transition is atomic: commands its hooks queue apply after it, substates
-  included.
-- `Res<Playing>` gates a system on the state already; `in_state::<T>()` is
-  the run condition. `insert_resource` of a state does not compile.
+`world.set_state(Playing { level: 2 })` (or through `Commands`) exits the
+group's active state and enters the new one. Substates and computed states
+exit innermost first and enter outermost first; a transition is atomic, so
+commands its hooks queue apply after all of it.
 
-## Queries
+### Queries
 
-- `Query<D, F>`: `D` is `&T`, `&mut T`, `Entity`, `Option<D>` (every row,
-  `None` where `D` does not match; schedules like `D`), `Has<T>` (whether the
-  row has `T`, a `bool`; reads table membership only, so it never conflicts
-  with writers of `T`), joins, or tuples of up to 16 of those. `F` is
-  `With<T>`, `Without<T>`, `Added<T>`, `Changed<T>`, `Related<R>`,
-  `Relinked<R>`, tuples of up to 16 (and), or `Or<(F, G, ...)>`.
-- `Single<D, F>` requires exactly one match; otherwise the system is skipped
-  without running or advancing its locals.
-- Registered queries cache matching archetypes and scan only new ones.
-- `query.get_mut(entity)` returns one entity's item if it matches the query and
-  its filters, including row filters such as `Changed`.
-- `query.contiguous_mut()` yields one slice per matching table, or an error for
-  row filters and fragmented rows.
-- `world.query`, `world.query_filtered`, and `world.single` work outside systems.
+- `Query<D, F>`: `D` is `&T`, `&mut T`, `Entity`, `Option<D>`, `Has<T>`,
+  relation joins, or tuples of up to 16. `F` is `With`, `Without`, `Added`,
+  `Changed`, `Related`, `Relinked`, tuples (and), or `Or<(...)>`.
+- `Single<D, F>` requires exactly one match, otherwise the system is skipped.
+- Prefer `for_each` (or `contiguous_mut` for slices) in hot loops: it runs one
+  tight, vectorizable loop per table. A `for` loop goes through `next`.
+- Change detection: mutable items are `Mut<T>`, marking rows changed on write.
+  `Components<T, true>` adds per-column summaries so `Added`/`Changed` skip
+  whole columns.
 
-Mutable items are `Mut<T>`: mutable dereferencing marks the row changed. Each
-system has its own change window; skipped systems keep pending changes.
-`Components<T, true>` enables per-column change summaries that let
-`Added`/`Changed` skip whole columns. A summary is raised once per table when a
-query fetches the column mutably, so per-row loops do no atomic work; columns
-fetched for writing but left unchanged are scanned, not skipped.
-
-Iterate hot queries with `for_each` (or `contiguous_mut`): it runs one tight,
-vectorizable loop per table. A `for` loop goes through `next` and stays scalar.
-
-Change ticks are a Lamport clock carried along the schedule rather than a shared
-counter: a writer issues the next tick on its own path, joins take the maximum,
-and the world stores the result when the frame ends. Systems that conflict are
-always ordered, so every write is either visible to a reader's current window
-or to its next one. Unordered, non-conflicting writers may share a tick value.
-
-## Systems and composition
-
-Systems are functions or closures taking their label's input (if any), then up
-to 16 parameters: `Query`, `Single`, `Res<T>`, `ResMut<T>`, `Option<P>`,
-`Local<T>` (per-registration state), and `Commands<_>`.
+### Composing systems
 
 ```rust,ignore
 app.add_systems(Update, ((integrate, decay).parallel(), validate).chain().run_if(running))
 ```
 
-- Tuples (2–16) run in order; `.chain()` states it explicitly.
-- `.parallel()` runs branches concurrently. Overlapping access fails to compile;
-  complementary filters (`With<T>`/`Without<T>`) prove disjointness.
-- `.run_if(condition)` runs a read-only boolean system before the group.
-- `exclusive(|world| ...)` gets `&mut World` and conflicts with everything.
-- `System::run(input, world)` runs a converted system directly (`NoInput` for
-  plain systems).
-- `ready((node(A, a), node(B, b).after(A), ...))` builds a dependency graph of up
-  to `MAX_NODES` nodes (nest graphs for more). Labels, missing dependencies, and
-  cycles are checked at compile time; conflicting unordered nodes are ordered
-  deterministically and transitive edges removed, all during const evaluation.
+Tuples run in order, `.parallel()` runs branches concurrently (or fails to
+compile), `.run_if` gates a group on a read-only boolean system,
+`exclusive(|world: &mut World<_>| ...)` gets the whole world, and
+`ready((node(...), ...))` builds a checked dependency graph. Systems take up to
+16 parameters: `Query`, `Single`, `Res`, `ResMut`, `Option<P>`, `Local<T>`,
+`Commands<_>`.
 
-`ExecutionMode::Serial` runs everything on the calling thread without workers.
-
-`Commands<_>` records structural changes (`spawn`, `insert`, `remove`,
-`despawn`, or `queue` any `FnOnce(&mut World<S>)`) without structural access, so
-it runs in parallel groups. `spawn` reserves the entity immediately; later
-commands can use it. Each system's commands are stored inline in its own queue
-(no boxing, no locks) and applied when the `emit` that ran it finishes, in system
-order (`System::run` applies right after the run). Commands on entities
-despawned before they apply do nothing. Like `World<_>`, the parameter names the
-world, so components only ever inserted through commands must be registered.
+`Commands` record structural changes without structural access, so they run in
+parallel groups. Each system's commands live inline in its own queue (no
+boxing, no locks) and apply when the `emit` finishes, in system order.
 
 ### Hooks
 
-Hooks are systems under a lifecycle label; their input is a `Trigger`:
+Hooks are systems under lifecycle labels:
 
 ```rust
 use static_ecs::prelude::*;
@@ -375,35 +430,23 @@ let entity = app.world.spawn_bundle((Health(10),));
 assert!(app.world.get::<Alive>(entity).is_some()); // applied before spawn returned
 ```
 
-- `OnAdd<T>` (newly added), `OnInsert<T>` (any write), `OnReplace<T>` (before an
-  existing value is overwritten, removed, or despawned), `OnRemove<T>` (before
-  removal or despawn). Several hooks for one label run in registration order.
-- `Trigger` holds the affected entities: one per call, all of a `spawn_batch`.
-- Hooks run serially inside the structural operation, so they take system
-  parameters only (`Query`, `Single`, `Local`, `Commands`); exclusive hooks fail
-  to compile. Their commands apply, breadth first, before the outermost
-  structural operation returns.
-- The built world owns its hooks, which must be `Send + Sync + 'static`. Each
-  (component, label) with hooks compiles to one function running all of them;
-  an operation reaches it through one table lookup and indirect call. Worlds
-  without hooks skip the table entirely.
+`OnAdd` (newly added), `OnInsert` (any write), `OnReplace` (before an old value
+is overwritten or removed), `OnRemove`. Their commands apply before the
+outermost structural operation returns. Each (component, label) pair compiles
+to one function; worlds without hooks skip the lookup entirely.
 
 ### Relations
 
-A relation is a type; its value is the edge's data. Relate by inserting
-`R.to(target)` like any component, then read across edges inside queries:
+A relation is a type whose value is the edge's data. Insert `R.to(target)`
+like any component, then read across edges inside queries:
 
 ```rust
 use static_ecs::prelude::*;
 use static_ecs::{From, To}; // not in the prelude: `From` would shadow std's
 
-struct DockedAt { berth: u8 } // edge data
+struct DockedAt { berth: u8 }
 impl Relation for DockedAt {
     type Kind = OneToMany; // each ship docks at one station
-}
-struct Allied;
-impl Relation for Allied {
-    type Kind = ManyToMany;
 }
 struct Follows;
 impl Relation for Follows {
@@ -419,7 +462,6 @@ impl Schedule for Update {}
 
 let mut app = App::new()
     .relation::<DockedAt>()
-    .relation::<Allied>()
     .relation::<Follows>()
     .register::<Name>()
     // Many ships share a station: `&mut` across that edge is one row at a time.
@@ -445,74 +487,30 @@ let lead = world.spawn_bundle((Name("Kestrel"), Cargo(5), Pos(100), Gap(0)));
 let wing = world.spawn_bundle((Name("Osprey"), Cargo(7), Pos(0), Gap(-10), Follows.to(lead)));
 world.insert(lead, DockedAt { berth: 2 }.to(station));
 world.insert(wing, DockedAt { berth: 3 }.to(station));
-world.relate(lead, Allied, wing);
 app.emit(&Update);
-let world = &mut app.world;
-assert_eq!(world.get::<Cargo>(station).unwrap().0, 12);
-assert_eq!(world.get::<Pos>(wing).unwrap().0, 90);
+assert_eq!(app.world.get::<Cargo>(station).unwrap().0, 12);
+assert_eq!(app.world.get::<Pos>(wing).unwrap().0, 90);
 
-// Edge data and the target, side by side; `From` lists a target's sources.
-let mut ships = world.query::<(&Name, &Relates<DockedAt>, To<DockedAt, &Name>)>();
-let (name, dock, at) = ships.get_mut(wing).unwrap();
-assert_eq!((name.0, dock.berth, at.unwrap().0), ("Osprey", 3, "Ceres"));
-let mut stations = world.query::<From<DockedAt, &Name>>();
+// `From` lists a target's sources.
+let mut stations = app.world.query::<From<DockedAt, &Name>>();
 assert_eq!(stations.get_mut(station).unwrap().count(), 2);
-let mut allies = world.query::<To<Allied, &Name>>();
-assert_eq!(allies.get_mut(lead).unwrap().map(|n| n.0).collect::<Vec<_>>(), ["Osprey"]);
 ```
 
-- **Writing links.** Insert `R.to(target)` (in spawn bundles and commands
-  too); inserting again retargets, and for many-to-many replaces every edge.
-  `relate(source, value, target)` adds one edge (or replaces its value);
-  removing `Relates<R>`, `unrelate`, or despawning either side unlinks.
-  `Relates<R>` and `Sources<R>` are `Immutable`: `&mut` to them does not
-  compile, since swapping two rows' lists would corrupt the index. A
-  relation with a one-side refuses self-edges; an `ACYCLIC` one refuses edges
-  closing a cycle; `LINKED` despawns sources with their target.
-- **Joins.** `To<R, Q>` fetches `Q` on the row's targets, `From<R, Q>` on its
-  sources; entities not matching `Q` are skipped. The item follows
-  cardinality at compile time:
+| | `OneToOne` | `OneToMany` | `ManyToMany` |
+|---|---|---|---|
+| `To<R, Q>` | `Option` | `Option` | iterator |
+| `From<R, Q>` | `Option` | iterator | iterator |
 
-  | | `OneToOne` | `OneToMany` | `ManyToMany` |
-  |---|---|---|---|
-  | `To<R, Q>` | `Option` | `Option` | iterator |
-  | `From<R, Q>` | `Option` | iterator | iterator |
+`ACYCLIC` refuses edges that would close a cycle, `LINKED` despawns sources
+with their target, and `FRAGMENTING` makes the target part of the table key so
+one target's sources are contiguous. Links are `Immutable`, so `&mut` access
+cannot corrupt the edge index.
 
-  Joins nest (`From<ChildOf, From<ChildOf, Entity>>`) and schedule like the
-  components they reach.
-- **Mutable joins.** Checked at compile time per relation: many-to-many joins
-  never write; two joins in one row cannot conflict (both may reach one
-  entity), nor can nested joins with anything. `From<R, &mut T>` on a
-  one-source relation and `OneToOne` joins give distinct values per row, so
-  `iter_mut` and `for` work. When rows can share a value (`To<OneToMany, &mut
-  T>`, or a row writing `T` while joining `&T`), iterate with `each` or
-  `iter_lending()` / `fetch_next()`, which keep one row alive at a time.
-  `cascade` is `each` in parent-first order along the query's leading
-  `To<R, _>` (one-target, `ACYCLIC`).
-- **Storage.** Non-fragmenting (default): `Relates<R>` holds a source's
-  targets and edge value, `Sources<R>` a target's sources; each entry stores
-  its index in the other side's list, so unlinking is O(1). Fragmenting
-  (`const FRAGMENTING: bool = true`, data-less, one-to-many or many-to-many):
-  the `(relation, target)` pair is part of the source's table key and stored
-  nowhere else; one target's sources are contiguous, `To` resolves a table's
-  target once and `From` walks whole tables through a pair index. Relating is
-  one table move; the costs are a table per distinct target set (dead ones
-  reused) and a pair-index lookup per fragmenting relation on despawn.
-- **Filters and walks.** `Related<R>` matches sources; `Relinked<R>` those
-  whose links changed since the system last ran. `world.targets`/`sources`/
-  `descendants::<R>(entity)` iterate either storage, parents before children.
-  `.relation::<R>()` installs a relation; relating an uninstalled one panics
-  (non-fragmenting) or fails to compile (fragmenting).
+### Async tasks and remote bridges
 
-### Tasks and bridges
-
-`task(body)` is a plugin: an async body the app owns and polls during `emit`.
-It sits in registration order like a system, under every label at once. A
-bridge, `world.bridge(Label, |params...| ...)`, runs a closure with system
-parameters (`Query`, `Single`, `Commands`, `Local`, or `&mut World<_>` alone)
-when the task's position is reached while that label is emitted: after the
-systems registered before it, before those after. Its commands apply before
-it returns, so the next bridge sees them.
+`task(body)` is a plugin: an async body polled during `emit`, at its place in
+the schedule. A bridge runs a closure with system parameters when the frame
+reaches the task:
 
 ```rust
 use static_ecs::prelude::*;
@@ -549,150 +547,50 @@ let mut log = Vec::new();
 assert_eq!(log, [2, 1]);
 ```
 
-- A task starts at the first `emit`. Afterwards it is polled when an emit
-  reaches it on a label it waits on, or after a waker (e.g. a channel or I/O
-  future) wakes it; otherwise a visit is a few loads. A bridge site runs once
-  per visit: the loop above runs once per `emit`, while a chain of different
-  bridges completes in one.
-- `bridge` fails with `BridgeError::Invalid` if a parameter cannot be fetched
-  (a `Single` without exactly one match); `until` waits for the label's next
-  emit instead, e.g. until another plugin has spawned what this one needs.
-- `world.state()` keeps parameter state across bridges: `Local`s persist,
-  `Changed` sees changes since its previous bridge, and query caches stay warm,
-  so bridging through it allocates nothing (one-shot bridges build fresh state).
-- Bridges run with exclusive world access and cannot nest. Components they use
-  are checked against the world at `build` but are not inferred from them
-  (the async body is opaque): `.register::<T>()` them, as the example does, or
-  use them in a system.
-- Nothing requires `Send`. A task that is `Send` runs wherever the frame's
-  invocation reaches it, possibly a worker; with a non-`Send` task the app
-  runs each registration as its own invocation on the calling thread.
+Futures elsewhere (tokio, other threads) reach the world through a sync point:
+place `sync_point(Net)` in the schedule and call `world.remote().bridge(Net,
+...)` from anywhere. The driver grants queued bridges in parallel waves of
+non-conflicting access; warm bridges allocate nothing, and an idle sync point
+costs one load. [`examples/tokio_web.rs`](examples/tokio_web.rs) fetches pages
+on tokio and inserts the responses while frames keep running.
 
-### Remote bridges
+### Execution model
 
-Futures on other threads or runtimes (tokio, a thread pool) bridge in through
-sync points. A sync point is a marker type: `impl SyncPoint for Net {}`.
-`sync_point(Net)` is the system that drives it; place it under a label like
-any system (`add_systems(Update, sync_point(Net))`, or inside a chain,
-parallel group, or graph). A world's `Remote` (`world.remote()`, or a
-`&Remote<_>` system parameter) reaches every sync point from anywhere:
-`remote.bridge(Net, ...)`. Placing the driver declares `Net` in the inferred
-schema, so its queue sits at a compile-time index in the world, and bridging
-to a point the app never places fails to compile.
-[`examples/tokio_web.rs`](examples/tokio_web.rs) fetches pages on a tokio
-runtime and inserts the responses as components while frames keep running.
+- **One invocation per emit**: every system under the label runs as one chain
+  of typed continuations; sequences, conditions, parallel groups, and graphs
+  lower into it.
+- **Persistent workers**: `WorkerPool::new(n)` starts `n - 1` threads; the
+  caller is worker 0 and helps while it waits. Idle workers steal unstarted
+  branches, spin briefly, then park. Without `install`, a process-wide pool
+  sized by `available_parallelism` is used. `ExecutionMode::Serial` uses no
+  workers at all.
+- **Panics** cancel unpublished work; `emit` resumes the first panic after
+  every published branch finished. The pool stays usable.
 
-```rust
-use static_ecs::prelude::*;
-struct Update;
-impl Schedule for Update {}
-struct Net;
-impl SyncPoint for Net {}
-struct Score(u32);
+## Tradeoffs
 
-let mut app = App::new()
-    .register::<Score>()
-    .add_systems(Update, sync_point(Net))
-    .build();
-let entity = app.world.spawn_bundle((Score(0),));
-let remote = app.world.remote();
-let worker = std::thread::spawn(move || {
-    let mut fetched = 40; // e.g. from the network; borrowed mutably below
-    let bridge = remote.bridge(Net, |mut q: Query<&mut Score>| {
-        fetched += 2;
-        q.get_mut(entity).unwrap().0 = fetched;
-    });
-    // Any executor works; this one just re-polls.
-    let mut bridge = std::pin::pin!(bridge);
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    while bridge.as_mut().poll(&mut cx).is_pending() {
-        std::thread::yield_now();
-    }
-});
-while !worker.is_finished() {
-    app.emit(&Update);
-}
-assert_eq!(app.world.get::<Score>(entity).unwrap().0, 42);
+- **Nightly only**, on incomplete language features.
+- **Compile time** grows with the app: every system is part of one type. The
+  4,113-system benchmark type-checks in about 44 s as loose systems, or 4.7 s
+  when registered through a plugin (checked once at `build`).
+- **Debug binaries are large**: the app's type names are enormous, and full
+  debug info stores them (2.3 GB for the benchmark). In the crate that builds
+  the app, `[profile.dev] debug = "line-tables-only"` roughly halves that.
+- **No runtime system registration**: the schedule is fixed when the app type
+  is compiled. Changing a system changes the world's type.
+- Very long chains may need a higher `#![recursion_limit]`; graph compile time
+  grows quadratically with nodes per graph; parallel groups need `Send`
+  systems.
+- Not yet: observers, and Bevy's broader engine (rendering, assets, input).
+  The [`demo/`](demo) crates show apps built on plugins, including a
+  CPU-rendered Wayland client whose first frame is drawn 1.5 ms after launch.
+
+## Run it
+
+```sh
+cargo run --release --example simulation
+cargo run --release --example relations
+cargo run --release --example tokio_web   # remote bridges from tokio (network)
+cargo run --release -p flappy             # CPU-rendered Wayland client
+cargo test --workspace --release
 ```
-
-- The driver grants queued bridges in **waves** of non-conflicting access,
-  checked with compile-time component masks: each granted closure runs on its
-  own task's thread, in parallel with the rest of its wave, so closures need
-  not be `Send` and may borrow the caller's locals. The driver then applies
-  their commands in grant order and grants the next wave. Exclusive
-  (`&mut World<_>`) bridges and bridges sharing one `remote.state()` never
-  share a wave.
-- Synchronization is one short lock around the request list (enqueue,
-  admission, cancellation), a release/acquire pair per grant, and one
-  decrement per completion. Requests live inside their pinned futures, so warm
-  bridges allocate nothing on either side; an idle sync point is one load.
-- A bridge site runs once per task per drive: a remote loop runs once per
-  emit, and a chain of different bridges may finish in one drive if each step
-  is queued before the driver's last wave.
-- `until` retries at later drives; dropping a pending future withdraws it,
-  even after it was granted. Dropping the world closes its sync points:
-  pending and later bridges fail with `BridgeError::Closed`.
-- The driver waits for granted bridges, so poll remote bridges on threads
-  other than the app's. Inside a task, use `AsyncWorld::bridge`; awaiting a
-  remote bridge there panics rather than deadlocking.
-- **Envelopes.** By default a sync point is exclusive: it orders against
-  everything and applies each wave's commands at once. With `type Env =
-  Query<'static, &'static mut Score>;` (system parameters: one, or a tuple
-  of up to 16) its driver runs in parallel with systems that do not
-  conflict with the envelope, the envelope's components join the inferred
-  world, a bridge reaching outside it fails to compile, and commands (always
-  allowed) apply when the emit ends.
-- One point placed twice is driven by one driver at a time. While an
-  envelope point waits for its bridges, its worker stays useful: it lends its
-  slot to the pool before granting, runs branches published to it meanwhile,
-  and holds the slot again once the wave is done.
-
-## Execution model
-
-A frame is one compiled program:
-
-- **One invocation per emit.** Every handler registered for the event runs as a
-  single chain of typed continuations, with no barrier between registrations.
-  Nested sequences, conditions, parallel groups, and graphs lower into the same
-  chain. Lists containing non-`Send` systems still work: each parallel group then
-  runs as its own invocation.
-- **Straight-line code is inlined.** A system's successor is a type, so sequences
-  compile to direct, inlinable calls. A continuation reachable from several places
-  (after a join, either side of a condition, a published branch) is emitted once
-  out of line, so code size grows linearly with the schedule. Outlined
-  continuations are returned to a loop rather than called, so stack depth stays
-  constant across any number of joins.
-- **Synchronization only at forks and joins.** No system touches shared state to
-  run. A fork publishes its second branch only if a worker is idle; otherwise both
-  branches run here without atomic read-modify-write operations. A cross-worker
-  join costs two atomic operations per arrival (count and clock).
-- **Persistent workers.** `WorkerPool::new(n)` starts `n - 1` threads; the caller is
-  worker 0 and helps while it waits. Each worker has one publication slot.
-  Idle workers steal unstarted branches, spin briefly, then park.
-  `with_min_parallel_work(k)` keeps branches smaller than `k` systems local.
-- **Panics.** A panic cancels unpublished work. `emit` returns only after every
-  published branch has finished, then resumes the first panic on the caller.
-  Completed mutations are not rolled back; the pool stays usable.
-
-Without `install`, a process-wide pool sized by `available_parallelism` is used.
-Callers sharing a pool serialize their invocations; nested emits inside systems
-run serially.
-
-Debug builds: every system is part of one concrete type, and those type names
-are enormous. Full debug info stores them, making debug binaries gigabytes large
-(2.3 GB for the 4,113-system benchmark). Set this in the crate that builds the
-app (where the concrete types are compiled) to roughly halve that:
-
-```toml
-[profile.dev]
-debug = "line-tables-only" # keeps file:line backtraces
-```
-
-Limits: very long continuation chains may need a higher `#![recursion_limit]` in
-the crate that builds the app. Graph compile time grows quadratically with nodes
-per graph. Parallel groups need `Send` systems and `Send + Sync` world data.
-Missing Bevy features include observers, states, resources as a separate store,
-and runtime system registration.
-
-Benchmarks against Bevy 0.20 are in [BENCHMARKS.md](BENCHMARKS.md).
