@@ -984,3 +984,68 @@ fn cascade_inside_a_system_propagates_every_frame() {
     app.emit(&Update);
     assert_eq!(globals(&app.world), [102, 12, 2]);
 }
+
+#[test]
+fn joins_follow_retargets_and_despawns_in_both_storages() {
+    use static_ecs::{From, To};
+    let mut app = App::new()
+        .relation::<DockedAt, _>()
+        .relation::<InSquad, _>()
+        .register::<Name>()
+        .build();
+    let world = &mut app.world;
+    let [a, b] = [10, 11].map(|i| world.spawn_bundle((Name(i),)));
+    let unit = world.spawn_bundle((Name(1), DockedAt { berth: 0 }.to(a), InSquad.to(a)));
+    let read = |world: &mut World<_>| {
+        let mut q = world.query::<(To<DockedAt, &Name>, To<InSquad, &Name>)>();
+        let (docked, squad) = q.get_mut(unit).unwrap();
+        (docked.map(|n| n.0), squad.map(|n| n.0))
+    };
+    let crew = |world: &mut World<_>, e| {
+        let mut q = world.query::<(From<DockedAt, Entity>, From<InSquad, Entity>)>();
+        let (docked, squad) = q.get_mut(e).unwrap();
+        (docked.count(), squad.count())
+    };
+    assert_eq!(read(world), (Some(10), Some(10)));
+    // Retargeting moves the fragmenting source to another table: the table's
+    // resolved target follows.
+    world.insert(unit, InSquad.to(b));
+    world.relate(unit, DockedAt { berth: 1 }, b);
+    assert_eq!(read(world), (Some(11), Some(11)));
+    assert_eq!((crew(world, a), crew(world, b)), ((0, 0), (1, 1)));
+    // A despawned target unlinks: both joins come back empty.
+    world.despawn(b);
+    assert_eq!(read(world), (None, None));
+}
+
+#[test]
+fn spawning_toward_a_target_despawned_in_the_same_flush_links_nothing() {
+    struct Update;
+    impl Schedule for Update {}
+    struct Station(Entity);
+    let mut app = App::new()
+        .relation::<DockedAt, _>()
+        .relation::<InSquad, _>()
+        .register::<Name>()
+        .add_systems(Update, |s: Single<&Station>, mut commands: Commands<_>| {
+            commands.spawn((Name(1), DockedAt { berth: 0 }.to(s.0), InSquad.to(s.0)));
+            commands.despawn(s.0);
+            commands.spawn((Name(2), DockedAt { berth: 0 }.to(s.0), InSquad.to(s.0)));
+        })
+        .build();
+    let station = app.world.spawn_bundle((Name(9),));
+    app.world.spawn_bundle((Station(station),));
+    app.emit(&Update);
+    let world = &mut app.world;
+    assert!(!world.contains(station));
+    let ships: Vec<_> = world
+        .query::<(Entity, &Name)>()
+        .iter_mut()
+        .map(|(e, _)| e)
+        .collect();
+    assert_eq!(ships.len(), 2);
+    for ship in ships {
+        assert!(world.get::<Relates<DockedAt>>(ship).is_none());
+        assert_eq!(world.targets::<InSquad>(ship).count(), 0);
+    }
+}

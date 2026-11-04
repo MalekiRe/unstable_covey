@@ -268,51 +268,119 @@ assert!(app.world.get::<Alive>(entity).is_some()); // applied before spawn retur
 
 ### Relations
 
-A relation kind fixes its cardinality and despawn behavior at compile time:
+A relation is a type; its value is the edge's data. Relate by inserting
+`R.to(target)` like any component, then read across edges inside queries:
 
 ```rust
 use static_ecs::prelude::*;
-struct ChildOf;
-impl Relation for ChildOf {
-    type Kind = OneToMany;    // or OneToOne, ManyToMany
-    const LINKED: bool = true; // despawning a parent despawns its children
-}
+use static_ecs::{From, To}; // not in the prelude: `From` would shadow std's
 
-let mut app = App::new().relation::<ChildOf, _>().build();
+struct DockedAt { berth: u8 } // edge data
+impl Relation for DockedAt {
+    type Kind = OneToMany; // each ship docks at one station
+}
+struct Allied;
+impl Relation for Allied {
+    type Kind = ManyToMany;
+}
+struct Follows;
+impl Relation for Follows {
+    type Kind = OneToMany;
+    const ACYCLIC: bool = true; // convoys have leaders: `cascade` walks them
+}
+struct Name(&'static str);
+struct Cargo(u32);
+struct Pos(i32);
+struct Gap(i32);
+struct Update;
+impl Schedule for Update {}
+
+let mut app = App::new()
+    .relation::<DockedAt, _>()
+    .relation::<Allied, _>()
+    .relation::<Follows, _>()
+    .register::<Name>()
+    // Many ships share a station: `&mut` across that edge is one row at a time.
+    .add_systems(Update, |mut ships: Query<(&Cargo, To<DockedAt, &mut Cargo>)>| {
+        ships.each(|(cargo, station)| {
+            if let Some(mut station) = station {
+                station.0 += cargo.0;
+            }
+        })
+    })
+    // Leaders before followers, so each reads its leader's new position.
+    .add_systems(Update, |mut convoy: Query<(To<Follows, &Pos>, (&Gap, &mut Pos))>| {
+        convoy.cascade(|(leader, (gap, mut pos))| {
+            if let Some(leader) = leader {
+                pos.0 = leader.0 + gap.0;
+            }
+        })
+    })
+    .build();
 let world = &mut app.world;
-let (parent, child) = (world.spawn(), world.spawn());
-world.relate(child, ChildOf, parent);
-assert_eq!(world.get::<Relates<ChildOf>>(child).unwrap().target(), parent);
-assert_eq!(world.get::<Sources<ChildOf>>(parent).unwrap().len(), 1);
-world.despawn(parent);
-assert!(!world.contains(child));
+let station = world.spawn_bundle((Name("Ceres"), Cargo(0)));
+let lead = world.spawn_bundle((Name("Kestrel"), Cargo(5), Pos(100), Gap(0)));
+let wing = world.spawn_bundle((Name("Osprey"), Cargo(7), Pos(0), Gap(-10), Follows.to(lead)));
+world.insert(lead, DockedAt { berth: 2 }.to(station));
+world.insert(wing, DockedAt { berth: 3 }.to(station));
+world.relate(lead, Allied, wing);
+app.emit(&Update);
+let world = &mut app.world;
+assert_eq!(world.get::<Cargo>(station).unwrap().0, 12);
+assert_eq!(world.get::<Pos>(wing).unwrap().0, 90);
+
+// Edge data and the target, side by side; `From` lists a target's sources.
+let mut ships = world.query::<(&Name, &Relates<DockedAt>, To<DockedAt, &Name>)>();
+let (name, dock, at) = ships.get_mut(wing).unwrap();
+assert_eq!((name.0, dock.berth, at.unwrap().0), ("Osprey", 3, "Ceres"));
+let mut stations = world.query::<From<DockedAt, &Name>>();
+assert_eq!(stations.get_mut(station).unwrap().count(), 2);
+let mut allies = world.query::<To<Allied, &Name>>();
+assert_eq!(allies.get_mut(lead).unwrap().map(|n| n.0).collect::<Vec<_>>(), ["Osprey"]);
 ```
 
-- `world.relate`/`unrelate` and `commands.relate`/`unrelate` are the only
-  writers. A one-target source moves to its new target; a one-source target
-  drops its previous source. `world.targets`/`sources` read either storage.
-- **Non-fragmenting** (default): entities with different targets share tables.
-  Sources hold `Relates<R>` (`targets()`, or `target()` for one target),
-  targets hold `Sources<R>` (`sources()`/`source()`); both are ordinary
-  components. Each entry stores its index in the other side's list, so
-  unlinking is O(1); one-sided ends store an `Option`, never a `Vec`. Two
-  hooks unlink (or, if `LINKED`, despawn) when either side goes.
-- **Fragmenting** (`const FRAGMENTING: bool = true`, one-to-many or
-  many-to-many): the `(relation, target)` pair is part of the source's table
-  key and stored nowhere else. One target's sources are contiguous; relating
-  or reparenting is one table move and leaves the target untouched; `From`
-  joins walk a target's source tables through a pair index, and `To` joins
-  resolve a table's target once.
-  Despawning a target despawns (`LINKED`) or detaches its sources through the
-  pair index, terminating on cycles. Costs: a table per distinct target set
-  (empty tables whose target died are reused) and a pair-index lookup per
-  fragmenting relation on each despawn. One-to-one fragmenting fails to
-  compile.
-- `Related<R>` matches sources of either storage. `.relation::<R, _>()`
-  installs a relation; relating an uninstalled one panics (non-fragmenting) or
-  fails to compile (fragmenting).
-- `world.targets`/`sources`/`descendants::<R>(entity)` iterate either storage;
-  `descendants` yields parents before children.
+- **Writing links.** Insert `R.to(target)` (in spawn bundles and commands
+  too); inserting again retargets, and for many-to-many replaces every edge.
+  `relate(source, value, target)` adds one edge (or replaces its value);
+  removing `Relates<R>`, `unrelate`, or despawning either side unlinks.
+  `Relates<R>` and `Sources<R>` are read-only otherwise: `&mut` to them does
+  not compile, since swapping two rows' lists would corrupt the index. A
+  relation with a one-side refuses self-edges; an `ACYCLIC` one refuses edges
+  closing a cycle; `LINKED` despawns sources with their target.
+- **Joins.** `To<R, Q>` fetches `Q` on the row's targets, `From<R, Q>` on its
+  sources; entities not matching `Q` are skipped. The item follows
+  cardinality at compile time:
+
+  | | `OneToOne` | `OneToMany` | `ManyToMany` |
+  |---|---|---|---|
+  | `To<R, Q>` | `Option` | `Option` | iterator |
+  | `From<R, Q>` | `Option` | iterator | iterator |
+
+  Joins nest (`From<ChildOf, From<ChildOf, Entity>>`) and schedule like the
+  components they reach.
+- **Mutable joins.** Checked at compile time per relation: many-to-many joins
+  never write; two joins in one row cannot conflict (both may reach one
+  entity), nor can nested joins with anything. `From<R, &mut T>` on a
+  one-source relation and `OneToOne` joins give distinct values per row, so
+  `iter_mut` and `for` work. When rows can share a value (`To<OneToMany, &mut
+  T>`, or a row writing `T` while joining `&T`), iterate with `each` or
+  `iter_lending()` / `fetch_next()`, which keep one row alive at a time.
+  `cascade` is `each` in parent-first order along the query's leading
+  `To<R, _>` (one-target, `ACYCLIC`).
+- **Storage.** Non-fragmenting (default): `Relates<R>` holds a source's
+  targets and edge value, `Sources<R>` a target's sources; each entry stores
+  its index in the other side's list, so unlinking is O(1). Fragmenting
+  (`const FRAGMENTING: bool = true`, data-less, one-to-many or many-to-many):
+  the `(relation, target)` pair is part of the source's table key and stored
+  nowhere else; one target's sources are contiguous, `To` resolves a table's
+  target once and `From` walks whole tables through a pair index. Relating is
+  one table move; the costs are a table per distinct target set (dead ones
+  reused) and a pair-index lookup per fragmenting relation on despawn.
+- **Filters and walks.** `Related<R>` matches sources; `Relinked<R>` those
+  whose links changed since the system last ran. `world.targets`/`sources`/
+  `descendants::<R>(entity)` iterate either storage, parents before children.
+  `.relation::<R, _>()` installs a relation; relating an uninstalled one panics
+  (non-fragmenting) or fails to compile (fragmenting).
 
 ### Tasks and bridges
 
