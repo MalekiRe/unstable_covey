@@ -160,6 +160,28 @@ Frame times are within run-to-run variation (the −7.4% row included); final
 states match in all 60 processes. Table creation now also compares pairs and
 maintains the pair index, visible as +0.5 ms init at 4,096 actors.
 
+## Relations redesign (`793da2e` → `b6436f9`)
+
+Joins (`To`/`From`), access split into own/direct/far, `cascade`, and every
+`QueryData::fetch` now receiving a `Reach` (world lookup context). The matched
+simulation uses no joins, so this measures their cost when unused. Five
+alternating repetitions per row, cores 4–7, no other load
+(`relations-redesign-paired.json`):
+
+| Actors | Workers | Before ms | After ms | Change | Init before/after ms |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0698 | 0.0701 | +0.5% | 1.6 / 1.6 |
+| 0 | 4 | 0.0287 | 0.0298 | +3.7% | 1.0 / 1.1 |
+| 4,096 | 1 | 1.248 | 1.263 | +1.2% | 3.7 / 3.7 |
+| 4,096 | 4 | 1.205 | 1.218 | +1.1% | 3.2 / 3.4 |
+| 100,000 | 1 | 98.6 | 100.9 | +2.4% | 131 / 131 |
+| 100,000 | 4 | 83.5 | 84.2 | +0.8% | 110 / 111 |
+
+Final states match in all 60 processes. Intermediate commits measured
+0.0365–0.0368 ms on the empty 4-worker row (+27%) while `b6436f9`, with more
+code, measured 0.0294: the same kind of build-to-build code generation swing
+as the schema change above, not a per-frame cost of the new paths.
+
 ## Schedule inputs (`3476d77` → current)
 
 Systems now receive their label's input through the frame, and `add_systems`
