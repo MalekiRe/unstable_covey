@@ -21,6 +21,7 @@ mod immutable;
 mod init;
 mod join;
 mod lookup;
+mod one_of;
 mod param;
 mod plan;
 mod plugin;
@@ -47,6 +48,7 @@ pub use hook::{Batch, Event, Hook, OnAdd, OnInsert, OnRemove, OnReplace, Trigger
 pub use immutable::Immutable;
 pub use join::{From, JoinKind, Joined, To};
 pub use lookup::ComponentLookup as Stores;
+pub use one_of::{GroupList, OneOf};
 pub use param::{Local, Res, ResMut};
 pub use plan::{
     ExclusiveSystem, ExecutionMode, FunctionSystem, Input, IntoSystemConfigs, IntoSystems, NoInput,
@@ -66,11 +68,11 @@ pub mod prelude {
     pub use crate::{
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
         Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice,
-        NoInput, OnAdd, OnEnter, OnExit, OnInsert, OnRemove, OnReplace, OnTransition, OneToMany,
-        OneToOne, Or, Plugin, Query, Ref, Related, Relates, Relation, Relinked, Remote, Requires,
-        Res, ResMut, Schedule, Single, Sources, Sparse, State, Storage, Stores, SyncPoint, Systems,
-        Trigger, With, Without, WorkerPool, World, exclusive, in_state, node, ready, schedule,
-        sync_point, task,
+        NoInput, OnAdd, OnEnter, OnExit, OnInsert, OnRemove, OnReplace, OnTransition, OneOf,
+        OneToMany, OneToOne, Or, Plugin, Query, Ref, Related, Relates, Relation, Relinked, Remote,
+        Requires, Res, ResMut, Schedule, Single, Sources, Sparse, State, Storage, Stores,
+        SyncPoint, Systems, Trigger, With, Without, WorkerPool, World, exclusive, in_state, node,
+        ready, schedule, sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

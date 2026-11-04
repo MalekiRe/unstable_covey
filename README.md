@@ -208,6 +208,15 @@ assert!(world.despawn(entity));
   stores what it requires, so required types need no registration. Each
   archetype caches the result per bundle; bundles without requirements
   compile to the plain path.
+- `impl OneOf for Walking { type Groups = (Locomotion, Life); }`: an entity
+  holds at most one member of each group. Inserting `Walking` removes the
+  entity's other `Locomotion` and `Life` members in the same table move:
+  their `OnReplace` and `OnRemove` hooks run first, with the old values
+  readable, then they are dropped. Membership is per group, not transitive:
+  `Running` (`Locomotion`) and `Dead` (`Life`) may coexist. A bundle with two
+  members sharing a group does not compile; a requirement shared with an
+  inserted member's group panics on the first such insert. Bundles without
+  members or requirements compile to the plain path.
 - Tuple bundles (1–16 components) work with `spawn_bundle`, `spawn_batch`,
   `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
   multi-component transitions in a small table keyed by a compile-time hash of

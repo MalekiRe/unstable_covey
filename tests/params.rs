@@ -685,6 +685,7 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         ("immutable_res_mut", Some("E0080")),
         ("state_insert_resource", Some("E0080")),
         ("required_unstored", Some("E0080")),
+        ("one_of_bundle", Some("E0080")),
     ] {
         std::fs::copy(
             root.join("tests/ui").join(format!("{fixture}.rs")),

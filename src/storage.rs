@@ -1,4 +1,5 @@
 use crate::init::Init;
+use crate::one_of::{MaybeOneOf, Sharing};
 use crate::require::{HasRequired, MaybeRequires, RequiredInit};
 use crate::{
     change::{Mut, SystemWorld},
@@ -13,6 +14,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     ops::{Deref, Index},
+    panic::AssertUnwindSafe,
     ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
@@ -241,6 +243,10 @@ impl ColumnPtr {
     pub(crate) unsafe fn value<T>(self, row: usize) -> *mut T {
         unsafe { self.data.cast::<T>().add(self.row(row)).as_ptr() }
     }
+    /// Row `row`'s value, untyped, for components of `size` bytes.
+    pub(crate) unsafe fn raw(self, row: usize, size: usize) -> *mut u8 {
+        unsafe { self.data.as_ptr().add(self.row(row) * size) }
+    }
     pub(crate) unsafe fn added(self, row: usize) -> *mut u64 {
         unsafe { self.added.add(self.row(row)).as_ptr() }
     }
@@ -410,16 +416,18 @@ struct Archetype {
     rows: Vec<usize>,
     components: Vec<usize>,
     transitions: Vec<[Option<NonZeroUsize>; 2]>,
-    /// Inserts of bundles whose members require components, resolved once.
-    required: Vec<RequiredMove>,
+    /// Inserts of bundles that require or exclude components, resolved once.
+    inserts: Vec<InsertMove>,
 }
-/// Inserting a requiring bundle from one archetype: its destination, and the
-/// required components it lacks there, written as `Default`.
-struct RequiredMove {
+/// Inserting a resolving bundle from one archetype: its destination, the
+/// required components it lacks there (written as `Default`), and the
+/// components sharing a `OneOf` group with what it adds (removed).
+struct InsertMove {
     key: u64,
     indices: &'static [usize],
     destination: usize,
     inits: Box<[RequiredInit]>,
+    displaced: Box<[usize]>,
 }
 /// Dynamic archetypes over a compile-time component vocabulary.
 pub struct World<S: Storage> {
@@ -641,7 +649,7 @@ impl<S: Storage> World<S> {
             rows: Vec::new(),
             components,
             transitions: vec![[None; 2]; S::LEN],
-            required: Vec::new(),
+            inserts: Vec::new(),
         };
         for &pair in &targets {
             self.pairs.entry(pair).or_default().push(id);
@@ -809,56 +817,94 @@ impl<S: Storage> World<S> {
             );
         }
     }
-    /// Where adding bundle B from `source` leads, and for requiring bundles
-    /// the cached entry listing the required components to write.
+    /// As `check_bundle`, plus: no two members share a `OneOf` group.
+    fn check_insert<B: Bundle<S>>() {
+        Self::check_bundle::<B>();
+        const {
+            assert!(
+                B::DISJOINT,
+                "two bundle members share a `OneOf` group: an entity holds at most one member of each group"
+            );
+        }
+    }
+    /// Where adding bundle B from `source` leads, and for resolving bundles
+    /// the cached entry listing what to write and what to remove.
     #[inline]
     fn adding<B: Bundle<S>>(&mut self, source: usize) -> (usize, usize) {
-        if !B::REQUIRES {
+        if !B::RESOLVES {
             return (self.destination::<B>(source, true), 0);
         }
         let entry = match self.archetypes[source]
-            .required
+            .inserts
             .iter()
             .position(|m| m.key == B::KEY && m.indices == B::INDICES)
         {
             Some(entry) => entry,
-            None => self.resolve_required::<B>(source),
+            None => self.resolve_insert::<B>(source),
         };
-        (self.archetypes[source].required[entry].destination, entry)
+        (self.archetypes[source].inserts[entry].destination, entry)
     }
     #[cold]
-    fn resolve_required<B: Bundle<S>>(&mut self, source: usize) -> usize {
-        let mut all = Vec::new();
-        B::required(&mut all);
+    fn resolve_insert<B: Bundle<S>>(&mut self, source: usize) -> usize {
+        let mut required = Vec::new();
+        B::required(&mut required);
         let mut signature = self.tables[source].present.clone();
-        let inits: Box<[RequiredInit]> = all
-            .into_iter()
+        let inits: Box<[RequiredInit]> = required
+            .iter()
+            .copied()
             .filter(|r| !signature[r.index] && !B::INDICES.contains(&r.index))
             .collect();
-        for &i in B::INDICES {
+        let added: Vec<usize> = B::INDICES
+            .iter()
+            .copied()
+            .chain(inits.iter().map(|r| r.index))
+            .collect();
+        let groups: Vec<_> = self
+            .info
+            .iter()
+            .map(|info| {
+                let mut ids = Vec::new();
+                (info.groups)(&mut ids);
+                ids
+            })
+            .collect();
+        let shares = |a: usize, b: usize| a != b && groups[a].iter().any(|g| groups[b].contains(g));
+        for r in &required {
+            if let Some(&a) = added.iter().find(|&&a| shares(a, r.index)) {
+                panic!(
+                    "inserting `{}` would remove `{}`, which the insert requires: they share a `OneOf` group",
+                    self.info[a].name, self.info[r.index].name
+                );
+            }
+        }
+        let displaced: Box<[usize]> = (0..S::LEN)
+            .filter(|&i| signature[i] && added.iter().any(|&a| shares(a, i)))
+            .collect();
+        for &i in &added {
             signature[i] = true;
         }
-        for r in &inits {
-            signature[r.index] = true;
+        for &i in &displaced {
+            signature[i] = false;
         }
         let destination = self.table_for(
             signature,
             self.tables[source].targets.clone(),
             self.tables[source].resource,
         );
-        let list = &mut self.archetypes[source].required;
-        list.push(RequiredMove {
+        let list = &mut self.archetypes[source].inserts;
+        list.push(InsertMove {
             key: B::KEY,
             indices: B::INDICES,
             destination,
             inits,
+            displaced,
         });
         list.len() - 1
     }
     /// Write the defaults of entry `entry` (from `source`) at `row` of `table`.
     #[inline]
     fn init_required(&self, source: usize, entry: usize, table: usize, row: usize, tick: u64) {
-        for r in &self.archetypes[source].required[entry].inits {
+        for r in &self.archetypes[source].inserts[entry].inits {
             // SAFETY: the destination has the column and reserved `row` for
             // this entity; the source lacked it, so it is uninitialized.
             unsafe { (r.init)(&self.tables[table], r.index, row, tick) };
@@ -867,19 +913,50 @@ impl<S: Storage> World<S> {
     /// Kind `K` hooks for the required components entry `entry` added.
     #[inline]
     fn fire_required<K: Kind>(&mut self, source: usize, entry: usize, entities: &[Entity]) {
-        if self.hooks.is_none() {
+        for i in 0..self.archetypes[source].inserts[entry].inits.len() {
+            let index = self.archetypes[source].inserts[entry].inits[i].index;
+            self.fire_index::<K>(index, entities);
+        }
+    }
+    /// Kind `K` hooks for the components entry `entry` removes.
+    #[inline]
+    fn fire_displaced<K: Kind>(&mut self, source: usize, entry: usize, entities: &[Entity]) {
+        for i in 0..self.archetypes[source].inserts[entry].displaced.len() {
+            let index = self.archetypes[source].inserts[entry].displaced[i];
+            self.fire_index::<K>(index, entities);
+        }
+    }
+    #[inline]
+    fn fire_index<K: Kind>(&mut self, index: usize, entities: &[Entity]) {
+        let Some(hooks) = self.hooks.as_ref() else {
             return;
+        };
+        let Some((run, list)) = hooks.entry(index, K::INDEX) else {
+            return;
+        };
+        let world: *mut Self = self;
+        // SAFETY: hooks reach the world only through `world`, and never
+        // move entities or change archetype caches.
+        unsafe { run(list, world, entities) };
+    }
+    /// Drop the values entry `entry` removes from `location`'s row; the move
+    /// then skips their columns. A panicking drop leaks the rest and is
+    /// returned, to resume once the move completes.
+    #[inline]
+    fn drop_displaced(&self, location: Location, entry: usize) -> std::thread::Result<()> {
+        let displaced = &self.archetypes[location.table].inserts[entry].displaced;
+        if displaced.is_empty() {
+            return Ok(());
         }
-        for i in 0..self.archetypes[source].required[entry].inits.len() {
-            let index = self.archetypes[source].required[entry].inits[i].index;
-            let Some((run, list)) = self.hooks.as_ref().unwrap().entry(index, K::INDEX) else {
-                continue;
-            };
-            let world: *mut Self = self;
-            // SAFETY: hooks reach the world only through `world`, and never
-            // move entities or change archetype caches.
-            unsafe { run(list, world, entities) };
-        }
+        std::panic::catch_unwind(AssertUnwindSafe(|| {
+            for &index in displaced {
+                let info = &self.info[index];
+                let column = self.tables[location.table].columns[index];
+                // SAFETY: the source row holds a live value of this column,
+                // which the destination lacks, so the move never reads it.
+                unsafe { (info.drop)(column.raw(location.row, info.layout.size()), 1) };
+            }
+        }))
     }
     /// The table reached from `source` by adding or removing B's components.
     /// Single components use a per-archetype array; bundles a keyed cache.
@@ -976,7 +1053,7 @@ impl<S: Storage> World<S> {
         // Cached transitions may point into the retargeted tables.
         for archetype in &mut self.archetypes {
             archetype.transitions.fill([None; 2]);
-            archetype.required.clear();
+            archetype.inserts.clear();
         }
         self.bundles = Transitions::default();
         self.pair_moves.clear();
@@ -1100,7 +1177,7 @@ impl<S: Storage> World<S> {
     }
     /// Spawn directly into the bundle's archetype; no declaration needed.
     pub fn spawn_bundle<B: Bundle<S>>(&mut self, bundle: B) -> Entity {
-        Self::check_bundle::<B>();
+        Self::check_insert::<B>();
         self.flush_reserved();
         let (table, entry) = self.adding::<B>(0);
         let tick = self.change_tick();
@@ -1111,7 +1188,7 @@ impl<S: Storage> World<S> {
     }
     /// Place a bundle at an entity reserved by `Commands`.
     pub(crate) fn spawn_reserved<B: Bundle<S>>(&mut self, entity: Entity, bundle: B) {
-        Self::check_bundle::<B>();
+        Self::check_insert::<B>();
         self.flush_reserved();
         let slot = &self.locations[entity.slot as usize];
         debug_assert!(entity.world == self.id && slot.generation == 0 && slot.location.is_none());
@@ -1124,11 +1201,11 @@ impl<S: Storage> World<S> {
     #[inline]
     fn added<B: Bundle<S>>(&mut self, entry: usize, entities: &[Entity]) {
         B::fire::<Add>(self, entities, B::ALL);
-        if B::REQUIRES {
+        if B::RESOLVES {
             self.fire_required::<Add>(0, entry, entities);
         }
         B::fire::<Insert>(self, entities, B::ALL);
-        if B::REQUIRES {
+        if B::RESOLVES {
             self.fire_required::<Insert>(0, entry, entities);
         }
         self.settle();
@@ -1139,7 +1216,7 @@ impl<S: Storage> World<S> {
     where
         I::Item: Bundle<S>,
     {
-        Self::check_bundle::<I::Item>();
+        Self::check_insert::<I::Item>();
         self.flush_reserved();
         let mut bundles = bundles.into_iter();
         let Some(first) = bundles.next() else {
@@ -1192,7 +1269,7 @@ impl<S: Storage> World<S> {
         }
         // Sealed typed writes cannot allocate, drop user values, or unwind.
         unsafe { bundle.write(&self.tables[table], row, tick) };
-        if B::REQUIRES {
+        if B::RESOLVES {
             self.init_required(0, entry, table, row, tick);
         }
         self.dense[dense].entities.push(entity);
@@ -1307,14 +1384,18 @@ impl<S: Storage> World<S> {
     /// Replace/insert every bundle component with at most one dense migration.
     /// Returns the previous values, one Option per tuple member.
     pub fn insert_bundle<B: Bundle<S>>(&mut self, entity: Entity, bundle: B) -> B::Replaced {
-        Self::check_bundle::<B>();
+        Self::check_insert::<B>();
         let location = self
             .location(entity)
             .expect("entity is dead or belongs to another world");
-        // Replace hooks see old values; hooks never move entities.
+        let (destination, entry) = self.adding::<B>(location.table);
+        // Replace and remove hooks see old values; hooks never move entities.
         let before = B::mask(&self.tables[location.table].present);
         B::fire::<Replace>(self, &[entity], before);
-        let (destination, entry) = self.adding::<B>(location.table);
+        if B::RESOLVES {
+            self.fire_displaced::<Replace>(location.table, entry, &[entity]);
+            self.fire_displaced::<Remove>(location.table, entry, &[entity]);
+        }
         let tick = self.change_tick();
         let row = self.prepare_move(location, destination);
         let replaced = unsafe {
@@ -1326,16 +1407,22 @@ impl<S: Storage> World<S> {
                 tick,
             )
         };
-        if B::REQUIRES {
+        let dropped = if B::RESOLVES {
             self.init_required(location.table, entry, destination, row, tick);
-        }
+            self.drop_displaced(location, entry)
+        } else {
+            Ok(())
+        };
         self.transfer(location, destination);
+        if let Err(panic) = dropped {
+            std::panic::resume_unwind(panic);
+        }
         B::fire::<Add>(self, &[entity], B::ALL & !before);
-        if B::REQUIRES {
+        if B::RESOLVES {
             self.fire_required::<Add>(location.table, entry, &[entity]);
         }
         B::fire::<Insert>(self, &[entity], B::ALL);
-        if B::REQUIRES {
+        if B::RESOLVES {
             self.fire_required::<Insert>(location.table, entry, &[entity]);
         }
         self.settle();
@@ -1617,9 +1704,13 @@ pub trait Bundle<S: Storage>: bundle_sealed::Sealed + 'static {
     /// Fire kind `K` hooks for the members in `members`, in member order.
     #[doc(hidden)]
     fn fire<K: Kind>(world: &mut World<S>, entities: &[Entity], members: u16);
-    /// Some member implements `Requires`.
+    /// Some member requires components or belongs to a `OneOf` group, so
+    /// inserts resolve a cached `InsertMove`.
     #[doc(hidden)]
-    const REQUIRES: bool;
+    const RESOLVES: bool;
+    /// No two members share a `OneOf` group.
+    #[doc(hidden)]
+    const DISJOINT: bool;
     /// Everything the members require, recursively, once each.
     #[doc(hidden)]
     fn required(out: &mut Vec<RequiredInit>);
@@ -1635,7 +1726,8 @@ macro_rules! bundle {
             };
             type Replaced = ($(Option<$t>,)+);
             const ALL: u16 = 0 $(| 1 << $i)+;
-            const REQUIRES: bool = false $(|| <$t as HasRequired>::HAS)+;
+            const RESOLVES: bool = false $(|| <$t as HasRequired>::HAS || <$t as MaybeOneOf>::IS)+;
+            const DISJOINT: bool = true $(&& <Self as Sharing<$t>>::COUNT <= 1)+;
             fn required(out: &mut Vec<RequiredInit>) {
                 $(<$t as MaybeRequires<S>>::collect(out);)+
             }

@@ -10,6 +10,9 @@ pub struct Info {
     pub drop: unsafe fn(*mut u8, usize),
     pub sparse: bool,
     pub summary: bool,
+    pub name: &'static str,
+    /// The `OneOf` groups the component belongs to.
+    pub groups: fn(&mut Vec<std::any::TypeId>),
 }
 impl Info {
     pub fn of<T>(sparse: bool, summary: bool) -> Self {
@@ -21,6 +24,8 @@ impl Info {
             drop: drop_values::<T>,
             sparse,
             summary,
+            name: std::any::type_name::<T>(),
+            groups: <T as crate::one_of::MaybeOneOf>::groups,
         }
     }
     fn allocation(self, capacity: usize) -> Layout {
