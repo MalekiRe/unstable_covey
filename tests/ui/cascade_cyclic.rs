@@ -9,7 +9,7 @@ impl Schedule for Update {}
 fn main() {
     // Without ACYCLIC, a cycle of rows has no root to start from.
     let mut app = App::new()
-        .relation::<ChildOf, _>()
+        .relation::<ChildOf>()
         .add_systems(Update, |mut q: Query<(To<ChildOf, &u32>, &mut u32)>| {
             q.cascade(|(parent, mut value)| *value += parent.map_or(0, |p| *p));
         })

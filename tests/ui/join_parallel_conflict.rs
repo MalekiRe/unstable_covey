@@ -16,7 +16,7 @@ struct Update;
 impl Schedule for Update {}
 fn main() {
     App::new()
-        .relation::<Docked, _>()
+        .relation::<Docked>()
         .add_systems(Update, (
             |mut q: Query<To<Docked, &mut u32>>| q.each(|t| { std::hint::black_box(t); }),
             |mut values: Query<&u32>| { for value in &mut values { std::hint::black_box(value); } },

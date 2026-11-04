@@ -64,9 +64,9 @@ type Refuel = (
 fn warm_joins_allocate_nothing() {
     assert_eq!(allocations(|| drop(std::hint::black_box(Box::new(1)))), 1);
     let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .relation::<InSquad, _>()
-        .relation::<Likes, _>()
+        .relation::<DockedAt>()
+        .relation::<InSquad>()
+        .relation::<Likes>()
         .register::<Fuel>()
         .add_systems(Update, |mut q: Query<Refuel>| {
             q.each(|(own, station, squad)| {

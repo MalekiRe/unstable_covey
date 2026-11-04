@@ -215,13 +215,13 @@ fn list(items: Vec<String>) -> String {
 
 fn main() {
     let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .relation::<Piloting, _>()
-        .relation::<InFleet, _>()
-        .relation::<Allied, _>()
-        .relation::<Hunting, _>()
-        .relation::<Follows, _>()
-        .relation::<Aboard, _>()
+        .relation::<DockedAt>()
+        .relation::<Piloting>()
+        .relation::<InFleet>()
+        .relation::<Allied>()
+        .relation::<Hunting>()
+        .relation::<Follows>()
+        .relation::<Aboard>()
         .register::<Carrier>() // only filtered on: nothing else stores it
         // Carriers launch two drones each, once. Bundles relate on spawn.
         // (A closure: `Commands<_>` infers the world type.)

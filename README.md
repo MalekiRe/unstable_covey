@@ -82,38 +82,71 @@ assert_eq!(app.world.get::<Health>(entity).unwrap().0, 7);
   inline as `Cons<On<Label, Systems>, Tail>`, and specialization selects the
   matching registrations; there is no runtime label comparison.
 
-A plugin is a registration value that installs into any app without naming its
-world: `schedule(label, systems)` builds what `add_systems` would register.
+A plugin is a type. It names the components (and relations) its systems use,
+then builds those systems for whatever world the app ends up with, so it never
+names that world:
 
 ```rust
-use static_ecs::{App, Listener, Ref, Schedule, schedule};
+use static_ecs::prelude::*;
+struct Update;
+impl Schedule for Update {}
 struct Click(u32);
 impl Schedule for Click {
     type In = Ref<Self>;
 }
+pub struct Clicks(u32);
 
-fn analytics(total: &mut u32) -> Listener<Click, impl FnMut(&Click) + '_> {
-    let mut count = 0;
-    schedule(Click, move |click: &Click| {
-        count += 1;
-        *total += click.0 * count;
-    })
+pub struct Analytics<'a> {
+    pub total: &'a mut u32,
+}
+impl Plugin for Analytics<'_> {
+    type Components = (Clicks,);
+    fn systems<S: Storage>(self) -> impl Systems<S> {
+        let mut count = 0;
+        (
+            schedule(Click, move |click: &Click| {
+                count += 1;
+                *self.total += click.0 * count;
+            }),
+            // `S` is the app's world: systems that name it take it from here.
+            schedule(Update, |mut commands: Commands<S>, mut q: Query<&Clicks>| {
+                if q.iter_mut().next().is_none() {
+                    commands.spawn((Clicks(0),));
+                }
+            }),
+        )
+    }
 }
 
 let mut total = 0;
 {
-    let mut app = App::new().add_plugins(analytics(&mut total)).build();
+    let mut app = App::new().add_plugins(Analytics { total: &mut total }).build();
     app.emit(&Click(3));
     app.emit(&Click(3));
+    app.emit(&Update);
+    assert_eq!(app.world.query::<&Clicks>().iter_mut().count(), 1);
 }
 assert_eq!(total, 9);
 ```
 
-`Listener<E, F>` names a world-free system under payload label `E`; systems
-with parameters are `Scheduled<E, P>`. `add_plugins` takes one plugin or a
-tuple of up to 12 (nested freely), applied left to right; it consumes the
-builder and returns a new type. The `demo/` crates
-compose two independent plugin crates.
+- `type Components` is a tuple of up to 32 component types; `type Relations`
+  (default `()`) a tuple of relations, installed once however many plugins
+  name them. A system using a component the plugin did not declare (and
+  nothing else stores) fails to compile at `build`.
+- `systems` returns `schedule(label, systems)`, `task(body)`, another plugin's
+  `systems::<S>()`, or a tuple of up to 12 of them, nested freely. Inside, `S`
+  is the final world: `Commands<S>`, `&mut World<S>`, `AsyncWorld<S>` (or
+  `_`). It is called once, by `build`, and its systems run where the plugin was
+  added among the app's registrations. A plugin's hooks run after the app's
+  own, and like all hooks they own what they capture (`'static`).
+- `add_plugins` takes a plugin, a `task(...)`, or a tuple of up to 12 of them,
+  applied left to right. The `demo/` crates compose two independent plugin
+  crates.
+- A plugin's systems stay opaque in the built app's type; dispatch into them
+  is resolved when the app is compiled, statically as for any other system.
+  Because they are opaque, an app with plugins cannot prove it is `Send`
+  (to move it to another thread), though its frames still run in parallel.
+
 `.build()` creates the world and checks every system against it.
 
 ## The inferred world
@@ -296,9 +329,9 @@ struct Update;
 impl Schedule for Update {}
 
 let mut app = App::new()
-    .relation::<DockedAt, _>()
-    .relation::<Allied, _>()
-    .relation::<Follows, _>()
+    .relation::<DockedAt>()
+    .relation::<Allied>()
+    .relation::<Follows>()
     .register::<Name>()
     // Many ships share a station: `&mut` across that edge is one row at a time.
     .add_systems(Update, |mut ships: Query<(&Cargo, To<DockedAt, &mut Cargo>)>| {
@@ -379,7 +412,7 @@ assert_eq!(allies.get_mut(lead).unwrap().map(|n| n.0).collect::<Vec<_>>(), ["Osp
 - **Filters and walks.** `Related<R>` matches sources; `Relinked<R>` those
   whose links changed since the system last ran. `world.targets`/`sources`/
   `descendants::<R>(entity)` iterate either storage, parents before children.
-  `.relation::<R, _>()` installs a relation; relating an uninstalled one panics
+  `.relation::<R>()` installs a relation; relating an uninstalled one panics
   (non-fragmenting) or fails to compile (fragmenting).
 
 ### Tasks and bridges

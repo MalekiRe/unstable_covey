@@ -6,7 +6,9 @@ use crate::executor::{Second, Tail, Within, serially};
 use crate::hook::{Event, Hook, HookList};
 use crate::lookup::ComponentLookup;
 use crate::plan::{ExecutionMode, FunctionSystem, Input, NoInput, Ref, Shape, run_now};
-use crate::relation::{self, Fragment, PairOf, Relates, Relation, RelationHooks, Sources};
+use crate::plugin::{
+    ComponentList, InstallRelation, Instantiate, InstantiateHooks, Pending, Plugin, RelationList,
+};
 use crate::vocab::{Declaration, Insert, Uses};
 use crate::{Components, IntoSystems, Storage, System, World};
 
@@ -149,9 +151,6 @@ pub trait Handle<E, S> {
 
 pub struct Run<P>(P);
 pub type Scheduled<E, P> = On<E, Run<P>>;
-/// A world-free function `F` registered under payload label `E`, e.g. a
-/// plugin's `fn plugin(...) -> Listener<Click, impl FnMut(&Click)>`.
-pub type Listener<E, F> = Scheduled<E, FunctionSystem<F, (), (), (), Ref<E>>>;
 
 impl<P> Inner for Run<P> {
     type Inner = P;
@@ -273,6 +272,36 @@ impl<E: 'static, S, H: Handle<E, S>> MaybeHandle<E, S> for On<E, H> {
         S: Send + Sync + SystemWorld,
     {
         unsafe { H::enter::<R, Within<P>, K>(context, flow) }
+    }
+}
+
+/// A nested list (a plugin's systems) handles like the list it is.
+impl<E: 'static, S, H, T> MaybeHandle<E, S> for Cons<H, T>
+where
+    Cons<H, T>: Dispatch<E, S>,
+{
+    const HAS_PARALLEL: bool = <Self as Dispatch<E, S>>::HAS_PARALLEL;
+    const WEIGHT: usize = <Self as Dispatch<E, S>>::WEIGHT;
+    #[inline]
+    unsafe fn maybe_handle(&mut self, input: *const (), state: &mut S) {
+        unsafe { self.dispatch(input, state) };
+    }
+    #[inline]
+    fn maybe_defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
+    where
+        S: SystemWorld,
+    {
+        Dispatch::<E, S>::defer(self, queue);
+    }
+    #[inline(always)]
+    unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<S, R>>(
+        context: &Context<'_, S, R>,
+        flow: Flow,
+    ) -> Tail<S, R>
+    where
+        S: Send + Sync + SystemWorld,
+    {
+        unsafe { <Self as Dispatch<E, S>>::enter::<R, P, K>(context, flow) }
     }
 }
 
@@ -423,19 +452,17 @@ impl<P: Shape> Handler for Run<P> {
     type Access = P::Access;
 }
 
-/// Anything `add_plugins` accepts: a registration (`schedule(...)`,
-/// `relation()`), or a tuple of up to 12 plugins, nested freely, applied left
-/// to right. Each changes the builder's type: `Components` is `C` extended
-/// with every component its systems use; emitted systems extend the listener
-/// list `L`, hooks and relation registrations the hook list `K`.
-pub trait Plugins<C, L, K> {
+/// One registration from `add_systems`: listeners under an emitted label, or
+/// hooks under a lifecycle label. `Components` is `C` extended with every
+/// component its systems use.
+#[doc(hidden)]
+pub trait Register<C, L, K> {
     type Components: Storage;
     type Listeners;
     type Hooks;
-    #[doc(hidden)]
     fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks);
 }
-impl<E: 'static, H: Handler<Access: Uses<C>>, C, L, K> Plugins<C, L, K> for On<E, H> {
+impl<E: 'static, H: Handler<Access: Uses<C>>, C, L, K> Register<C, L, K> for On<E, H> {
     type Components = <H::Access as Uses<C>>::Out;
     type Listeners = Cons<Self, L>;
     type Hooks = K;
@@ -443,7 +470,7 @@ impl<E: 'static, H: Handler<Access: Uses<C>>, C, L, K> Plugins<C, L, K> for On<E
         (Cons(self, listeners), hooks)
     }
 }
-impl<E, P, C, L, K> Plugins<C, L, K> for Hook<E, P>
+impl<E, P, C, L, K> Register<C, L, K> for Hook<E, P>
 where
     E: Event,
     P: Shape<Output = ()>,
@@ -457,12 +484,35 @@ where
         (listeners, Cons(self, hooks))
     }
 }
-impl<R: Relation, C: Insert<Components<PairOf<R>>>, L, K> Plugins<C, L, K> for Fragment<R> {
-    type Components = <C as Insert<Components<PairOf<R>>>>::Out;
-    type Listeners = L;
-    type Hooks = Cons<Self, K>;
-    fn add_to(self, listeners: L, hooks: K) -> (L, Self::Hooks) {
-        (listeners, Cons(self, hooks))
+
+/// Anything `add_plugins` accepts: a `Plugin`, a `task(...)`, or a tuple of up
+/// to 12 of them, nested freely, applied left to right. Each changes the
+/// builder's type: `Components` is `C` extended with what it stores; systems
+/// extend the listener list `L` (plugins as placeholders until `build`),
+/// relations the hook list `K`.
+pub trait Plugins<C, L, K> {
+    type Components: Storage;
+    type Listeners;
+    type Hooks;
+    #[doc(hidden)]
+    fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks);
+}
+/// The plugin's components and relations now; its systems at `build`.
+impl<P: Plugin, C, L, K> Plugins<C, L, K> for P
+where
+    P::Components: ComponentList<C>,
+    P::Relations: RelationList<<P::Components as ComponentList<C>>::Out, K>,
+{
+    type Components =
+        <P::Relations as RelationList<<P::Components as ComponentList<C>>::Out, K>>::Components;
+    type Listeners = Cons<Pending<P>, L>;
+    type Hooks = <P::Relations as RelationList<<P::Components as ComponentList<C>>::Out, K>>::Hooks;
+    fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks) {
+        let hooks =
+            <P::Relations as RelationList<<P::Components as ComponentList<C>>::Out, K>>::install(
+                hooks,
+            );
+        (Cons(Pending(self), listeners), hooks)
     }
 }
 impl<C, L, K, A: Plugins<C, L, K>> Plugins<C, L, K> for (A,) {
@@ -544,7 +594,7 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         self
     }
     /// Add a plugin or a tuple of plugins (up to 12, nested freely), applied
-    /// left to right: `.add_plugins((physics::plugin(), net::plugin(&mut stats)))`.
+    /// left to right: `.add_plugins((Physics, Net { stats: &mut stats }))`.
     pub fn add_plugins<P: Plugins<C, L, K>>(
         self,
         plugins: P,
@@ -583,34 +633,35 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         label: X,
         systems: P,
     ) -> AppBuilder<
-        <Placed<E, P::Systems> as Plugins<C, L, K>>::Components,
-        <Placed<E, P::Systems> as Plugins<C, L, K>>::Listeners,
-        <Placed<E, P::Systems> as Plugins<C, L, K>>::Hooks,
+        <Placed<E, P::Systems> as Register<C, L, K>>::Components,
+        <Placed<E, P::Systems> as Register<C, L, K>>::Listeners,
+        <Placed<E, P::Systems> as Register<C, L, K>>::Hooks,
     >
     where
-        Placed<E, P::Systems>: Plugins<C, L, K>,
+        Placed<E, P::Systems>: Register<C, L, K>,
     {
-        self.add_plugins(schedule(label, systems))
+        let (listeners, hooks) = schedule(label, systems).add_to(self.listeners, self.hooks);
+        AppBuilder {
+            listeners,
+            hooks,
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
     }
     /// Install relation `R`: its components `Relates<R>`/`Sources<R>` and the
-    /// hooks keeping them consistent. Name the world as `_`:
-    /// `.relation::<ChildOf, _>()`.
+    /// hooks keeping them consistent. Installing it again, here or from a
+    /// plugin's `Relations`, changes nothing.
     #[allow(clippy::type_complexity)]
-    pub fn relation<R: Relation, S>(
+    pub fn relation<R: InstallRelation<C, K>>(
         self,
-    ) -> AppBuilder<
-        <RelationHooks<R, S> as Plugins<C, L, K>>::Components,
-        L,
-        <RelationHooks<R, S> as Plugins<C, L, K>>::Hooks,
-    >
-    where
-        RelationHooks<R, S>: Plugins<C, L, K, Listeners = L>,
-        S: Storage
-            + ComponentLookup<Relates<R>>
-            + ComponentLookup<Sources<R>>
-            + ComponentLookup<PairOf<R>>,
+    ) -> AppBuilder<<R as InstallRelation<C, K>>::Components, L, <R as InstallRelation<C, K>>::Hooks>
     {
-        self.add_plugins(relation::relation::<R, S>())
+        AppBuilder {
+            listeners: self.listeners,
+            hooks: R::install(self.hooks),
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
     }
     /// Store `T` even though no system queries it, e.g. a tag that is only
     /// inserted, or data read through `World` methods outside systems. Keeps
@@ -663,29 +714,39 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
             components: PhantomData,
         }
     }
-    /// Create the world, which owns the hooks. Every handler and hook is
-    /// checked against it here.
-    pub fn build(self) -> App<C, L>
+    /// Create the world, which owns the hooks. Plugins build their systems
+    /// for it, then every handler and hook is checked against it. A plugin's
+    /// hooks run after the app's own.
+    pub fn build(self) -> App<C, <L as Instantiate<C>>::Listeners>
     where
-        K: HookList<C> + Send + Sync + 'static,
-        L: Fits<World<C>>,
+        L: Instantiate<C>,
+        K: InstantiateHooks<C>,
     {
-        const {
-            assert!(
-                L::VALID && K::VALID,
-                "invalid system: missing/ambiguous storage or conflicting access"
-            );
+        fn check<S: Storage, L: Fits<World<S>>, K: HookList<S>>(_: &L, _: &K) {
+            const {
+                assert!(
+                    L::VALID && K::VALID,
+                    "invalid system: missing/ambiguous storage or conflicting access"
+                );
+            }
         }
+        let (listeners, plugin_hooks) = self.listeners.instantiate();
+        let hooks = Cons(plugin_hooks, self.hooks.instantiate());
+        check::<C, _, _>(&listeners, &hooks);
         let mut world = World::default();
-        if const { !K::EMPTY } {
-            world.set_hooks(self.hooks);
+        if !is_empty::<C, _>(&hooks) {
+            world.set_hooks(hooks);
         }
         App {
             world,
-            listeners: self.listeners,
+            listeners,
             execution_mode: self.execution_mode,
         }
     }
+}
+/// Whether a hook list holds no hooks at all.
+fn is_empty<S: Storage, K: HookList<S>>(_: &K) -> bool {
+    K::EMPTY
 }
 
 /// A built app: a world with its inferred component set `S`, and every handler.

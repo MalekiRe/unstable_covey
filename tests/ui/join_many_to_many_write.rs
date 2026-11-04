@@ -17,9 +17,9 @@ impl Schedule for Update {}
 fn main() {
     let system = |mut q: Query<To<Likes, &mut u32>>| q.each(|targets| targets.for_each(|mut t| *t += 1));
     let mut app = App::new()
-        .relation::<Docked, _>()
-        .relation::<Partner, _>()
-        .relation::<Likes, _>()
+        .relation::<Docked>()
+        .relation::<Partner>()
+        .relation::<Likes>()
         .add_systems(Update, system)
         .build();
     app.emit(&Update);

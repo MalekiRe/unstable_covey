@@ -68,7 +68,7 @@ macro_rules! nothing {
     )*};
 }
 nothing!((), Exclusive);
-// Relation components come from `.relation::<R, _>()`; filtering alone does
+// Relation components come from `.relation::<R>()`; filtering alone does
 // not create storage.
 impl<C: Storage, R> Uses<C> for crate::filter::Related<R> {
     type Out = C;

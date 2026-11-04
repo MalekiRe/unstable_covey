@@ -8,7 +8,7 @@ impl Schedule for Update {}
 fn main() {
     // Swapping two rows' link lists would corrupt the relation's index.
     let mut app = App::new()
-        .relation::<Docked, _>()
+        .relation::<Docked>()
         .add_systems(Update, |mut q: Query<&mut Relates<Docked>>| {
             q.each(|link| { std::hint::black_box(link); })
         })

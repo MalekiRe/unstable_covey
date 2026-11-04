@@ -18,7 +18,7 @@ struct Name(u32);
 
 #[test]
 fn many_to_many_matches_a_set_model_through_relates_unrelates_and_despawns() {
-    let mut app = App::new().relation::<Likes, _>().register::<Name>().build();
+    let mut app = App::new().relation::<Likes>().register::<Name>().build();
     let world = &mut app.world;
     let mut alive: Vec<Entity> = (0..40).map(|i| world.spawn_bundle((Name(i),))).collect();
     let mut model = BTreeSet::<(usize, usize)>::new(); // indices into `ids`
@@ -83,10 +83,7 @@ fn many_to_many_matches_a_set_model_through_relates_unrelates_and_despawns() {
 
 #[test]
 fn linked_hierarchies_reparent_and_despawn_recursively() {
-    let mut app = App::new()
-        .relation::<ChildOf, _>()
-        .register::<Name>()
-        .build();
+    let mut app = App::new().relation::<ChildOf>().register::<Name>().build();
     let world = &mut app.world;
     let root = world.spawn_bundle((Name(0),));
     let other = world.spawn_bundle((Name(1),));
@@ -126,10 +123,7 @@ fn linked_hierarchies_reparent_and_despawn_recursively() {
 
 #[test]
 fn one_to_one_displaces_previous_partners_and_unlinks_on_removal() {
-    let mut app = App::new()
-        .relation::<Partner, _>()
-        .register::<Name>()
-        .build();
+    let mut app = App::new().relation::<Partner>().register::<Name>().build();
     let world = &mut app.world;
     let [a, b, c] = [0, 1, 2].map(|i| world.spawn_bundle((Name(i),)));
     world.relate(a, Partner, b);
@@ -153,7 +147,7 @@ fn commands_relate_freshly_spawned_entities() {
     struct Update;
     impl Schedule for Update {}
     let mut app = App::new()
-        .relation::<ChildOf, _>()
+        .relation::<ChildOf>()
         .add_systems(Update, |mut commands: Commands<_>| {
             let parent = commands.spawn((Name(0),));
             for i in 1..=3 {
@@ -207,7 +201,7 @@ fn ids(entities: impl Iterator<Item = Entity>) -> Vec<Entity> {
 #[test]
 fn fragmenting_one_to_many_groups_each_targets_sources_into_tables() {
     let mut app = App::new()
-        .relation::<InSquad, _>()
+        .relation::<InSquad>()
         .register::<Name>()
         .register::<Elite>()
         .build();
@@ -248,10 +242,7 @@ struct Elite;
 
 #[test]
 fn fragmenting_many_to_many_keys_tables_by_target_sets() {
-    let mut app = App::new()
-        .relation::<Tagged, _>()
-        .register::<Name>()
-        .build();
+    let mut app = App::new().relation::<Tagged>().register::<Name>().build();
     let world = &mut app.world;
     let [red, blue] = [100, 200].map(|i| world.spawn_bundle((Name(i),)));
     let things: Vec<_> = (0..4).map(|i| world.spawn_bundle((Name(i),))).collect();
@@ -283,10 +274,7 @@ fn fragmenting_many_to_many_keys_tables_by_target_sets() {
 
 #[test]
 fn churning_fragmenting_targets_reuses_dead_tables() {
-    let mut app = App::new()
-        .relation::<InSquad, _>()
-        .register::<Name>()
-        .build();
+    let mut app = App::new().relation::<InSquad>().register::<Name>().build();
     let world = &mut app.world;
     let mut tables_after_first = None;
     for round in 0..50 {
@@ -313,8 +301,8 @@ fn churning_fragmenting_targets_reuses_dead_tables() {
 #[test]
 fn descendants_come_parents_first_for_both_storages() {
     let mut app = App::new()
-        .relation::<ChildOf, _>()
-        .relation::<InSquad, _>()
+        .relation::<ChildOf>()
+        .relation::<InSquad>()
         .register::<Name>()
         .build();
     let world = &mut app.world;
@@ -345,7 +333,7 @@ impl Relation for Mount {
 
 #[test]
 fn linked_fragmenting_relations_despawn_subtrees_and_terminate_on_cycles() {
-    let mut app = App::new().relation::<Mount, _>().register::<Name>().build();
+    let mut app = App::new().relation::<Mount>().register::<Name>().build();
     let world = &mut app.world;
     let names: Vec<_> = (0..6).map(|i| world.spawn_bundle((Name(i),))).collect();
     // 0 -> {1, 2}; 1 -> {3}; 3 -> {4}; 5 stays separate.
@@ -374,7 +362,7 @@ fn fragmenting_joins_read_targets_and_subtrees_inside_systems() {
     struct Log(Vec<(u32, Option<u32>)>, usize);
     type Grandchildren = From<InSquad, From<InSquad, Entity>>;
     let mut app = App::new()
-        .relation::<InSquad, _>()
+        .relation::<InSquad>()
         .add_systems(
             Update,
             |mut members: Query<(&Name, To<InSquad, &Name>), Related<InSquad>>,
@@ -416,10 +404,7 @@ impl Relation for DockedAt {
 
 #[test]
 fn bundle_values_relate_retarget_and_unrelate_with_edge_data() {
-    let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .register::<Name>()
-        .build();
+    let mut app = App::new().relation::<DockedAt>().register::<Name>().build();
     let world = &mut app.world;
     let (kestrel, osprey) = (
         world.spawn_bundle((Name(1),)),
@@ -453,8 +438,8 @@ fn commands_spawn_related_entities_and_many_to_many_values_replace_edges() {
     impl Schedule for Update {}
     struct Station(Entity);
     let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .relation::<Likes, _>()
+        .relation::<DockedAt>()
+        .relation::<Likes>()
         .register::<Name>()
         .add_systems(Update, |s: Single<&Station>, mut commands: Commands<_>| {
             commands.spawn((Name(20), DockedAt { berth: 7 }.to(s.0)));
@@ -491,14 +476,14 @@ fn commands_spawn_related_entities_and_many_to_many_values_replace_edges() {
 #[test]
 #[should_panic(expected = "cannot relate to itself")]
 fn one_sided_relations_refuse_self_edges() {
-    let mut app = App::new().relation::<DockedAt, _>().build();
+    let mut app = App::new().relation::<DockedAt>().build();
     let ship = app.world.spawn();
     app.world.relate(ship, DockedAt { berth: 0 }, ship);
 }
 
 #[test]
 fn many_to_many_relations_allow_self_edges() {
-    let mut app = App::new().relation::<Likes, _>().build();
+    let mut app = App::new().relation::<Likes>().build();
     let narcissus = app.world.spawn();
     app.world.relate(narcissus, Likes, narcissus);
     assert_eq!(ids(app.world.targets::<Likes>(narcissus)), [narcissus]);
@@ -506,10 +491,7 @@ fn many_to_many_relations_allow_self_edges() {
 
 #[test]
 fn fragmenting_bundle_values_become_pairs() {
-    let mut app = App::new()
-        .relation::<InSquad, _>()
-        .register::<Name>()
-        .build();
+    let mut app = App::new().relation::<InSquad>().register::<Name>().build();
     let world = &mut app.world;
     let (alpha, beta) = (
         world.spawn_bundle((Name(1),)),
@@ -536,9 +518,9 @@ fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
 fn non_fragmenting_joins_follow_relations_by_cardinality() {
     use static_ecs::{From, To};
     let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .relation::<Partner, _>()
-        .relation::<Likes, _>()
+        .relation::<DockedAt>()
+        .relation::<Partner>()
+        .relation::<Likes>()
         .register::<Name>()
         .register::<Fuel>()
         .build();
@@ -670,8 +652,8 @@ fn fragmenting_joins_run_in_systems_and_infer_joined_components() {
     impl Schedule for Update {}
     // `Fuel` is never registered: the joins alone place it in the world.
     let mut app = App::new()
-        .relation::<InSquad, _>()
-        .relation::<Tagged, _>()
+        .relation::<InSquad>()
+        .relation::<Tagged>()
         .register::<Name>()
         .add_systems(
             Update,
@@ -758,8 +740,8 @@ fn relinked_matches_changed_links_for_both_storages() {
     #[derive(Default)]
     struct Seen(Vec<Vec<u32>>);
     let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .relation::<InSquad, _>()
+        .relation::<DockedAt>()
+        .relation::<InSquad>()
         .add_systems(
             Update,
             |mut docked: Query<&Name, Relinked<DockedAt>>,
@@ -829,7 +811,7 @@ macro_rules! cascade_matches_model {
         fn $name() {
             use static_ecs::To;
             let mut app = App::new()
-                .relation::<$relation, _>()
+                .relation::<$relation>()
                 .register::<Local>()
                 .register::<Global>()
                 .register::<Skip>()
@@ -915,7 +897,7 @@ cascade_matches_model!(cascade_orders_parents_first_through_pairs, Carried);
 #[test]
 #[should_panic(expected = "would close a cycle")]
 fn acyclic_relations_refuse_closing_a_chain() {
-    let mut app = App::new().relation::<Attached, _>().build();
+    let mut app = App::new().relation::<Attached>().build();
     let world = &mut app.world;
     let [a, b, c] = [(); 3].map(|()| world.spawn());
     world.relate(a, Attached, b);
@@ -926,7 +908,7 @@ fn acyclic_relations_refuse_closing_a_chain() {
 #[test]
 #[should_panic(expected = "would close a cycle")]
 fn acyclic_fragmenting_bundles_refuse_cycles() {
-    let mut app = App::new().relation::<Carried, _>().build();
+    let mut app = App::new().relation::<Carried>().build();
     let world = &mut app.world;
     let a = world.spawn();
     let b = world.spawn_bundle((Carried.to(a),));
@@ -935,7 +917,7 @@ fn acyclic_fragmenting_bundles_refuse_cycles() {
 
 #[test]
 fn acyclic_many_to_many_allows_diamonds_and_refuses_back_edges() {
-    let mut app = App::new().relation::<Precedes, _>().build();
+    let mut app = App::new().relation::<Precedes>().build();
     let world = &mut app.world;
     let [top, left, right, bottom] = [(); 4].map(|()| world.spawn());
     for (source, target) in [(left, top), (right, top), (bottom, left), (bottom, right)] {
@@ -961,7 +943,7 @@ fn cascade_inside_a_system_propagates_every_frame() {
         (&'static Local, &'static mut Global),
     );
     let mut app = App::new()
-        .relation::<Attached, _>()
+        .relation::<Attached>()
         .add_systems(Update, |mut tree: Query<Transforms>| {
             tree.cascade(|(up, (local, mut global))| {
                 global.0 = up.map_or(0, |up| up.0) + local.0;
@@ -989,8 +971,8 @@ fn cascade_inside_a_system_propagates_every_frame() {
 fn joins_follow_retargets_and_despawns_in_both_storages() {
     use static_ecs::{From, To};
     let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .relation::<InSquad, _>()
+        .relation::<DockedAt>()
+        .relation::<InSquad>()
         .register::<Name>()
         .build();
     let world = &mut app.world;
@@ -1024,8 +1006,8 @@ fn spawning_toward_a_target_despawned_in_the_same_flush_links_nothing() {
     impl Schedule for Update {}
     struct Station(Entity);
     let mut app = App::new()
-        .relation::<DockedAt, _>()
-        .relation::<InSquad, _>()
+        .relation::<DockedAt>()
+        .relation::<InSquad>()
         .register::<Name>()
         .add_systems(Update, |s: Single<&Station>, mut commands: Commands<_>| {
             commands.spawn((Name(1), DockedAt { berth: 0 }.to(s.0), InSquad.to(s.0)));

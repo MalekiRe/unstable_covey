@@ -45,10 +45,10 @@ impl Reserve<'_> {
     }
 }
 /// Declares a dense component; SUMMARY opts into conservative column summaries.
-pub struct Components<T, const SUMMARY: bool = false>(PhantomData<T>);
+pub struct Components<T, const SUMMARY: bool = false>(PhantomData<fn() -> T>);
 /// Declares archetype-local sparse storage. Sparse-only changes preserve the
 /// physical dense row; sparse columns remain aligned with archetype membership.
-pub struct Sparse<T, const SUMMARY: bool = false>(PhantomData<T>);
+pub struct Sparse<T, const SUMMARY: bool = false>(PhantomData<fn() -> T>);
 impl<T, const B: bool> Default for Components<T, B> {
     fn default() -> Self {
         Self(PhantomData)
@@ -75,8 +75,9 @@ mod sealed {
     impl<P> Sealed for super::Point<P> {}
     impl<A: super::Storage, B: super::Storage> Sealed for (A, B) {}
 }
-/// Sealed, statically composed component vocabulary.
-pub trait Storage: sealed::Sealed + Default + 'static {
+/// Sealed, statically composed component vocabulary: zero-sized markers,
+/// so every world type can cross threads.
+pub trait Storage: sealed::Sealed + Default + Send + Sync + 'static {
     const LEN: usize;
     const HAS_SPARSE: bool;
     /// Sync points declared, numbered apart from components.

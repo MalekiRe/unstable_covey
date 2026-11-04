@@ -144,6 +144,7 @@ impl<S: Storage> HookList<S> for Nil {
 }
 impl<S: Storage, A: HookList<S>, B: HookList<S>> HookList<S> for Cons<A, B> {
     const VALID: bool = A::VALID && B::VALID;
+    const EMPTY: bool = A::EMPTY && B::EMPTY;
     #[inline(always)]
     unsafe fn fire<E: Event>(this: *mut Self, world: *mut World<S>, entities: &[Entity]) {
         // Registration order: the tail holds earlier hooks.

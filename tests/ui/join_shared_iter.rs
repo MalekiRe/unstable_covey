@@ -22,9 +22,9 @@ fn main() {
         }
     };
     let mut app = App::new()
-        .relation::<Docked, _>()
-        .relation::<Partner, _>()
-        .relation::<Likes, _>()
+        .relation::<Docked>()
+        .relation::<Partner>()
+        .relation::<Likes>()
         .add_systems(Update, system)
         .build();
     app.emit(&Update);

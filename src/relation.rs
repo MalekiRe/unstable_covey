@@ -37,7 +37,7 @@ pub trait Relation: Send + Sync + 'static {
     ///     type Kind = OneToOne;
     ///     const FRAGMENTING: bool = true;
     /// }
-    /// App::new().relation::<Spouse, _>().build();
+    /// App::new().relation::<Spouse>().build();
     /// ```
     const FRAGMENTING: bool = false;
     /// Refuse edges that would close a cycle (relating panics), so walks
@@ -468,7 +468,7 @@ impl<S: Storage> World<S> {
         }
         assert!(
             self.has_hook::<OnReplace<Relates<R>>>() && self.has_hook::<OnReplace<Sources<R>>>(),
-            "relate: install the relation with `.relation::<R, _>()`"
+            "relate: install the relation with `.relation::<R>()`"
         );
         if let Some(mut current) = self.links_mut::<Relates<R>>(source) {
             current.value = value;
@@ -497,7 +497,7 @@ impl<S: Storage> World<S> {
         let relation = pair_index::<R, S>();
         assert!(
             self.fragmenting(relation).is_some(),
-            "relate: install the relation with `.relation::<R, _>()`"
+            "relate: install the relation with `.relation::<R>()`"
         );
         let previous = self.pair_targets(source, relation).next();
         if previous == Some(target)
@@ -814,8 +814,8 @@ pub type RelationHooks<R, S> = (
 
 /// Install relation `R`: its components, and either the hooks keeping the
 /// lists consistent or, if fragmenting, its registration for despawn
-/// cascades. Use `.relation::<R, _>()` or install from a plugin.
-pub fn relation<R, S>() -> RelationHooks<R, S>
+/// cascades. Installed by `.relation::<R>()` or a plugin's `Relations`.
+pub(crate) fn relation<R, S>() -> RelationHooks<R, S>
 where
     R: Relation,
     S: Storage
