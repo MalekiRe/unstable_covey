@@ -5,7 +5,7 @@ use crate::executor::{self, Context, Continue, Done, Fields, First, Flow, Inner,
 use crate::executor::{Second, Tail, Within, serially};
 use crate::hook::{Event, Hook, HookList};
 use crate::lookup::ComponentLookup;
-use crate::plan::{ExecutionMode, FunctionSystem, Input, NoInput, Ref, Shape, run_now};
+use crate::plan::{ExecutionMode, Input, NoInput, Ref, Shape, run_now};
 use crate::plugin::{
     ComponentList, InstallRelation, Instantiate, InstantiateHooks, Pending, Plugin, RelationList,
 };
