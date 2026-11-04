@@ -979,3 +979,53 @@ fn tuples_reach_sixteen_for_queries_filters_bundles_params_and_chains() {
     drop(app);
     assert_eq!(log.into_inner().unwrap(), (0..16).collect::<Vec<_>>());
 }
+
+#[test]
+fn cached_queries_keep_every_table_as_tables_appear_between_runs() {
+    struct Seen(usize);
+    struct T<const N: usize>;
+    let mut app = App::new()
+        .register::<T<0>>()
+        .register::<T<1>>()
+        .register::<T<2>>()
+        .register::<T<3>>()
+        .register::<T<4>>()
+        .register::<T<5>>()
+        .register::<T<6>>()
+        .add_systems(
+            Update,
+            |mut q: Query<&Position>, mut seen: Single<&mut Seen>| {
+                seen.0 = q.iter_mut().count();
+            },
+        )
+        .build();
+    let seen = app.world.spawn_bundle((Seen(0),));
+    let count = |app: &mut App<_, _>| {
+        app.emit(&Update);
+        app.world.get::<Seen>(seen).unwrap().0
+    };
+    // Three tables, cached inline...
+    app.world.spawn_bundle((Position(0),));
+    app.world.spawn_bundle((Position(0), T::<0>));
+    app.world.spawn_bundle((Position(0), T::<1>));
+    assert_eq!(count(&mut app), 3);
+    // ...then seven more appear between runs: the cache crosses its inline
+    // capacity while scanning only the new tables.
+    app.world.spawn_bundle((Position(0), T::<2>));
+    app.world.spawn_bundle((Position(0), T::<3>));
+    assert_eq!(count(&mut app), 5);
+    for _ in 0..2 {
+        app.world.spawn_bundle((Position(0), T::<4>));
+        app.world.spawn_bundle((Position(0), T::<5>));
+        app.world.spawn_bundle((Position(0), T::<6>));
+        app.world.spawn_bundle((Position(0), T::<0>, T::<6>));
+    }
+    assert_eq!(count(&mut app), 13);
+    // A new world restarts the cache from scratch.
+    let mut fresh = World::default();
+    let seen = fresh.spawn_bundle((Seen(0),));
+    fresh.spawn_bundle((Position(0), T::<5>));
+    app.world = fresh;
+    app.emit(&Update);
+    assert_eq!(app.world.get::<Seen>(seen).unwrap().0, 1);
+}

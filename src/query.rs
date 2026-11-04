@@ -130,19 +130,58 @@ pub unsafe trait FetchQuery<S: Storage>: QueryData {
     const VALID: bool;
     const INDICES: Self::Indices;
 }
+/// A query parameter's cache of matching tables. Boxed, so systems (and the
+/// app holding them all by value) stay small; the box holds the first few
+/// matching tables inline, so a first run allocates once.
 #[doc(hidden)]
-#[derive(Default)]
 pub struct QueryState(Option<Box<MatchingTables>>);
 impl Init for QueryState {
     fn init() -> Self {
         Self(None)
     }
 }
+impl Default for QueryState {
+    fn default() -> Self {
+        Self::init()
+    }
+}
+/// Table indices: the first few inline, the rest on the heap.
+#[derive(Default)]
+struct TableList {
+    len: usize,
+    inline: [usize; INLINE_TABLES],
+    heap: Vec<usize>,
+}
+const INLINE_TABLES: usize = 4;
+impl TableList {
+    fn push(&mut self, table: usize) {
+        if self.len < INLINE_TABLES {
+            self.inline[self.len] = table;
+        } else {
+            if self.len == INLINE_TABLES {
+                self.heap.extend_from_slice(&self.inline);
+            }
+            self.heap.push(table);
+        }
+        self.len += 1;
+    }
+    fn clear(&mut self) {
+        self.len = 0;
+        self.heap.clear();
+    }
+    fn as_slice(&self) -> &[usize] {
+        if self.len > INLINE_TABLES {
+            &self.heap
+        } else {
+            &self.inline[..self.len]
+        }
+    }
+}
 struct MatchingTables {
     world: u64,
     scanned: usize,
     candidate: Option<usize>,
-    matching: Vec<usize>,
+    matching: TableList,
     /// `Query::cascade`'s visit order, kept to reuse its allocation.
     order: Vec<(u32, u32)>,
 }
@@ -248,10 +287,11 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         let component_tables = unsafe { &(*world).component_tables };
         let state = state.0.get_or_insert_with(|| {
             Box::new(MatchingTables {
+                // No world has this id: the first run scans from scratch.
                 world: u64::MAX,
                 scanned: 0,
                 candidate: None,
-                matching: Vec::new(),
+                matching: TableList::default(),
                 order: Vec::new(),
             })
         });
@@ -288,7 +328,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         let MatchingTables {
             matching, order, ..
         } = &mut **state;
-        query.matching = Some(matching);
+        query.matching = Some(matching.as_slice());
         query.order = Some(order);
         query.cached = true;
         query

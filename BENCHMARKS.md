@@ -217,6 +217,28 @@ A plugin's systems are checked against the world once, at `build`, instead of
 each system extending the inferred component set in turn, so type checking
 drops by 89% and the build by 53%.
 
+## Query caches allocate once (`22a6108` → current)
+
+A query parameter's cache of matching tables now keeps its first four tables
+inside its box, so a system's first run allocates once per query instead of
+twice. Seven alternating repetitions per row (`inline-state-paired.json`):
+
+| Actors | Workers | Frame before ms | Frame after ms | Change | Init before ms | Init after ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0722 | 0.0693 | −4.0% | 1.86 | 1.44 |
+| 0 | 4 | 0.0296 | 0.0290 | −2.2% | 1.14 | 1.23 |
+| 4,096 | 1 | 1.291 | 1.279 | −0.9% | 3.81 | 3.63 |
+| 4,096 | 4 | 1.233 | 1.208 | −2.0% | 3.56 | 3.28 |
+| 100,000 | 1 | 100.0 | 100.5 | +0.5% | 129 | 130 |
+| 100,000 | 4 | 85.2 | 85.8 | +0.7% | 114 | 113 |
+
+Final states match in all 84 processes. The first frame alone drops from
+1.08–1.28 to 0.88–0.90 ms (no actors, one worker). Storing the whole cache
+inline in each system instead cut the empty-world frame by 8%, but the app
+(198 KB here, built and returned by value) grew past what the main thread's
+stack holds across the builder's moves, and init rose by 2.4 ms: caches stay
+boxed.
+
 ## Schedule inputs (`3476d77` → current)
 
 Systems now receive their label's input through the frame, and `add_systems`
