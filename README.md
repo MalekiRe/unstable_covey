@@ -378,6 +378,63 @@ assert_eq!(log, [2, 1]);
   invocation reaches it, possibly a worker; with a non-`Send` task the app
   runs each registration as its own invocation on the calling thread.
 
+### Remote bridges
+
+Futures on other threads or runtimes (tokio, a thread pool) bridge in through
+a sync point. `sync_point(Label)` returns a plugin and a `Remote` handle; the
+plugin's position in registration order is where, during `emit` of `Label`,
+queued remote bridges run.
+
+```rust
+use static_ecs::prelude::*;
+struct Update;
+impl Schedule for Update {}
+struct Score(u32);
+
+let (point, remote) = sync_point(Update);
+let mut app = App::new().register::<Score>().add_plugins(point).build();
+let entity = app.world.spawn_bundle((Score(0),));
+let worker = std::thread::spawn(move || {
+    let mut fetched = 40; // e.g. from the network; borrowed mutably below
+    let bridge = remote.bridge(|mut q: Query<&mut Score>| {
+        fetched += 2;
+        q.get_mut(entity).unwrap().0 = fetched;
+    });
+    // Any executor works; this one just re-polls.
+    let mut bridge = std::pin::pin!(bridge);
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    while bridge.as_mut().poll(&mut cx).is_pending() {
+        std::thread::yield_now();
+    }
+});
+while !worker.is_finished() {
+    app.emit(&Update);
+}
+assert_eq!(app.world.get::<Score>(entity).unwrap().0, 42);
+```
+
+- The driver grants queued bridges in **waves** of non-conflicting access,
+  checked with compile-time component masks: each granted closure runs on its
+  own task's thread, in parallel with the rest of its wave, so closures need
+  not be `Send` and may borrow the caller's locals. The driver then applies
+  their commands in grant order and grants the next wave. Exclusive
+  (`&mut World<_>`) bridges and bridges sharing one `remote.state()` never
+  share a wave.
+- Synchronization is one short lock around the request list (enqueue,
+  admission, cancellation), a release/acquire pair per grant, and one
+  decrement per completion. Requests live inside their pinned futures, so warm
+  bridges allocate nothing on either side; an idle sync point is one load.
+- A bridge site runs once per task per drive: a remote loop runs once per
+  emit, and a chain of different bridges may finish in one drive if each step
+  is queued before the driver's last wave.
+- `until` retries at later drives; dropping a pending future withdraws it,
+  even after it was granted. Dropping the app closes its sync points: pending
+  and later bridges fail with `BridgeError::Closed`.
+- The driver waits for granted bridges, so poll remote bridges on threads
+  other than the app's. Inside a task, use `AsyncWorld::bridge`; awaiting a
+  remote bridge there panics rather than deadlocking.
+
 ## Execution model
 
 A frame is one compiled program:

@@ -43,6 +43,10 @@ pub(crate) struct Scope {
 thread_local! {
     static SCOPE: Cell<*const Scope> = const { Cell::new(std::ptr::null()) };
 }
+/// Whether this thread is polling one of an app's tasks.
+pub(crate) fn in_task() -> bool {
+    !SCOPE.get().is_null()
+}
 impl Scope {
     pub(crate) fn new<S: Storage>(label: TypeId, world: *mut World<S>, clock: u64) -> Self {
         Self {
@@ -95,7 +99,7 @@ impl Scope {
 
 /// `TypeId` of `T` with lifetimes erased. Every closure expression has its
 /// own type, so this identifies a bridge's call site.
-fn site<T: ?Sized>() -> TypeId {
+pub(crate) fn site<T: ?Sized>() -> TypeId {
     trait Site {
         fn id(&self) -> TypeId
         where
@@ -170,7 +174,7 @@ impl<S: Storage> AsyncWorld<S> {
     /// query caches stay warm, so bridging through it allocates nothing.
     pub fn state<T: Default>(&self) -> BridgeState<S, T> {
         BridgeState {
-            cell: Arc::new(UnsafeCell::new(BridgeCell::default())),
+            shared: Arc::default(),
             world: *self,
         }
     }
@@ -180,13 +184,33 @@ impl<S: Storage> AsyncWorld<S> {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct BridgeCell<T> {
-    params: T,
-    last_run: u64,
-    last_world: u64,
+    pub(crate) params: T,
+    pub(crate) last_run: u64,
+    pub(crate) last_world: u64,
 }
+impl<T> BridgeCell<T> {
+    /// The change window of a run at `now` in world `id`.
+    pub(crate) fn window(&self, id: u64, now: u64) -> ChangeWindow {
+        let last = if self.last_world == id {
+            self.last_run
+        } else {
+            0
+        };
+        ChangeWindow { last, now }
+    }
+    pub(crate) fn ran(&mut self, id: u64, now: u64) {
+        self.last_run = now;
+        self.last_world = id;
+    }
+}
+/// Where a bridge keeps its parameter state: inline, or shared.
 #[doc(hidden)]
 pub trait StateRef<T> {
     fn cell(&mut self) -> *mut BridgeCell<T>;
+    /// The wave stamp of shared state; null for state no other bridge sees.
+    fn stamp(&self) -> *const Cell<u64> {
+        std::ptr::null()
+    }
 }
 impl<T> StateRef<T> for BridgeCell<T> {
     fn cell(&mut self) -> *mut BridgeCell<T> {
@@ -194,48 +218,60 @@ impl<T> StateRef<T> for BridgeCell<T> {
     }
 }
 
+/// State shared by bridges, plus the stamp of the remote wave that last
+/// granted one of them, written only by sync points.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct StateBox<T> {
+    stamp: Cell<u64>,
+    cell: UnsafeCell<BridgeCell<T>>,
+}
+// SAFETY: a running bridge alone accesses the cell: local bridges hold the
+// world exclusively and never nest, and a remote wave grants each stamp once.
+// Only the sync point driving a wave touches the stamp.
+unsafe impl<T: Send> Send for StateBox<T> {}
+unsafe impl<T: Send> Sync for StateBox<T> {}
+impl<T> StateRef<T> for Arc<StateBox<T>> {
+    fn cell(&mut self) -> *mut BridgeCell<T> {
+        self.cell.get()
+    }
+    fn stamp(&self) -> *const Cell<u64> {
+        &self.stamp
+    }
+}
+
 /// Shared parameter state for bridges, from `AsyncWorld::state`. Cloning
-/// shares it; bridges through it never overlap, since every bridge runs with
-/// exclusive world access and bridges cannot nest.
+/// shares it; bridges through it never overlap.
 pub struct BridgeState<S: Storage, T> {
-    cell: Arc<UnsafeCell<BridgeCell<T>>>,
+    shared: Arc<StateBox<T>>,
     world: AsyncWorld<S>,
 }
-// SAFETY: the cell is only accessed by a running bridge, and bridges sharing
-// it never overlap; its contents move between threads with the tasks.
-unsafe impl<S: Storage, T: Send> Send for BridgeState<S, T> {}
-unsafe impl<S: Storage, T: Send> Sync for BridgeState<S, T> {}
 impl<S: Storage, T> Clone for BridgeState<S, T> {
     fn clone(&self) -> Self {
         Self {
-            cell: self.cell.clone(),
+            shared: self.shared.clone(),
             world: self.world,
         }
     }
 }
-impl<S: Storage, T> StateRef<T> for BridgeState<S, T> {
-    fn cell(&mut self) -> *mut BridgeCell<T> {
-        self.cell.get()
-    }
-}
 impl<S: Storage, T> BridgeState<S, T> {
     /// `AsyncWorld::bridge` through this state.
-    pub fn bridge<E, X, LM, F, M>(&self, _: X, function: F) -> Bridge<S, E, F, M, Self>
+    pub fn bridge<E, X, LM, F, M>(&self, _: X, function: F) -> Bridge<S, E, F, M, Arc<StateBox<T>>>
     where
         E: Schedule<Route = Emitted>,
         X: Label<E, LM>,
         F: BridgeFn<S, M, State = T>,
     {
-        Bridge::new(self.world, function, self.clone(), false)
+        Bridge::new(self.world, function, self.shared.clone(), false)
     }
     /// `AsyncWorld::until` through this state.
-    pub fn until<E, X, LM, F, M>(&self, _: X, function: F) -> Bridge<S, E, F, M, Self>
+    pub fn until<E, X, LM, F, M>(&self, _: X, function: F) -> Bridge<S, E, F, M, Arc<StateBox<T>>>
     where
         E: Schedule<Route = Emitted>,
         X: Label<E, LM>,
         F: BridgeFn<S, M, State = T>,
     {
-        Bridge::new(self.world, function, self.clone(), true)
+        Bridge::new(self.world, function, self.shared.clone(), true)
     }
 }
 
@@ -244,10 +280,15 @@ impl<S: Storage, T> BridgeState<S, T> {
 pub enum BridgeError {
     /// A parameter could not be fetched, e.g. a `Single` without exactly one match.
     Invalid,
+    /// The sync point is gone: its app was dropped, or it was never added.
+    Closed,
 }
 impl std::fmt::Display for BridgeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("a bridge parameter could not be fetched")
+        f.write_str(match self {
+            Self::Invalid => "a bridge parameter could not be fetched",
+            Self::Closed => "the bridge's sync point was dropped",
+        })
     }
 }
 impl std::error::Error for BridgeError {}
@@ -419,15 +460,10 @@ where
                 latest
             };
             World::set_clock(world, now);
-            let last = if cell.last_world == scope.id {
-                cell.last_run
-            } else {
-                0
-            };
-            match function.call(world, &mut cell.params, ChangeWindow { last, now }) {
+            let window = cell.window(scope.id, now);
+            match function.call(world, &mut cell.params, window) {
                 Ok(output) => {
-                    cell.last_run = now;
-                    cell.last_world = scope.id;
+                    cell.ran(scope.id, now);
                     F::defer(&mut cell.params, &mut *World::queue(world));
                     (*world).flush();
                     scope.clock.set(World::clock(world));

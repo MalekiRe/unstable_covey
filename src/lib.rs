@@ -21,6 +21,7 @@ mod param;
 mod plan;
 mod query;
 mod relation;
+mod remote;
 mod storage;
 mod task;
 mod vocab;
@@ -46,6 +47,7 @@ pub use query::{ContiguousError, Query, QueryChunks, Single};
 pub use relation::{
     ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources, relation,
 };
+pub use remote::{Remote, RemoteBridge, RemoteState, SyncPoint, sync_point};
 pub use task::{Task, TaskFn, task};
 
 pub mod prelude {
@@ -54,7 +56,7 @@ pub mod prelude {
         Entity, ExecutionMode, Has, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, NoInput,
         OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Query, Ref, Related,
         Relates, Relation, Schedule, Single, Sources, Sparse, Storage, Trigger, With, Without,
-        WorkerPool, World, exclusive, node, ready, schedule, task,
+        WorkerPool, World, exclusive, node, ready, schedule, sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Sparse, Storage, World};

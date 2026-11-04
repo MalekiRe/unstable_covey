@@ -87,3 +87,63 @@ fn idle_visits_and_warm_bridges_allocate_nothing() {
         .0;
     assert_eq!(app.world.get::<Health>(entity).unwrap().0, 103);
 }
+
+#[test]
+fn warm_remote_bridges_allocate_nothing_on_either_side() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+    use std::thread;
+    struct Unpark(thread::Thread);
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let (point, remote) = sync_point(Update);
+    let mut app = App::new().register::<Health>().add_plugins(point).build();
+    app.world.spawn_bundle((Health(0),));
+    const WARM: usize = 3;
+    const ROUNDS: usize = 50;
+    let (queued, finished) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let wait = |counter: &AtomicUsize, at: usize| {
+        while counter.load(Ordering::SeqCst) < at {
+            thread::yield_now();
+        }
+    };
+    thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let waker = Waker::from(Arc::new(Unpark(thread::current())));
+            let mut cx = Context::from_waker(&waker);
+            let state = remote.state();
+            let mut round = |_| {
+                let mut bridge =
+                    std::pin::pin!(state.bridge(|mut q: Query<&mut Health>, _: Commands<_>| {
+                        for mut health in &mut q {
+                            health.0 += 1;
+                        }
+                    }));
+                let mut first = true;
+                while bridge.as_mut().poll(&mut cx).is_pending() {
+                    if std::mem::take(&mut first) {
+                        queued.fetch_add(1, Ordering::SeqCst);
+                    }
+                    thread::park();
+                }
+                finished.fetch_add(1, Ordering::SeqCst);
+            };
+            (0..WARM).for_each(&mut round);
+            allocations(|| (0..ROUNDS).for_each(&mut round))
+        });
+        let mut drive = |round: usize| {
+            wait(&queued, round + 1);
+            app.emit(&Update);
+            wait(&finished, round + 1);
+        };
+        (0..WARM).for_each(&mut drive);
+        let driver = allocations(|| (WARM..WARM + ROUNDS).for_each(&mut drive));
+        assert_eq!((driver, worker.join().unwrap()), (0, 0));
+    });
+    let mut q = app.world.query::<&Health>();
+    assert_eq!(q.iter_mut().next().unwrap().0, (WARM + ROUNDS) as u32);
+}
