@@ -307,6 +307,59 @@ Final states match in all 84 processes. Rerun alone with eleven alternating
 repetitions, the 100,000-actor single-worker row measures 100.83 → 100.82 ms
 (0.0%). The all-plugin benchmark still compiles in about 33 s.
 
+## Column line pairs (`32c005e` → `f8e3597`)
+
+Implementing `OneOf` slowed the empty-world 4-worker frame from 0.029 to
+0.036 ms in every process, with the same instruction count. Neither code
+layout (64-byte function alignment changed nothing) nor parking (about 12
+voluntary context switches per run in every build) explained it; glibc
+malloc tunables alone flipped the same binary, so it was heap placement.
+Parallel systems write different singleton columns every frame (`Clock`,
+`Grid`, each `Lane<N>`): their rows and change ticks were tiny separate
+allocations, and whichever two malloc packed into one cache-line pair, two
+workers contended on. Column buffers and summaries now take whole 128-byte
+pairs. Empty 4-worker frame, slow processes out of 7 per malloc layout:
+
+| Build | default | `tcache_count=0` | `mmap_threshold=4096` | `top_pad=1M` |
+|---|---:|---:|---:|---:|
+| `32c005e` | 0/7 | 5/7 | 2/7 | 7/7 |
+| `OneOf`, unpadded columns | 7/7 | 7/7 | 7/7 | 0/7 |
+| `OneOf`, padded columns | 0/7 | 0/7 | 0/7 | 1/7 |
+
+Seven alternating repetitions per row (`columns-paired.json`); final states
+match in all 84 processes:
+
+| Actors | Workers | Frame before ms | Frame after ms | Change | Init before ms | Init after ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0674 | 0.0671 | −0.4% | 1.45 | 1.43 |
+| 0 | 4 | 0.0288 | 0.0283 | −1.7% | 0.99 | 1.02 |
+| 4,096 | 1 | 1.253 | 1.244 | −0.8% | 3.71 | 3.49 |
+| 4,096 | 4 | 1.197 | 1.185 | −1.0% | 3.04 | 3.16 |
+| 100,000 | 1 | 100.0 | 100.3 | +0.4% | 129 | 127 |
+| 100,000 | 4 | 85.2 | 85.8 | +0.7% | 113 | 115 |
+
+Cost: up to 3 × 127 bytes per column of each table.
+
+## OneOf (`f8e3597` → `6424201`)
+
+Apps without `OneOf` members take the plain insert path (a constant
+branch); the sibling-filter rule (`42ecb27`) is compile-time only. Seven
+alternating repetitions per row (`one-of-paired3.json`); final states match
+in all 84 processes:
+
+| Actors | Workers | Frame before ms | Frame after ms | Change | Init before ms | Init after ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0679 | 0.0675 | −0.5% | 1.54 | 1.45 |
+| 0 | 4 | 0.0289 | 0.0287 | −0.7% | 1.12 | 1.21 |
+| 4,096 | 1 | 1.285 | 1.273 | −0.9% | 3.92 | 3.55 |
+| 4,096 | 4 | 1.219 | 1.225 | +0.5% | 3.17 | 3.23 |
+| 100,000 | 1 | 96.4 | 95.8 | −0.6% | 123 | 127 |
+| 100,000 | 4 | 85.0 | 85.0 | 0.0% | 115 | 115 |
+
+The 0-actor 4-worker row overlapped a compile in that run (0.0336 before);
+shown instead is a quiet rerun of 15 alternating processes per build:
+`32c005e` 0.0292, `f8e3597` 0.0289, `6424201` 0.0287 ms (medians).
+
 ## Idle async
 
 The same simulation, plus an idle exclusive sync point under `Update` and a
