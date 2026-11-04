@@ -1,7 +1,7 @@
 //! Infers a world's component vocabulary from the systems an app composes.
 //! The result is an ordinary nested-pair schema, deduplicated by component type.
 use crate::access::{Drives, Exclusive, Filtered, Mentions, QueryAccess, Read, Union, Write};
-use crate::filter::{Added, Changed, Or, With, Without};
+use crate::filter::{Added, Changed, MayHave, Or, With, Without};
 use crate::lookup::{ComponentLookup, PointLookup};
 use crate::plugin::ComponentList;
 use crate::require::{HasRequired, Requires};
@@ -118,7 +118,9 @@ macro_rules! component {
         }
     )*};
 }
-component!(Read, Write, Mentions, With, Without, Added, Changed);
+component!(
+    Read, Write, Mentions, With, Without, MayHave, Added, Changed
+);
 impl<C, A: Uses<C>, B: Uses<A::Out>> Uses<C> for (A, B) {
     type Out = B::Out;
 }

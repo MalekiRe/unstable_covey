@@ -13,9 +13,11 @@ pub struct Info {
     pub name: &'static str,
     /// The `OneOf` groups the component belongs to.
     pub groups: fn(&mut Vec<std::any::TypeId>),
+    /// Queries skip rows holding it unless they mention it.
+    pub disabling: bool,
 }
 impl Info {
-    pub fn of<T>(sparse: bool, summary: bool) -> Self {
+    pub fn of<T: 'static>(sparse: bool, summary: bool) -> Self {
         unsafe fn drop_values<T>(pointer: *mut u8, len: usize) {
             unsafe { ptr::drop_in_place(ptr::slice_from_raw_parts_mut(pointer.cast::<T>(), len)) };
         }
@@ -26,6 +28,7 @@ impl Info {
             summary,
             name: std::any::type_name::<T>(),
             groups: <T as crate::one_of::MaybeOneOf>::groups,
+            disabling: <T as crate::disabled::IsDisabling>::IS,
         }
     }
     fn allocation(self, capacity: usize) -> Layout {

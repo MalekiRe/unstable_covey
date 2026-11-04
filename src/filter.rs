@@ -13,6 +13,10 @@ pub struct With<T>(PhantomData<fn() -> T>);
 /// Matches archetypes without `T`.
 pub struct Without<T>(PhantomData<fn() -> T>);
 
+/// Matches every row, and mentions `T`: the query sees entities holding `T`
+/// although `T` is [`Disabling`](crate::Disabling).
+pub struct MayHave<T>(PhantomData<fn() -> T>);
+
 /// Matches any alternative in a two- or three-element filter tuple.
 pub struct Or<F>(PhantomData<fn() -> F>);
 
@@ -55,6 +59,10 @@ pub trait QueryFilter: sealed::Sealed {
     fn requires(_: &Self::State, _: usize) -> bool {
         false
     }
+    /// Whether the filter names component `component`, so a disabling one
+    /// does not hide the row.
+    #[doc(hidden)]
+    fn mentions(state: &Self::State, component: usize) -> bool;
     /// # Safety
     /// The row is live and filter accesses are granted.
     unsafe fn row(state: &Self::State, table: &Table, row: usize, window: ChangeWindow) -> bool;
@@ -83,7 +91,9 @@ impl QueryFilter for () {
     unsafe fn row(_: &(), _: &Table, _: usize, _: ChangeWindow) -> bool {
         true
     }
-
+    fn mentions(_: &(), _: usize) -> bool {
+        false
+    }
     fn matches(_: &(), _: &[bool]) -> bool {
         true
     }
@@ -98,6 +108,9 @@ impl<T: 'static> QueryFilter for With<T> {
     type State = usize;
     type Access = ();
     fn requires(state: &usize, index: usize) -> bool {
+        *state == index
+    }
+    fn mentions(state: &usize, index: usize) -> bool {
         *state == index
     }
     unsafe fn row(state: &usize, table: &Table, _: usize, _: ChangeWindow) -> bool {
@@ -117,6 +130,9 @@ impl<T: 'static> sealed::Sealed for Without<T> {}
 impl<T: 'static> QueryFilter for Without<T> {
     type State = usize;
     type Access = ();
+    fn mentions(state: &usize, index: usize) -> bool {
+        *state == index
+    }
     unsafe fn row(state: &usize, table: &Table, _: usize, _: ChangeWindow) -> bool {
         Self::matches(state, &table.present)
     }
@@ -126,6 +142,25 @@ impl<T: 'static> QueryFilter for Without<T> {
     }
 }
 impl<T: 'static, S: Storage + ComponentLookup<T>> FilterFor<S> for Without<T> {
+    const VALID: bool = <S as ComponentLookup<T>>::COUNT == 1;
+    const STATE: usize = <S as ComponentLookup<T>>::INDEX;
+}
+
+impl<T: 'static> sealed::Sealed for MayHave<T> {}
+impl<T: 'static> QueryFilter for MayHave<T> {
+    type State = usize;
+    type Access = ();
+    fn mentions(state: &usize, index: usize) -> bool {
+        *state == index
+    }
+    unsafe fn row(_: &usize, _: &Table, _: usize, _: ChangeWindow) -> bool {
+        true
+    }
+    fn matches(_: &usize, _: &[bool]) -> bool {
+        true
+    }
+}
+impl<T: 'static, S: Storage + ComponentLookup<T>> FilterFor<S> for MayHave<T> {
     const VALID: bool = <S as ComponentLookup<T>>::COUNT == 1;
     const STATE: usize = <S as ComponentLookup<T>>::INDEX;
 }
@@ -148,6 +183,9 @@ impl<R: Relation> QueryFilter for Related<R> {
     type State = usize;
     type Access = ();
     fn requires(state: &usize, index: usize) -> bool {
+        *state == index
+    }
+    fn mentions(state: &usize, index: usize) -> bool {
         *state == index
     }
     unsafe fn row(state: &usize, table: &Table, _: usize, _: ChangeWindow) -> bool {
@@ -177,6 +215,9 @@ impl<R: Relation> QueryFilter for Relinked<R> {
     type Access = Read<Relates<R>>;
     const ARCHETYPAL: bool = false;
     fn requires(state: &usize, index: usize) -> bool {
+        *state == index
+    }
+    fn mentions(state: &usize, index: usize) -> bool {
         *state == index
     }
     unsafe fn classify(index: &usize, table: &Table, window: ChangeWindow) -> TableMatch {
@@ -256,6 +297,15 @@ impl<T: 'static, F: Excluded<T>> Disjoint<F> for With<T> {
 impl<T: 'static, F: Required<T>> Disjoint<F> for Without<T> {
     const VALUE: bool = F::VALUE;
 }
+impl<T: 'static, U: 'static> Required<T> for MayHave<U> {
+    const VALUE: bool = false;
+}
+impl<T: 'static, U: 'static> Excluded<T> for MayHave<U> {
+    const VALUE: bool = false;
+}
+impl<T: 'static, F> Disjoint<F> for MayHave<T> {
+    const VALUE: bool = false;
+}
 impl<T: 'static, R: Relation> Required<T> for Related<R> {
     const VALUE: bool = marks::<T, R>();
 }
@@ -293,6 +343,9 @@ macro_rules! filter_tuple {
             fn requires(state: &Self::State, index: usize) -> bool {
                 false $(|| $filter::requires(&state.$index, index))+
             }
+            fn mentions(state: &Self::State, index: usize) -> bool {
+                false $(|| $filter::mentions(&state.$index, index))+
+            }
             unsafe fn classify(state: &Self::State, table: &Table, window: ChangeWindow) -> TableMatch {
                 TableMatch::All $(.and(unsafe { $filter::classify(&state.$index, table, window) }))+
             }
@@ -325,6 +378,9 @@ macro_rules! filter_tuple {
             const ARCHETYPAL: bool = true $(&& $filter::ARCHETYPAL)+;
             fn requires(state: &Self::State, index: usize) -> bool {
                 true $(&& $filter::requires(&state.$index, index))+
+            }
+            fn mentions(state: &Self::State, index: usize) -> bool {
+                false $(|| $filter::mentions(&state.$index, index))+
             }
             unsafe fn classify(state: &Self::State, table: &Table, window: ChangeWindow) -> TableMatch {
                 TableMatch::None $(.or(unsafe { $filter::classify(&state.$index, table, window) }))+
@@ -380,6 +436,9 @@ macro_rules! change_filter {
             type Access = Read<T>;
             const ARCHETYPAL: bool = false;
             fn requires(state: &usize, index: usize) -> bool {
+                *state == index
+            }
+            fn mentions(state: &usize, index: usize) -> bool {
                 *state == index
             }
             unsafe fn classify(index: &usize, table: &Table, window: ChangeWindow) -> TableMatch {

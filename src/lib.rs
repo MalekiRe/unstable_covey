@@ -12,6 +12,7 @@ mod bridge;
 mod change;
 mod column;
 mod command;
+mod disabled;
 mod dispatch;
 mod executor;
 mod filter;
@@ -37,12 +38,13 @@ mod vocab;
 pub use bridge::{AsyncWorld, Bridge, BridgeError, BridgeFn, BridgeState};
 pub use change::{Mut, MutSlice};
 pub use command::Commands;
+pub use disabled::{Disabled, Disabling};
 pub use dispatch::{
     App, AppBuilder, Cons, Dispatch, Handle, Label, MaybeHandle, Nil, On, Placed, Plugins, Run,
     Schedule, Scheduled, schedule,
 };
 pub use executor::WorkerPool;
-pub use filter::{Added, Changed, Or, Related, Relinked, With, Without};
+pub use filter::{Added, Changed, MayHave, Or, Related, Relinked, With, Without};
 pub use graph::{GraphConfig, MAX_NODES, Node, ReadyGraph, node, ready};
 pub use hook::{Batch, Event, Hook, OnAdd, OnInsert, OnRemove, OnReplace, Trigger};
 pub use immutable::Immutable;
@@ -67,12 +69,12 @@ pub use task::{Task, TaskFn, task};
 pub mod prelude {
     pub use crate::{
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
-        Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice,
-        NoInput, OnAdd, OnEnter, OnExit, OnInsert, OnRemove, OnReplace, OnTransition, OneOf,
-        OneToMany, OneToOne, Or, Plugin, Query, Ref, Related, Relates, Relation, Relinked, Remote,
-        Requires, Res, ResMut, Schedule, Single, Sources, Sparse, State, Storage, Stores,
-        SyncPoint, Systems, Trigger, With, Without, WorkerPool, World, exclusive, in_state, node,
-        ready, schedule, sync_point, task,
+        Disabled, Disabling, Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local,
+        ManyToMany, MayHave, Mut, MutSlice, NoInput, OnAdd, OnEnter, OnExit, OnInsert, OnRemove,
+        OnReplace, OnTransition, OneOf, OneToMany, OneToOne, Or, Plugin, Query, Ref, Related,
+        Relates, Relation, Relinked, Remote, Requires, Res, ResMut, Schedule, Single, Sources,
+        Sparse, State, Storage, Stores, SyncPoint, Systems, Trigger, With, Without, WorkerPool,
+        World, exclusive, in_state, node, ready, schedule, sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

@@ -195,6 +195,7 @@ the compiler already knows.
 | `#[derive(States)] enum`, `OnEnter(Game::Playing)` | `impl State for Playing { type Group = Game; }`, `OnEnter::<Playing>` |
 | component hooks, `on_add` | `add_systems(OnAdd::<T>, ...)` |
 | `ChildOf` / `Children` | `impl Relation for ChildOf { type Kind = OneToMany; }`, `To` / `From` |
+| `Disabled`, `register_disabling_component`, `Allow<T>` | `Disabled`, `impl Disabling for T {}`, `MayHave<T>` |
 | `ParamSet` | disjoint filters, proven at compile time |
 | `ApplyDeferred` | commands apply when the `emit` finishes (hooks: before the operation returns) |
 
@@ -383,14 +384,20 @@ commands its hooks queue apply after all of it.
 ### Queries
 
 - `Query<D, F>`: `D` is `&T`, `&mut T`, `Entity`, `Option<D>`, `Has<T>`,
-  relation joins, or tuples of up to 16. `F` is `With`, `Without`, `Added`,
-  `Changed`, `Related`, `Relinked`, tuples (and), or `Or<(...)>`.
+  relation joins, or tuples of up to 16. `F` is `With`, `Without`, `MayHave`,
+  `Added`, `Changed`, `Related`, `Relinked`, tuples (and), or `Or<(...)>`.
 - `Single<D, F>` requires exactly one match, otherwise the system is skipped.
 - Prefer `for_each` (or `contiguous_mut` for slices) in hot loops: it runs one
   tight, vectorizable loop per table. A `for` loop goes through `next`.
 - Change detection: mutable items are `Mut<T>`, marking rows changed on write.
   `Components<T, true>` adds per-column summaries so `Added`/`Changed` skip
   whole columns.
+- Default filters: queries skip entities holding a `Disabling` component
+  (`Disabled` is built in; `impl Disabling for Prefab {}` makes your own)
+  unless they mention it, by fetching it, `Option<&T>`, `Has<T>`, a filter on
+  it, or `MayHave<T>`, which matches every row. Each disabling component needs
+  its own mention. Joins skip such targets the same way, unless their inner
+  query mentions the component. `World::get` and commands still see them.
 
 ### Composing systems
 

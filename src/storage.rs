@@ -318,8 +318,18 @@ pub struct Table {
     pub(crate) targets: Pairs,
     /// Holds the resource entity: no query matches it.
     pub(crate) resource: bool,
+    /// The `Disabling` components the table holds, ascending.
+    pub(crate) disabling: Box<[usize]>,
     pub(crate) entities: Entities,
     pub(crate) columns: Columns,
+}
+impl Table {
+    /// Whether a query mentioning the components `mentions` accepts sees the
+    /// table's rows: every disabling component it holds is mentioned.
+    #[inline]
+    pub(crate) fn shown(&self, mentions: impl Fn(usize) -> bool) -> bool {
+        self.disabling.iter().all(|&component| mentions(component))
+    }
 }
 /// A table's fragmenting relation pairs, sorted.
 pub(crate) type Pairs = Box<[(usize, Entity)]>;
@@ -643,6 +653,11 @@ impl<S: Storage> World<S> {
             values: vec![ColumnPtr::default(); components.len()],
             map,
         };
+        let disabling = components
+            .iter()
+            .copied()
+            .filter(|&i| self.info[i].disabling)
+            .collect();
         let archetype = Archetype {
             dense,
             sparse: Store::new(sparse_indices, &self.info),
@@ -658,6 +673,7 @@ impl<S: Storage> World<S> {
             present,
             targets,
             resource,
+            disabling,
             entities: Entities {
                 pointer: std::ptr::NonNull::dangling().as_ptr(),
                 len: 0,

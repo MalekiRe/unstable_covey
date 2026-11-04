@@ -11,7 +11,7 @@ use std::slice;
 use crate::Entity;
 use crate::access::{Access, Read};
 use crate::lookup::ComponentLookup;
-use crate::query::{FetchQuery, JoinCheck, QueryData};
+use crate::query::{FetchQuery, JoinCheck, QueryData, reveals};
 use crate::relation::{
     Cardinality, ManyToMany, OneToMany, OneToOne, PENDING, PairOf, Relates, Relation, Sources,
 };
@@ -135,7 +135,7 @@ unsafe fn reach_into<'w, Q: QueryData>(
     entity: Entity,
 ) -> Option<Q::Item<'w>> {
     let (table, row) = unsafe { reach.find(entity) }?;
-    if !Q::matches(indices, &table.present) {
+    if !reveals::<Q>(indices, table) {
         return None;
     }
     unsafe {
@@ -186,7 +186,7 @@ impl<'w, Q: QueryData> Iterator for Joined<'w, Q> {
                     }
                     let index = *tables.next()?;
                     let next = self.reach.table(index);
-                    *table = Q::matches(&self.indices, &next.present).then(|| {
+                    *table = reveals::<Q>(&self.indices, next).then(|| {
                         let fetch = Q::fetch(self.reach, next, &self.indices, self.tick);
                         (fetch, 0, next.entities.len())
                     });
@@ -311,6 +311,9 @@ impl<R: Relation, Q: JoinCheck> QueryData for To<R, Q> {
     fn requires(_: &Self::Indices, _: usize) -> bool {
         false
     }
+    fn mentions(indices: &Self::Indices, component: usize) -> bool {
+        indices.relates == component
+    }
     unsafe fn fetch(
         reach: Reach,
         table: &Table,
@@ -324,7 +327,7 @@ impl<R: Relation, Q: JoinCheck> QueryData for To<R, Q> {
             let target = table.targets.iter().find(|&&(r, _)| r == i.pair);
             fetch.resolved = target.and_then(|&(_, target)| {
                 let (table, row) = unsafe { reach.find(target) }?;
-                Q::matches(&i.inner, &table.present)
+                reveals::<Q>(&i.inner, table)
                     .then(|| (unsafe { Q::fetch(reach, table, &i.inner, tick) }, row))
             });
         }
@@ -364,6 +367,9 @@ impl<R: Relation, Q: JoinCheck> QueryData for From<R, Q> {
     }
     fn requires(_: &Self::Indices, _: usize) -> bool {
         false
+    }
+    fn mentions(indices: &Self::Indices, component: usize) -> bool {
+        indices.sources == component
     }
     unsafe fn fetch(reach: Reach, table: &Table, indices: &Self::Indices, _: u64) -> Self::Fetch {
         let i = indices;

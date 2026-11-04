@@ -77,6 +77,10 @@ pub trait QueryData: sealed::Sealed {
     fn matches(indices: &Self::Indices, present: &[bool]) -> bool;
     #[doc(hidden)]
     fn requires(indices: &Self::Indices, component: usize) -> bool;
+    /// Whether the row's own component `component` is named (fetched,
+    /// optionally fetched, or tested), so a disabling one does not hide the row.
+    #[doc(hidden)]
+    fn mentions(indices: &Self::Indices, component: usize) -> bool;
     /// # Safety
     /// Indices identify the correct types and the table matches. Writable
     /// columns have their change summaries raised to `tick`. `reach` is the
@@ -197,6 +201,25 @@ fn candidate<D: QueryData, F: QueryFilter>(
         .min_by_key(|(_, entries)| entries.len())
         .map(|(i, _)| i)
 }
+/// Whether `D` filtered by `F` matches `table`'s rows: tables holding a
+/// disabling component neither mentions are hidden.
+#[inline]
+fn admits<D: QueryData, F: QueryFilter>(
+    indices: &D::Indices,
+    filter: &F::State,
+    table: &Table,
+) -> bool {
+    !table.resource
+        && D::matches(indices, &table.present)
+        && F::matches(filter, &table.present)
+        && table
+            .shown(|component| D::mentions(indices, component) || F::mentions(filter, component))
+}
+/// Whether a join target's `table` holds rows of `Q`, as `admits` without a filter.
+#[inline]
+pub(crate) fn reveals<Q: QueryData>(indices: &Q::Indices, table: &Table) -> bool {
+    Q::matches(indices, &table.present) && table.shown(|component| Q::mentions(indices, component))
+}
 #[derive(Clone)]
 enum Tables<'a> {
     All(slice::Iter<'a, Table>),
@@ -209,11 +232,7 @@ impl<'a> Tables<'a> {
         indices: &D::Indices,
         filter: &F::State,
     ) -> Option<&'a Table> {
-        let matches = |table: &&Table| {
-            !table.resource
-                && D::matches(indices, &table.present)
-                && F::matches(filter, &table.present)
-        };
+        let matches = |table: &&Table| admits::<D, F>(indices, filter, table);
         match self {
             Self::All(tables) => tables.find(matches),
             Self::Indexed(tables, entries, cached) => {
@@ -308,19 +327,14 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
                 let candidates = &component_tables[component];
                 let start = candidates.partition_point(|&i| i < state.scanned);
                 for &i in &candidates[start..] {
-                    if D::matches(&query.indices, &query.tables[i].present)
-                        && F::matches(&query.filter, &query.tables[i].present)
-                    {
+                    if admits::<D, F>(&query.indices, &query.filter, &query.tables[i]) {
                         state.matching.push(i);
                     }
                     state.scanned = i + 1;
                 }
             } else {
                 for (i, table) in query.tables.iter().enumerate().skip(state.scanned) {
-                    if !table.resource
-                        && D::matches(&query.indices, &table.present)
-                        && F::matches(&query.filter, &table.present)
-                    {
+                    if admits::<D, F>(&query.indices, &query.filter, table) {
                         state.matching.push(i);
                     }
                     state.scanned = i + 1;
@@ -349,10 +363,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     fn row_of(&self, entity: Entity) -> Option<(usize, usize)> {
         let (index, row) = self.locator.find(entity)?;
         let table = &self.tables[index];
-        if table.resource
-            || !D::matches(&self.indices, &table.present)
-            || !F::matches(&self.filter, &table.present)
-        {
+        if !admits::<D, F>(&self.indices, &self.filter, table) {
             return None;
         }
         // SAFETY: filters read only tick metadata of a live row.
@@ -800,6 +811,9 @@ impl<T: 'static> QueryData for &T {
     fn requires(index: &usize, component: usize) -> bool {
         *index == component
     }
+    fn mentions(index: &usize, component: usize) -> bool {
+        *index == component
+    }
     unsafe fn fetch(_: Reach, table: &Table, index: &usize, _: u64) -> ColumnPtr {
         table.columns[*index]
     }
@@ -833,6 +847,9 @@ impl<T: 'static> QueryData for &mut T {
         present[*index]
     }
     fn requires(index: &usize, component: usize) -> bool {
+        *index == component
+    }
+    fn mentions(index: &usize, component: usize) -> bool {
         *index == component
     }
     unsafe fn fetch(_: Reach, table: &Table, index: &usize, tick: u64) -> ColumnPtr {
@@ -877,6 +894,9 @@ impl QueryData for Entity {
     fn requires(_: &(), _: usize) -> bool {
         false
     }
+    fn mentions(_: &(), _: usize) -> bool {
+        false
+    }
     unsafe fn fetch(_: Reach, table: &Table, _: &(), _: u64) -> Self::Fetch {
         table.entities.as_ptr()
     }
@@ -917,6 +937,9 @@ impl<Q: QueryData> QueryData for Option<Q> {
     }
     fn requires(_: &Self::Indices, _: usize) -> bool {
         false
+    }
+    fn mentions(indices: &Self::Indices, component: usize) -> bool {
+        Q::mentions(indices, component)
     }
     unsafe fn fetch(
         reach: Reach,
@@ -970,6 +993,9 @@ impl<T: 'static> QueryData for Has<T> {
     fn requires(_: &usize, _: usize) -> bool {
         false
     }
+    fn mentions(index: &usize, component: usize) -> bool {
+        *index == component
+    }
     unsafe fn fetch(_: Reach, table: &Table, index: &usize, _: u64) -> bool {
         table.present[*index]
     }
@@ -1012,6 +1038,7 @@ macro_rules! tuple_query {
             type Item<'w> = ($($data::Item<'w>,)+); type Slice<'w> = ($($data::Slice<'w>,)+);
             fn matches(indices: &Self::Indices, present: &[bool]) -> bool { true $(&& $data::matches(&indices.$index, present))+ }
             fn requires(indices: &Self::Indices, component: usize) -> bool { false $(|| $data::requires(&indices.$index, component))+ }
+            fn mentions(indices: &Self::Indices, component: usize) -> bool { false $(|| $data::mentions(&indices.$index, component))+ }
             unsafe fn fetch(reach: Reach, table: &Table, indices: &Self::Indices, tick: u64) -> Self::Fetch { unsafe { ($($data::fetch(reach, table, &indices.$index, tick),)+) } }
             fn direct(fetch: &Self::Fetch) -> bool { true $(&& $data::direct(&fetch.$index))+ }
             unsafe fn get<'a>(fetch: &Self::Fetch, row: usize, tick: u64) -> Self::Item<'a> { unsafe { ($($data::get(&fetch.$index, row, tick),)+) } }

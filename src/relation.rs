@@ -272,6 +272,9 @@ impl<L: 'static> QueryData for LinksMut<L> {
     fn requires(index: &usize, component: usize) -> bool {
         <&mut L as QueryData>::requires(index, component)
     }
+    fn mentions(index: &usize, component: usize) -> bool {
+        <&mut L as QueryData>::mentions(index, component)
+    }
     unsafe fn fetch(reach: Reach, table: &Table, index: &usize, tick: u64) -> ColumnPtr {
         unsafe { <&mut L as QueryData>::fetch(reach, table, index, tick) }
     }
