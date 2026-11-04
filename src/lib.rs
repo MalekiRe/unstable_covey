@@ -28,6 +28,7 @@ mod query;
 mod relation;
 mod remote;
 mod require;
+mod state;
 mod storage;
 mod task;
 mod vocab;
@@ -58,16 +59,18 @@ pub use remote::{
     Envelope, Everything, Remote, RemoteBridge, RemoteState, SyncPoint, SyncPointSystem, sync_point,
 };
 pub use require::Requires;
+pub use state::{OnEnter, OnExit, OnTransition, State, in_state};
 pub use task::{Task, TaskFn, task};
 
 pub mod prelude {
     pub use crate::{
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
         Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice,
-        NoInput, OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Plugin, Query, Ref,
-        Related, Relates, Relation, Relinked, Remote, Requires, Res, ResMut, Schedule, Single,
-        Sources, Sparse, Storage, Stores, SyncPoint, Systems, Trigger, With, Without, WorkerPool,
-        World, exclusive, node, ready, schedule, sync_point, task,
+        NoInput, OnAdd, OnEnter, OnExit, OnInsert, OnRemove, OnReplace, OnTransition, OneToMany,
+        OneToOne, Or, Plugin, Query, Ref, Related, Relates, Relation, Relinked, Remote, Requires,
+        Res, ResMut, Schedule, Single, Sources, Sparse, State, Storage, Stores, SyncPoint, Systems,
+        Trigger, With, Without, WorkerPool, World, exclusive, in_state, node, ready, schedule,
+        sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

@@ -286,6 +286,27 @@ Frame times are within run-to-run variation; final states match in all 60
 processes. Initialization (build plus the first frame) is 0.3–0.5 ms slower in
 the small cases, consistently across repetitions.
 
+## Immutable, required, resources, states (`760dd62` → current)
+
+None of the four features adds work to apps that do not use them: bundles
+without requirements take the plain insert path (a constant branch), query
+caches never list resource tables, and hook entries are unchanged for plain
+lifecycle labels. Seven alternating repetitions per row of the same app
+(`features-paired.json`):
+
+| Actors | Workers | Frame before ms | Frame after ms | Change | Init before ms | Init after ms |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0695 | 0.0685 | −1.4% | 1.42 | 1.47 |
+| 0 | 4 | 0.0298 | 0.0293 | −1.6% | 1.27 | 1.10 |
+| 4,096 | 1 | 1.271 | 1.268 | −0.3% | 3.65 | 3.62 |
+| 4,096 | 4 | 1.221 | 1.218 | −0.3% | 3.35 | 3.30 |
+| 100,000 | 1 | 101.1 | 102.2 | +1.1% | 133 | 133 |
+| 100,000 | 4 | 86.4 | 86.3 | −0.1% | 117 | 119 |
+
+Final states match in all 84 processes. Rerun alone with eleven alternating
+repetitions, the 100,000-actor single-worker row measures 100.83 → 100.82 ms
+(0.0%). The all-plugin benchmark still compiles in about 33 s.
+
 ## Idle async
 
 The same simulation, plus an idle exclusive sync point under `Update` and a

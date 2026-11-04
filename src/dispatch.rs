@@ -9,6 +9,7 @@ use crate::plan::{ExecutionMode, Input, NoInput, Ref, Shape, run_now};
 use crate::plugin::{
     ComponentList, InstallRelation, Instantiate, InstantiateHooks, Pending, Plugin, RelationList,
 };
+use crate::state::State;
 use crate::vocab::{Declaration, Insert, Uses};
 use crate::{Components, IntoSystems, Storage, System, World};
 
@@ -588,13 +589,13 @@ impl<W, E: 'static, H: Handle<E, W>> Fits<W> for On<E, H> {
 pub struct AppBuilder<C = (), L = Nil, K = Nil, R = Nil> {
     listeners: L,
     hooks: K,
-    /// Resources to insert at `build`, newest first.
+    /// Resources, states, and state links to apply at `build`, newest first.
     resources: R,
     execution_mode: ExecutionMode,
     components: PhantomData<fn() -> C>,
 }
 
-impl<C: Storage, L, K, R: Resources<C>> AppBuilder<C, L, K, R> {
+impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
     pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
         self.execution_mode = mode;
         self
@@ -764,6 +765,72 @@ impl<C: Storage, L, K, R: Resources<C>> AppBuilder<C, L, K, R> {
             components: PhantomData,
         }
     }
+    /// Enter `state` at `build`, after hooks are installed, so its `OnEnter`
+    /// hooks and substates run.
+    #[allow(clippy::type_complexity)]
+    pub fn init_state<T: State>(
+        self,
+        state: T,
+    ) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K, Cons<InitState<T>, R>>
+    where
+        C: Insert<Components<T>>,
+    {
+        AppBuilder {
+            listeners: self.listeners,
+            hooks: self.hooks,
+            resources: Cons(InitState(state), self.resources),
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
+    /// Substate group of `Sub`: entered as `Sub::default()` after parent state
+    /// `P` is entered, exited before `P` exits. Setting a state of the group
+    /// while `P` is inactive is ignored (a debug panic).
+    #[allow(clippy::type_complexity)]
+    pub fn add_sub_state<P: State, Sub: State + Default>(
+        self,
+    ) -> AppBuilder<
+        <<C as Insert<Components<P>>>::Out as Insert<Components<Sub>>>::Out,
+        L,
+        K,
+        Cons<SubState<P, Sub>, R>,
+    >
+    where
+        C: Insert<Components<P>>,
+        <C as Insert<Components<P>>>::Out: Insert<Components<Sub>>,
+    {
+        AppBuilder {
+            listeners: self.listeners,
+            hooks: self.hooks,
+            resources: Cons(SubState(PhantomData), self.resources),
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
+    /// Computed state group of `X`: whenever parent state `P` is entered,
+    /// `compute(&p)` enters its result (if any); exited before `P` exits.
+    #[allow(clippy::type_complexity)]
+    pub fn add_computed_state<P: State, X: State>(
+        self,
+        compute: fn(&P) -> Option<X>,
+    ) -> AppBuilder<
+        <<C as Insert<Components<P>>>::Out as Insert<Components<X>>>::Out,
+        L,
+        K,
+        Cons<ComputedState<P, X>, R>,
+    >
+    where
+        C: Insert<Components<P>>,
+        <C as Insert<Components<P>>>::Out: Insert<Components<X>>,
+    {
+        AppBuilder {
+            listeners: self.listeners,
+            hooks: self.hooks,
+            resources: Cons(ComputedState(compute), self.resources),
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
     /// Create the world, which owns the hooks. Plugins build their systems
     /// for it, then every handler and hook is checked against it. A plugin's
     /// hooks run after the app's own.
@@ -787,6 +854,7 @@ impl<C: Storage, L, K, R: Resources<C>> AppBuilder<C, L, K, R> {
         if !is_empty::<C, _>(&hooks) {
             world.set_hooks(hooks);
         }
+        self.resources.link(&mut world);
         self.resources.apply(&mut world);
         App {
             world,
@@ -795,15 +863,21 @@ impl<C: Storage, L, K, R: Resources<C>> AppBuilder<C, L, K, R> {
         }
     }
 }
-/// A builder's resources, inserted into the built world oldest first.
+/// A builder's setup for the built world, oldest first: every state link,
+/// then every resource and initial state.
 #[doc(hidden)]
-pub trait Resources<S: Storage> {
+pub trait Setup<S: Storage> {
+    fn link(&self, _: &mut World<S>) {}
     fn apply(self, world: &mut World<S>);
 }
-impl<S: Storage> Resources<S> for Nil {
+impl<S: Storage> Setup<S> for Nil {
     fn apply(self, _: &mut World<S>) {}
 }
-impl<S: Storage, H: Resources<S>, T: Resources<S>> Resources<S> for Cons<H, T> {
+impl<S: Storage, H: Setup<S>, T: Setup<S>> Setup<S> for Cons<H, T> {
+    fn link(&self, world: &mut World<S>) {
+        self.1.link(world);
+        self.0.link(world);
+    }
     fn apply(self, world: &mut World<S>) {
         self.1.apply(world);
         self.0.apply(world);
@@ -811,17 +885,40 @@ impl<S: Storage, H: Resources<S>, T: Resources<S>> Resources<S> for Cons<H, T> {
 }
 #[doc(hidden)]
 pub struct InsertResource<T>(T);
-impl<S: Storage, T: 'static> Resources<S> for InsertResource<T> {
+impl<S: Storage, T: 'static> Setup<S> for InsertResource<T> {
     fn apply(self, world: &mut World<S>) {
         world.insert_resource(self.0);
     }
 }
 #[doc(hidden)]
 pub struct InitResource<T>(PhantomData<fn() -> T>);
-impl<S: Storage, T: Default + 'static> Resources<S> for InitResource<T> {
+impl<S: Storage, T: Default + 'static> Setup<S> for InitResource<T> {
     fn apply(self, world: &mut World<S>) {
         world.init_resource::<T>();
     }
+}
+#[doc(hidden)]
+pub struct InitState<T>(T);
+impl<S: Storage, T: State> Setup<S> for InitState<T> {
+    fn apply(self, world: &mut World<S>) {
+        world.set_state(self.0);
+    }
+}
+#[doc(hidden)]
+pub struct SubState<P, C>(PhantomData<fn() -> (P, C)>);
+impl<S: Storage, P: State, C: State + Default> Setup<S> for SubState<P, C> {
+    fn link(&self, world: &mut World<S>) {
+        world.link_sub_state::<P, C>();
+    }
+    fn apply(self, _: &mut World<S>) {}
+}
+#[doc(hidden)]
+pub struct ComputedState<P, X>(fn(&P) -> Option<X>);
+impl<S: Storage, P: State, X: State> Setup<S> for ComputedState<P, X> {
+    fn link(&self, world: &mut World<S>) {
+        world.link_computed_state(self.0);
+    }
+    fn apply(self, _: &mut World<S>) {}
 }
 /// Whether a hook list holds no hooks at all.
 fn is_empty<S: Storage, K: HookList<S>>(_: &K) -> bool {

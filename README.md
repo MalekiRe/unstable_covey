@@ -237,6 +237,45 @@ App::new()
 - Hooks fire as for any component. `ResMut` of an `Immutable` resource does
   not compile.
 
+## States
+
+One type per state; a group has at most one active state, stored as an
+`Immutable` resource.
+
+```rust,ignore
+struct Game;
+struct Menu;
+struct Playing { level: u32 }
+impl State for Menu { type Group = Game; }
+impl State for Playing { type Group = Game; }
+
+App::new()
+    .init_state(Menu)
+    .add_sub_state::<Playing, Running>() // Running::default() while Playing
+    .add_computed_state(|p: &Playing| (p.level >= 3).then_some(Hard))
+    .add_systems(OnEnter::<Playing>, |mut commands: Commands<_>| { /* ... */ })
+    .add_systems(OnTransition::<Menu, Playing>, spawn_level)
+    .add_systems(Update, tick.run_if(in_state::<Playing>()))
+```
+
+- `world.set_state(Playing { level: 2 })` (or `commands.set_state`) exits the
+  group's active state, then enters the new one; `clear_state::<Game>()`
+  leaves none. New data in the same state type is a transition too: states
+  are never compared.
+- `OnExit<T>` runs before `T` is removed (still readable as `Res<T>`),
+  `OnEnter<T>` after it is inserted, `OnTransition<A, B>` after entering `B`
+  directly from `A`. They are `OnReplace`/`OnInsert` hooks of the state
+  resource and take no `Trigger`.
+- Substates and computed states follow one parent state: they exit before it,
+  innermost first, and enter after it, outermost first. A computed state is
+  recomputed whenever its parent is entered. Setting a substate while its
+  parent is inactive is ignored (a debug panic). Each group follows at most
+  one parent, so substates cannot form a cycle.
+- A transition is atomic: commands its hooks queue apply after it, substates
+  included.
+- `Res<Playing>` gates a system on the state already; `in_state::<T>()` is
+  the run condition. `insert_resource` of a state does not compile.
+
 ## Queries
 
 - `Query<D, F>`: `D` is `&T`, `&mut T`, `Entity`, `Option<D>` (every row,

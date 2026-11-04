@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use std::mem::{MaybeUninit, size_of};
 
 use crate::lookup::ComponentLookup;
+use crate::state::State;
 use crate::storage::Reserve;
 use crate::{Bundle, Entity, Storage, World};
 
@@ -168,6 +169,14 @@ impl<S: Storage> Commands<'_, S> {
         self.queue.push(move |world: &mut World<S>| {
             world.remove_resource::<T>();
         });
+    }
+    pub fn set_state<T: State>(&mut self, state: T) {
+        self.queue
+            .push(move |world: &mut World<S>| world.set_state(state));
+    }
+    pub fn clear_state<G: 'static>(&mut self) {
+        self.queue
+            .push(move |world: &mut World<S>| world.clear_state::<G>());
     }
     /// Any deferred change with exclusive world access.
     pub fn queue(&mut self, command: impl FnOnce(&mut World<S>) + Send + 'static) {

@@ -446,12 +446,14 @@ pub struct World<S: Storage> {
     reserved: AtomicU32,
     /// Commands from hooks and finished systems, applied by `flush`.
     queue: CommandQueue<S>,
-    flushing: bool,
+    pub(crate) flushing: bool,
     hooks: Option<HookTable<S>>,
     /// Request queues of the schema's sync points; dropping closes them.
     pub(crate) points: Points<S>,
     /// The entity holding every resource, made by the first insert.
-    resources: Option<Entity>,
+    pub(crate) resources: Option<Entity>,
+    /// Substates and computed states, in registration order.
+    pub(crate) state_links: Vec<crate::state::Link<S>>,
     schema: PhantomData<S>,
 }
 impl<S: Storage> Default for World<S> {
@@ -489,6 +491,7 @@ impl<S: Storage> World<S> {
             hooks: None,
             points: Points::new(),
             resources: None,
+            state_links: Vec::new(),
             schema: PhantomData,
         };
         world.add_table(vec![false; S::LEN], Box::new([]), false);
@@ -1366,8 +1369,16 @@ impl<S: Storage> World<S> {
     {
         self.remove_bundle::<(T,)>(entity).0
     }
+    fn not_state<T: 'static>() {
+        const {
+            assert!(
+                !<T as crate::state::IsState>::IS,
+                "states change with `set_state`/`clear_state`, which run their transitions"
+            );
+        }
+    }
     /// The resource entity, made on first use in its own empty table.
-    fn resource_entity(&mut self) -> Entity {
+    pub(crate) fn resource_entity(&mut self) -> Entity {
         if let Some(entity) = self.resources
             && self.contains(entity)
         {
@@ -1398,6 +1409,7 @@ impl<S: Storage> World<S> {
     where
         S: ComponentLookup<T>,
     {
+        Self::not_state::<T>();
         let entity = self.resource_entity();
         self.insert(entity, value)
     }
@@ -1414,6 +1426,7 @@ impl<S: Storage> World<S> {
     where
         S: ComponentLookup<T>,
     {
+        Self::not_state::<T>();
         self.remove(self.resources?)
     }
     pub fn resource<T: 'static>(&self) -> Option<&T>
@@ -1432,9 +1445,7 @@ impl<S: Storage> World<S> {
     /// # Safety
     /// `world` is live; no structural change runs.
     #[inline]
-    pub(crate) unsafe fn resource_cell<T: 'static>(
-        world: *const Self,
-    ) -> Option<(ColumnPtr, usize)>
+    pub(crate) unsafe fn resource_cell<T: 'static>(world: *const Self) -> Option<(ColumnPtr, usize)>
     where
         S: ComponentLookup<T>,
     {

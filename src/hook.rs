@@ -47,12 +47,24 @@ pub struct Replace;
 #[doc(hidden)]
 pub struct Remove;
 
-/// A lifecycle event of one component.
+/// A lifecycle event of one component. Labels of one component and kind
+/// (`OnInsert<T>`, `OnEnter<T>`) share one table entry; `admits` narrows when
+/// a label's hooks run.
 pub trait Event: 'static {
     type Component: 'static;
     #[doc(hidden)]
     type Kind: Kind;
+    /// Whether this label's hooks run for the current firing.
+    /// # Safety
+    /// `world` is live and no structural change runs.
+    #[doc(hidden)]
+    #[inline(always)]
+    unsafe fn admits<S: Storage>(_: *mut World<S>) -> bool {
+        true
+    }
 }
+/// The structural event a label listens to.
+pub(crate) type Canonical<E> = <<E as Event>::Kind as Kind>::Of<<E as Event>::Component>;
 /// Maps a component to this kind's event.
 #[doc(hidden)]
 pub trait Kind: 'static {
@@ -165,13 +177,13 @@ impl<S: Storage, A: HookList<S>, B: HookList<S>> HookList<S> for Cons<A, B> {
 impl<S, E, P> HookList<S> for Hook<E, P>
 where
     S: Storage + ComponentLookup<E::Component>,
-    E: Event,
-    P: System<World<S>, Output = (), In = Batch>,
+    E: Event + Schedule,
+    P: System<World<S>, Output = (), In = E::In>,
 {
     const VALID: bool = P::VALID && <S as ComponentLookup<E::Component>>::COUNT == 1;
     #[inline(always)]
     unsafe fn fire<F: Event>(this: *mut Self, world: *mut World<S>, entities: &[Entity]) {
-        if const { <F as Same<E>>::VALUE } {
+        if const { <F as Same<Canonical<E>>>::VALUE } && unsafe { E::admits(world) } {
             unsafe { run(this, world, entities) };
         }
     }
@@ -184,13 +196,13 @@ where
             unsafe { Root::fire::<E>(hooks.cast(), world, entities) };
         }
         table[<S as ComponentLookup<E::Component>>::INDEX][E::Kind::INDEX] =
-            Some(every::<S, Root, E>);
+            Some(every::<S, Root, Canonical<E>>);
     }
 }
 /// Run a hook serially on the world's clock, then move its commands to the
-/// world's queue.
+/// world's queue. Systems without input ignore the trigger.
 #[inline(never)]
-unsafe fn run<S: Storage, E, P: System<World<S>, Output = (), In = Batch>>(
+unsafe fn run<S: Storage, E, P: System<World<S>, Output = ()>>(
     this: *mut Hook<E, P>,
     world: *mut World<S>,
     entities: &[Entity],
