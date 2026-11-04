@@ -180,6 +180,27 @@ Frame times are within run-to-run variation; final states match in all 60
 processes. Initialization (build plus the first frame) is 0.3–0.5 ms slower in
 the small cases, consistently across repetitions.
 
+## Idle async (`1cb8313`)
+
+The same simulation, plus an idle exclusive sync point registered under
+`Update` and a task waiting on a label that is never emitted, against the
+unchanged simulation, built from the same commit. Five alternating
+repetitions per row (`async-paired.json`):
+
+| Actors | Workers | Without ms | With ms | Change | Init without/with ms |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0679 | 0.0673 | −0.8% | 1.5 / 1.5 |
+| 0 | 4 | 0.0279 | 0.0278 | −0.4% | 1.3 / 1.6 |
+| 4,096 | 1 | 1.254 | 1.224 | −2.4% | 3.5 / 3.5 |
+| 4,096 | 4 | 1.096 | 1.051 | −4.1% | 3.2 / 3.2 |
+| 100,000 | 1 | 98.7 | 96.0 | −2.7% | 125 / 129 |
+| 100,000 | 4 | 88.0 | 85.3 | −3.1% | 122 / 111 |
+
+An idle sync point costs one load and an idle task a few loads, so the
+consistently lower times with them are code-layout or background-load
+effects, not a speedup; the result is "no measurable cost". Final states
+match in all 60 processes.
+
 ## Blended microbenchmark
 
 `blend_*`: 4,096 tiny systems in four parallel lanes plus a small simulation over
