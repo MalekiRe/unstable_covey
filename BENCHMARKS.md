@@ -217,6 +217,33 @@ A plugin's systems are checked against the world once, at `build`, instead of
 each system extending the inferred component set in turn, so type checking
 drops by 89% and the build by 53%.
 
+## Wayland launch: `demo/flappy`
+
+A CPU-rendered Wayland client (pure-Rust protocol, no toolkit, no GPU) whose
+game is a static-ecs plugin. It asks for its window first, then builds the app
+and draws the first frame into shared memory while the compositor replies.
+`flappy-launch` spawns it 20 times and reports when each step finished, in ms
+after spawn; `presented` is the compositor's scanout timestamp for the first
+frame, and `steady` a later frame's commit-to-scanout latency. COSMIC
+(cosmic-comp 1.2), 120 Hz output; `static` is `-C target-feature=+crt-static`:
+
+| Step | Static median | Dynamic median |
+|---|---:|---:|
+| process running (`main`) | 0.50 | 0.83 |
+| connected, globals bound | 0.65 | 0.97 |
+| ECS app built, game spawned | 0.70 | — |
+| first frame drawn | 1.52 | 1.80 |
+| window configured | 1.54 | 1.82 |
+| first frame committed | 1.55 | 1.83 |
+| first frame on screen | 60.1 (min 56.9) | 65.9 (min 57.3) |
+| later frame, commit to screen | 15.5 (min 9.5) | — |
+
+The client is done 1.5 ms after spawn; most of drawing is the first touch of
+the fresh 1.3 MB buffer (pre-populating both buffers with `MAP_POPULATE` moved
+1.4 ms onto that path instead). The compositor shows a new window's first
+frame about 55 ms after its commit, against about two refreshes for later
+frames.
+
 ## Query caches allocate once (`22a6108` → current)
 
 A query parameter's cache of matching tables now keeps its first four tables

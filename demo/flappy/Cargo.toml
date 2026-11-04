@@ -1,0 +1,15 @@
+[package]
+name = "flappy"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A CPU-rendered Wayland client on static-ecs. Fully static build:
+#   RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flappy
+# Launch latency: cargo run --release -p flappy --bin flappy-launch
+[dependencies]
+static-ecs = { path = "../.." }
+# Pure-Rust protocol backend: no libwayland.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+rustix = { version = "1", features = ["fs", "mm", "time"] }

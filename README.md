@@ -16,6 +16,8 @@ sealed traits. This is an experiment.
 cargo run --release --example simulation
 cargo run --release --example tokio_web # remote bridges from tokio (network)
 cargo run --release -p dispatch-demo
+cargo run --release -p flappy        # CPU-rendered Wayland client (space flaps)
+cargo run --release -p flappy --bin flappy-launch  # launch-to-pixels timing
 cargo test --workspace --release
 cargo clippy --workspace --all-targets -- -D clippy::all
 ```
