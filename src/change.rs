@@ -35,6 +35,10 @@ impl<'a, T> Mut<'a, T> {
         self.mark_changed();
         self.value
     }
+    /// The borrow without marking: for bookkeeping invisible to readers.
+    pub(crate) fn into_unmarked(self) -> &'a mut T {
+        self.value
+    }
 }
 
 /// A contiguous mutable component slice with lazy change tracking.

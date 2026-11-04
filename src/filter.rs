@@ -166,6 +166,34 @@ impl<R: Relation, S: Storage + ComponentLookup<PairOf<R>> + ComponentLookup<Rela
     };
     const STATE: usize = Self::index::<S>();
 }
+/// Matches sources whose links along `R` changed since this system last ran
+/// (related, retargeted, a target gained or lost, or edge data replaced), for
+/// either storage.
+pub struct Relinked<R>(PhantomData<fn() -> R>);
+impl<R: Relation> sealed::Sealed for Relinked<R> {}
+impl<R: Relation> QueryFilter for Relinked<R> {
+    type State = usize;
+    type Access = Read<Relates<R>>;
+    const ARCHETYPAL: bool = false;
+    fn requires(state: &usize, index: usize) -> bool {
+        *state == index
+    }
+    unsafe fn classify(index: &usize, table: &Table, window: ChangeWindow) -> TableMatch {
+        unsafe { <Changed<Relates<R>> as QueryFilter>::classify(index, table, window) }
+    }
+    fn matches(index: &usize, present: &[bool]) -> bool {
+        present[*index]
+    }
+    unsafe fn row(index: &usize, table: &Table, row: usize, window: ChangeWindow) -> bool {
+        unsafe { <Changed<Relates<R>> as QueryFilter>::row(index, table, row, window) }
+    }
+}
+impl<R: Relation, S: Storage + ComponentLookup<PairOf<R>> + ComponentLookup<Relates<R>>>
+    FilterFor<S> for Relinked<R>
+{
+    const VALID: bool = <Related<R> as FilterFor<S>>::VALID;
+    const STATE: usize = Related::<R>::index::<S>();
+}
 /// The component a `Related<R>` table is guaranteed to contain.
 const fn marks<T: 'static, R: Relation>() -> bool {
     if R::FRAGMENTING {
@@ -234,6 +262,15 @@ impl<R: Relation, F: Excluded<PairOf<R>> + Excluded<Relates<R>>> Disjoint<F> for
     } else {
         <F as Excluded<Relates<R>>>::VALUE
     };
+}
+impl<T: 'static, R: Relation> Required<T> for Relinked<R> {
+    const VALUE: bool = marks::<T, R>();
+}
+impl<T: 'static, R: Relation> Excluded<T> for Relinked<R> {
+    const VALUE: bool = false;
+}
+impl<R: Relation, F: Excluded<PairOf<R>> + Excluded<Relates<R>>> Disjoint<F> for Relinked<R> {
+    const VALUE: bool = <Related<R> as Disjoint<F>>::VALUE;
 }
 
 macro_rules! filter_access {

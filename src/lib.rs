@@ -35,7 +35,7 @@ pub use dispatch::{
     Plugins, Run, Schedule, Scheduled, schedule,
 };
 pub use executor::WorkerPool;
-pub use filter::{Added, Changed, Or, Related, With, Without};
+pub use filter::{Added, Changed, Or, Related, Relinked, With, Without};
 pub use graph::{GraphConfig, MAX_NODES, Node, ReadyGraph, node, ready};
 pub use hook::{Batch, Event, Hook, OnAdd, OnInsert, OnRemove, OnReplace, Trigger};
 pub use join::{From, JoinKind, Joined, To};
@@ -59,8 +59,9 @@ pub mod prelude {
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
         Entity, ExecutionMode, Has, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, NoInput,
         OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Query, Ref, Related,
-        Relates, Relation, Remote, Schedule, Single, Sources, Sparse, Storage, SyncPoint, Trigger,
-        With, Without, WorkerPool, World, exclusive, node, ready, schedule, sync_point, task,
+        Relates, Relation, Relinked, Remote, Schedule, Single, Sources, Sparse, Storage, SyncPoint,
+        Trigger, With, Without, WorkerPool, World, exclusive, node, ready, schedule, sync_point,
+        task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

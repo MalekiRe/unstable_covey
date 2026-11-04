@@ -303,18 +303,69 @@ unsafe impl<L: 'static, S: ComponentLookup<L>> FetchQuery<S> for LinksMut<L> {
 }
 
 /// Both sides of relation `R`, by entity: the world, or a hook's queries.
+/// `source`/`target` mark the side changed (`Relinked<R>`); back-index
+/// fix-ups go through `repoint`, which does not: the entity's links stay.
 trait Lists<R: Relation> {
     fn source(&mut self, entity: Entity) -> &mut SourceSide<R>;
     fn target(&mut self, entity: Entity) -> &mut TargetSide<R>;
+    fn source_unmarked(&mut self, entity: Entity) -> &mut SourceSide<R>;
+    fn target_unmarked(&mut self, entity: Entity) -> &mut TargetSide<R>;
+}
+/// An entry moved within one side: repoint its counterpart's back index.
+enum Moved {
+    /// Within a source's list: `(target, slot in target)` now sits at `index`.
+    InSource {
+        target: Entity,
+        slot: u32,
+        index: u32,
+    },
+    /// Within a target's list: `(source, index in source)` now sits at `slot`.
+    InTarget {
+        source: Entity,
+        index: u32,
+        slot: u32,
+    },
+}
+fn repoint<R: Relation>(lists: &mut impl Lists<R>, moved: Moved) {
+    match moved {
+        Moved::InSource {
+            target,
+            slot,
+            index,
+        } => {
+            lists.target_unmarked(target).entries_mut()[slot as usize].1 = index;
+        }
+        Moved::InTarget {
+            source,
+            index,
+            slot,
+        } => {
+            lists.source_unmarked(source).entries_mut()[index as usize].1 = slot;
+        }
+    }
 }
 /// Unlink `source`'s entry `index` from both sides; returns its target.
 fn unlink<R: Relation>(lists: &mut impl Lists<R>, source: Entity, index: u32) -> Entity {
     let (target, slot) = lists.source(source).entries()[index as usize];
     if let Some((moved, back)) = lists.source(source).swap_remove(index) {
-        lists.target(moved).entries_mut()[back as usize].1 = index;
+        repoint(
+            lists,
+            Moved::InSource {
+                target: moved,
+                slot: back,
+                index,
+            },
+        );
     }
     if let Some((moved, back)) = lists.target(target).swap_remove(slot) {
-        lists.source(moved).entries_mut()[back as usize].1 = slot;
+        repoint(
+            lists,
+            Moved::InTarget {
+                source: moved,
+                index: back,
+                slot,
+            },
+        );
     }
     target
 }
@@ -347,6 +398,20 @@ impl<S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>, R: 
             .into_inner()
             .side
     }
+    fn source_unmarked(&mut self, entity: Entity) -> &mut SourceSide<R> {
+        &mut self
+            .links_mut::<Relates<R>>(entity)
+            .unwrap()
+            .into_unmarked()
+            .side
+    }
+    fn target_unmarked(&mut self, entity: Entity) -> &mut TargetSide<R> {
+        &mut self
+            .links_mut::<Sources<R>>(entity)
+            .unwrap()
+            .into_unmarked()
+            .side
+    }
 }
 struct HookLists<'q, 'a, 'b, R: Relation> {
     sources: &'q mut Query<'a, LinksMut<Relates<R>>>,
@@ -358,6 +423,12 @@ impl<R: Relation> Lists<R> for HookLists<'_, '_, '_, R> {
     }
     fn target(&mut self, entity: Entity) -> &mut TargetSide<R> {
         &mut self.targets.get_mut(entity).unwrap().into_inner().side
+    }
+    fn source_unmarked(&mut self, entity: Entity) -> &mut SourceSide<R> {
+        &mut self.sources.get_mut(entity).unwrap().into_unmarked().side
+    }
+    fn target_unmarked(&mut self, entity: Entity) -> &mut TargetSide<R> {
+        &mut self.targets.get_mut(entity).unwrap().into_unmarked().side
     }
 }
 
@@ -484,7 +555,12 @@ impl<S: Storage> World<S> {
                 if let Some((moved, back)) = relates.side.swap_remove(index as u32)
                     && back != PENDING
                 {
-                    Lists::<R>::target(self, moved).entries_mut()[back as usize].1 = index as u32;
+                    let moved = Moved::InSource {
+                        target: moved,
+                        slot: back,
+                        index: index as u32,
+                    };
+                    repoint::<R>(self, moved);
                 }
                 continue;
             }

@@ -73,6 +73,9 @@ nothing!((), Exclusive);
 impl<C: Storage, R> Uses<C> for crate::filter::Related<R> {
     type Out = C;
 }
+impl<C: Storage, R> Uses<C> for crate::filter::Relinked<R> {
+    type Out = C;
+}
 macro_rules! component {
     ($($name:ident),*) => {$(
         impl<C: Insert<Components<T>>, T: 'static> Uses<C> for $name<T> {

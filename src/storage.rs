@@ -901,13 +901,13 @@ impl<S: Storage> World<S> {
             }
         };
         let row = self.prepare_move(location, destination);
-        let appears = !self.tables[location.table].present[relation]
-            && self.tables[destination].present[relation];
+        let appears = !self.tables[location.table].present[relation];
         self.transfer(location, destination);
-        if appears {
-            // The zero-sized marker has no value, but its tick slots do.
+        if self.tables[destination].present[relation] {
+            // The zero-sized marker has no value, but its tick slots do: every
+            // relink marks it changed (`Relinked<R>`), its first pair added.
             let tick = self.change_tick();
-            unsafe { self.tables[destination].columns[relation].mark(row, tick, true) };
+            unsafe { self.tables[destination].columns[relation].mark(row, tick, appears) };
         }
     }
     /// Whether `relation` is installed as fragmenting, and if so, linked.

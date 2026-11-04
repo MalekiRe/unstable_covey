@@ -750,3 +750,50 @@ fn fragmenting_joins_run_in_systems_and_infer_joined_components() {
         ]
     );
 }
+
+#[test]
+fn relinked_matches_changed_links_for_both_storages() {
+    struct Update;
+    impl Schedule for Update {}
+    #[derive(Default)]
+    struct Seen(Vec<Vec<u32>>);
+    let mut app = App::new()
+        .relation::<DockedAt, _>()
+        .relation::<InSquad, _>()
+        .add_systems(
+            Update,
+            |mut docked: Query<&Name, Relinked<DockedAt>>,
+             mut squads: Query<&Name, Relinked<InSquad>>,
+             mut seen: Single<&mut Seen>| {
+                let docked = docked.iter_mut().map(|n| n.0);
+                let squads = squads.iter_mut().map(|n| n.0 + 100);
+                seen.0
+                    .push(sorted(Iterator::chain(docked, squads).collect()));
+            },
+        )
+        .build();
+    let world = &mut app.world;
+    let seen = world.spawn_bundle((Seen::default(),));
+    let [a, b] = [10, 11].map(|i| world.spawn_bundle((Name(i),)));
+    let ships = [1, 2].map(|i| world.spawn_bundle((Name(i), DockedAt { berth: 0 }.to(a))));
+    let members = [1, 2].map(|i| world.spawn_bundle((Name(i), InSquad.to(a))));
+    app.emit(&Update);
+    app.emit(&Update);
+    // Retarget one of each, and replace one edge's data in place.
+    app.world.relate(ships[0], DockedAt { berth: 0 }, b);
+    app.world.relate(members[1], InSquad, b);
+    app.emit(&Update);
+    app.world.relate(ships[1], DockedAt { berth: 4 }, a);
+    // Relating an existing fragmenting pair changes nothing.
+    app.world.relate(members[1], InSquad, b);
+    app.emit(&Update);
+    // Losing a target unrelates: nothing left to match.
+    app.world.despawn(b);
+    app.emit(&Update);
+    let seen = &app.world.get::<Seen>(seen).unwrap().0;
+    assert_eq!(seen[0], [1, 2, 101, 102]);
+    assert_eq!(seen[1], Vec::<u32>::new());
+    assert_eq!(seen[2], [1, 102]);
+    assert_eq!(seen[3], [2]);
+    assert_eq!(seen[4], Vec::<u32>::new());
+}
