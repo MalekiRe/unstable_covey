@@ -22,7 +22,7 @@ use std::task::{Context, Poll, Waker};
 use std::thread::{self, Thread};
 
 use crate::access::{
-    Access, Against, Drives, Exclusive, Filtered, QueryAccess, Read, ValidAccess, Write,
+    Access, Against, Drives, Exclusive, Filtered, QueryAccess, Read, Union, ValidAccess, Write,
 };
 use crate::bridge::{BridgeCell, BridgeError, BridgeFn, StateBox, StateRef, in_task, site};
 use crate::change::{SystemWorld, next};
@@ -81,6 +81,11 @@ impl<S: Storage, A: Masks<S>, B: Masks<S>> Masks<S> for (A, B) {
     const EXCLUSIVE: bool = A::EXCLUSIVE || B::EXCLUSIVE;
 }
 impl<S: Storage, A: Masks<S>, B: Masks<S>> Masks<S> for QueryAccess<A, B> {
+    const READ: Mask = or(A::READ, B::READ);
+    const WRITE: Mask = or(A::WRITE, B::WRITE);
+    const EXCLUSIVE: bool = A::EXCLUSIVE || B::EXCLUSIVE;
+}
+impl<S: Storage, A: Masks<S>, B: Masks<S>> Masks<S> for Union<A, B> {
     const READ: Mask = or(A::READ, B::READ);
     const WRITE: Mask = or(A::WRITE, B::WRITE);
     const EXCLUSIVE: bool = A::EXCLUSIVE || B::EXCLUSIVE;
@@ -340,6 +345,9 @@ impl<Env, A: Within<Env>, B: Within<Env>> Within<Env> for (A, B) {
     const VALUE: bool = A::VALUE && B::VALUE;
 }
 impl<Env, A: Within<Env>, B: Within<Env>> Within<Env> for QueryAccess<A, B> {
+    const VALUE: bool = A::VALUE && B::VALUE;
+}
+impl<Env, A: Within<Env>, B: Within<Env>> Within<Env> for Union<A, B> {
     const VALUE: bool = A::VALUE && B::VALUE;
 }
 impl<Env, A: Within<Env>, F> Within<Env> for Filtered<A, F> {

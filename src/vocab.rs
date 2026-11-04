@@ -1,6 +1,6 @@
 //! Infers a world's component vocabulary from the systems an app composes.
 //! The result is an ordinary nested-pair schema, deduplicated by component type.
-use crate::access::{Drives, Exclusive, Filtered, QueryAccess, Read, Write};
+use crate::access::{Drives, Exclusive, Filtered, QueryAccess, Read, Union, Write};
 use crate::filter::{Added, Changed, Or, With, Without};
 use crate::lookup::{ComponentLookup, PointLookup};
 use crate::storage::{Components, Point, Sparse, Storage};
@@ -91,6 +91,9 @@ impl<C, A: Uses<C>, F: Uses<A::Out>> Uses<C> for Filtered<A, F> {
     type Out = F::Out;
 }
 impl<C, A: Uses<C>, B: Uses<A::Out>> Uses<C> for QueryAccess<A, B> {
+    type Out = B::Out;
+}
+impl<C, A: Uses<C>, B: Uses<A::Out>> Uses<C> for Union<A, B> {
     type Out = B::Out;
 }
 impl<C, F: Uses<C>> Uses<C> for Or<F> {

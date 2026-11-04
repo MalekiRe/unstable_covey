@@ -672,6 +672,11 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         ("duplicate_node", Some("E0080")),
         ("bridge_outside_envelope", Some("E0080")),
         ("unplaced_sync_point", Some("E0080")),
+        ("join_shared_iter", Some("E0080")),
+        ("join_many_to_many_write", Some("E0080")),
+        ("join_direct_alias", Some("E0080")),
+        ("join_nested_alias", Some("E0080")),
+        ("join_parallel_conflict", Some("E0080")),
     ] {
         std::fs::copy(
             root.join("tests/ui").join(format!("{fixture}.rs")),

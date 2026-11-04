@@ -1,12 +1,12 @@
 use crate::{
     Entity, Storage, World,
-    access::{Access, Read, ValidAccess, Write},
+    access::{Access, Conflict, Read, Union, ValidAccess, Write},
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
     filter::Related,
     filter::{FilterFor, QueryFilter, TableMatch},
     lookup::ComponentLookup,
     relation::Relation,
-    storage::{ColumnPtr, Locator, PairIndex, Table},
+    storage::{ColumnPtr, Locator, PairIndex, Reach, Table},
 };
 use std::{
     marker::PhantomData,
@@ -20,10 +20,28 @@ mod sealed {
     impl Sealed for super::Entity {}
     impl<A: Sealed, B: Sealed> Sealed for (A, B) {}
     impl<A: Sealed, B: Sealed, C: Sealed> Sealed for (A, B, C) {}
+    impl<R, Q> Sealed for crate::join::To<R, Q> {}
+    impl<R, Q> Sealed for crate::join::From<R, Q> {}
 }
 /// Sealed component, entity, or nested tuple query data.
 pub trait QueryData: sealed::Sealed {
+    /// Access to the row's own entity.
     type Access: Access;
+    /// Access to entities one join away; never the row itself.
+    #[doc(hidden)]
+    type Direct: Access;
+    /// Access to entities further away; possibly any entity, the row included.
+    #[doc(hidden)]
+    type Far: Access;
+    /// A direct write may reach one entity from several rows.
+    #[doc(hidden)]
+    const SHARED_WRITE: bool = false;
+    /// Contains a join (no contiguous form).
+    #[doc(hidden)]
+    const JOINS: bool = false;
+    /// Every join inside is sound on its own (see `JoinCheck::ROW_VALID`).
+    #[doc(hidden)]
+    const JOINS_VALID: bool = true;
     type Indices: Copy;
     type Fetch: Copy + Default;
     type Item<'w>;
@@ -34,8 +52,10 @@ pub trait QueryData: sealed::Sealed {
     fn requires(indices: &Self::Indices, component: usize) -> bool;
     /// # Safety
     /// Indices identify the correct types and the table matches. Writable
-    /// columns have their change summaries raised to `tick`.
-    unsafe fn fetch(table: &Table, indices: &Self::Indices, tick: u64) -> Self::Fetch;
+    /// columns have their change summaries raised to `tick`. `reach` is the
+    /// query's world; only items joining other entities use it.
+    unsafe fn fetch(reach: Reach, table: &Table, indices: &Self::Indices, tick: u64)
+    -> Self::Fetch;
     /// Whether every column indexes rows directly, with no archetype row map.
     fn direct(fetch: &Self::Fetch) -> bool;
     /// # Safety
@@ -47,6 +67,35 @@ pub trait QueryData: sealed::Sealed {
     /// # Safety
     /// All rows are contiguous, live, uniquely yielded, and access granted for 'a.
     unsafe fn slice<'a>(fetch: &Self::Fetch, len: usize, tick: u64) -> Self::Slice<'a>;
+}
+/// Join soundness of query data, from its own, direct, and far access.
+#[doc(hidden)]
+pub trait JoinCheck: QueryData {
+    /// Within one row: direct joins may reach the same entity, so they must
+    /// not conflict with each other; far joins may reach anything, the row
+    /// and direct targets included, so they conflict with nothing; and every
+    /// join is sound on its own: many-to-many joins never write, and a join
+    /// yielding several items holds an inner query whose items never alias.
+    const ROW_VALID: bool;
+    /// Every mutable reference one pass yields is to a distinct value, so
+    /// items may coexist: the query is an `Iterator`. Otherwise it offers
+    /// `each` and `iter_lending`, which keep one row alive at a time.
+    const UNIQUE: bool;
+}
+impl<D: QueryData> JoinCheck for D
+where
+    D::Direct: ValidAccess,
+    D::Far: ValidAccess + Conflict<D::Access> + Conflict<D::Direct>,
+    D::Access: Conflict<(D::Direct, D::Far)>,
+{
+    const ROW_VALID: bool = D::JOINS_VALID
+        && <D::Direct as ValidAccess>::VALID
+        && <D::Far as ValidAccess>::VALID
+        && !<D::Far as Conflict<D::Access>>::VALUE
+        && !<D::Far as Conflict<D::Direct>>::VALUE;
+    const UNIQUE: bool = !<D::Access as Conflict<(D::Direct, D::Far)>>::VALUE
+        && !<D::Far as Access>::WRITES
+        && !D::SHARED_WRITE;
 }
 /// # Safety
 /// VALID guarantees indices identify the unique requested component declarations.
@@ -117,6 +166,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     pub(crate) unsafe fn from_world<S: Storage>(world: *mut World<S>, window: ChangeWindow) -> Self
     where
         D: FetchQuery<S>,
+        D: JoinCheck,
         D::Access: ValidAccess,
         F: FilterFor<S>,
     {
@@ -124,6 +174,12 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             assert!(
                 D::VALID && F::VALID && D::Access::VALID,
                 "invalid query: missing/ambiguous component or conflicting access"
+            );
+            assert!(
+                D::ROW_VALID,
+                "invalid query: joins may alias. Joins cannot conflict with the row or \
+                 with each other; many-to-many joins cannot write; a join yielding several \
+                 items needs an inner query whose items never alias"
             );
         }
         Self {
@@ -143,7 +199,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         window: ChangeWindow,
     ) -> Self
     where
-        D: FetchQuery<S>,
+        D: FetchQuery<S> + JoinCheck,
         D::Access: ValidAccess,
         F: FilterFor<S>,
     {
@@ -192,6 +248,9 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         query.cached = true;
         query
     }
+    fn reach(&self) -> Reach {
+        Reach::new(self.locator, self.tables, self.pairs)
+    }
     fn tables(&self) -> Tables<'_> {
         match self.matching {
             Some(matching) => Tables::Indexed(self.tables, matching.iter(), self.cached),
@@ -214,13 +273,40 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
                 TableMatch::Maybe if !F::row(&self.filter, table, row, self.window) => return None,
                 _ => {}
             }
-            let fetch = D::fetch(table, &self.indices, self.window.now);
+            let fetch = D::fetch(self.reach(), table, &self.indices, self.window.now);
             Some(D::get(&fetch, row, self.window.now))
         }
     }
-    pub fn iter_mut(&mut self) -> QueryIter<'_, D, F> {
+    /// Iterate rows; items may be kept and compared. Queries whose joins can
+    /// reach one value from several rows (e.g. `To<OneToMany, &mut T>`) do
+    /// not compile here: use `each` or `iter_lending`.
+    pub fn iter_mut(&mut self) -> QueryIter<'_, D, F>
+    where
+        D: JoinCheck,
+    {
+        const {
+            assert!(
+                D::UNIQUE,
+                "this query's joins can reach one value from several rows: iterate with `each` or `iter_lending`"
+            );
+        }
+        self.iter_rows()
+    }
+    /// Call `f` for every row, one at a time: each item ends before the
+    /// next begins, so every query can use it.
+    #[inline]
+    pub fn each(&mut self, f: impl for<'r> FnMut(D::Item<'r>)) {
+        self.iter_rows().for_each(f);
+    }
+    /// Rows one at a time, as a lending iterator: each item borrows the
+    /// iterator until the next `fetch_next`, so every query can use it.
+    pub fn iter_lending(&mut self) -> QueryLending<'_, D, F> {
+        QueryLending(self.iter_rows())
+    }
+    fn iter_rows(&mut self) -> QueryIter<'_, D, F> {
         QueryIter {
             tables: self.tables(),
+            reach: self.reach(),
             indices: self.indices,
             filter: self.filter,
             window: self.window,
@@ -235,6 +321,9 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     /// Each item is one contiguous archetype slice (or tuple of slices).
     /// Row-filtered or fragmented queries fail before yielding any references.
     pub fn contiguous_mut(&mut self) -> Result<QueryChunks<'_, D, F>, ContiguousError> {
+        const {
+            assert!(!D::JOINS, "joins have no contiguous form");
+        }
         if !F::ARCHETYPAL {
             return Err(ContiguousError::RowFilter);
         }
@@ -243,7 +332,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             if !table.entities.is_empty()
                 && !unsafe {
                     D::contiguous(
-                        &D::fetch(table, &self.indices, self.window.now),
+                        &D::fetch(self.reach(), table, &self.indices, self.window.now),
                         table.entities.len(),
                     )
                 }
@@ -253,6 +342,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         }
         Ok(QueryChunks {
             tables: self.tables(),
+            reach: self.reach(),
             indices: self.indices,
             filter: self.filter,
             tick: self.window.now,
@@ -261,6 +351,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     }
     /// Exactly one fully matching entity across every matching archetype.
     pub fn single(self) -> Option<Single<'w, D, F>> {
+        let reach = self.reach();
         let mut tables = match self.matching {
             Some(entries) => Tables::Indexed(self.tables, entries.iter(), self.cached),
             None => Tables::All(self.tables.iter()),
@@ -293,7 +384,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         let (table, row) = matched?;
         Some(Single {
             item: unsafe {
-                let fetch = D::fetch(table, &self.indices, self.window.now);
+                let fetch = D::fetch(reach, table, &self.indices, self.window.now);
                 D::get(&fetch, row, self.window.now)
             },
             filter: PhantomData,
@@ -317,7 +408,7 @@ impl<'w, D: QueryData, R: Relation> Query<'w, D, Related<R>> {
             .get(&(self.filter, target))
             .map_or(&[][..], Vec::as_slice);
         let all = self.tables;
-        let mut iter = self.iter_mut();
+        let mut iter = self.iter_rows();
         iter.tables = Tables::Indexed(all, tables.iter(), false);
         iter
     }
@@ -351,6 +442,7 @@ impl<'w, D: QueryData, R: Relation> Query<'w, D, Related<R>> {
 }
 pub struct QueryIter<'a, D: QueryData, F: QueryFilter = ()> {
     tables: Tables<'a>,
+    reach: Reach,
     indices: D::Indices,
     filter: F::State,
     fetch: D::Fetch,
@@ -391,7 +483,7 @@ impl<'a, D: QueryData, F: QueryFilter> QueryIter<'a, D, F> {
         let Some((table, class)) = next else {
             return false;
         };
-        self.fetch = unsafe { D::fetch(table, &self.indices, self.window.now) };
+        self.fetch = unsafe { D::fetch(self.reach, table, &self.indices, self.window.now) };
         self.table = Some(table);
         self.row = 0;
         self.end = table.entities.len();
@@ -482,12 +574,30 @@ impl<'a, D: QueryData, F: QueryFilter> Iterator for QueryIter<'a, D, F> {
     }
 }
 impl<D: QueryData, F: QueryFilter> std::iter::FusedIterator for QueryIter<'_, D, F> {}
-impl<'a, 'w: 'a, D: QueryData, F: QueryFilter> IntoIterator for &'a mut Query<'w, D, F> {
+impl<'a, 'w: 'a, D: JoinCheck, F: QueryFilter> IntoIterator for &'a mut Query<'w, D, F> {
     type Item = D::Item<'a>;
     type IntoIter = QueryIter<'a, D, F>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
+}
+/// Rows one at a time; see `Query::iter_lending`.
+pub struct QueryLending<'a, D: QueryData, F: QueryFilter = ()>(QueryIter<'a, D, F>);
+impl<D: QueryData, F: QueryFilter> QueryLending<'_, D, F> {
+    /// The next row's item, alive until the next call.
+    #[allow(clippy::should_implement_trait)]
+    pub fn fetch_next(&mut self) -> Option<D::Item<'_>> {
+        // SAFETY: the item borrows `self`, so at most one is alive; the row
+        // iterator yields each row once.
+        self.0.next().map(|item| unsafe { shorten::<D>(item) })
+    }
+}
+/// Narrow an item's lifetime to the lending borrow.
+/// # Safety
+/// `'long` outlives `'short`; items are covariant in practice only through
+/// this explicit narrowing.
+unsafe fn shorten<'short, 'long: 'short, D: QueryData>(item: D::Item<'long>) -> D::Item<'short> {
+    unsafe { std::mem::transmute_copy(&std::mem::ManuallyDrop::new(item)) }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContiguousError {
@@ -505,6 +615,7 @@ impl std::fmt::Display for ContiguousError {
 impl std::error::Error for ContiguousError {}
 pub struct QueryChunks<'a, D: QueryData, F: QueryFilter = ()> {
     tables: Tables<'a>,
+    reach: Reach,
     indices: D::Indices,
     filter: F::State,
     tick: u64,
@@ -517,7 +628,7 @@ impl<'a, D: QueryData, F: QueryFilter> Iterator for QueryChunks<'a, D, F> {
             if !table.entities.is_empty() {
                 return Some(unsafe {
                     D::slice(
-                        &D::fetch(table, &self.indices, self.tick),
+                        &D::fetch(self.reach, table, &self.indices, self.tick),
                         table.entities.len(),
                         self.tick,
                     )
@@ -550,6 +661,8 @@ impl<D: QueryData, F: QueryFilter> DerefMut for Single<'_, D, F> {
 }
 impl<T: 'static> QueryData for &T {
     type Access = Read<T>;
+    type Direct = ();
+    type Far = ();
     type Indices = usize;
     type Fetch = ColumnPtr;
     type Item<'w> = &'w T;
@@ -560,7 +673,7 @@ impl<T: 'static> QueryData for &T {
     fn requires(index: &usize, component: usize) -> bool {
         *index == component
     }
-    unsafe fn fetch(table: &Table, index: &usize, _: u64) -> ColumnPtr {
+    unsafe fn fetch(_: Reach, table: &Table, index: &usize, _: u64) -> ColumnPtr {
         table.columns[*index]
     }
     fn direct(fetch: &ColumnPtr) -> bool {
@@ -582,6 +695,8 @@ unsafe impl<T: 'static, S: ComponentLookup<T>> FetchQuery<S> for &T {
 }
 impl<T: 'static> QueryData for &mut T {
     type Access = Write<T>;
+    type Direct = ();
+    type Far = ();
     type Indices = usize;
     type Fetch = ColumnPtr;
     type Item<'w> = Mut<'w, T>;
@@ -592,7 +707,7 @@ impl<T: 'static> QueryData for &mut T {
     fn requires(index: &usize, component: usize) -> bool {
         *index == component
     }
-    unsafe fn fetch(table: &Table, index: &usize, tick: u64) -> ColumnPtr {
+    unsafe fn fetch(_: Reach, table: &Table, index: &usize, tick: u64) -> ColumnPtr {
         let column = table.columns[*index];
         unsafe { column.touch(tick) };
         column
@@ -622,6 +737,8 @@ unsafe impl<T: 'static, S: ComponentLookup<T>> FetchQuery<S> for &mut T {
 }
 impl QueryData for Entity {
     type Access = ();
+    type Direct = ();
+    type Far = ();
     type Indices = ();
     type Fetch = *const Entity;
     type Item<'w> = Entity;
@@ -632,7 +749,7 @@ impl QueryData for Entity {
     fn requires(_: &(), _: usize) -> bool {
         false
     }
-    unsafe fn fetch(table: &Table, _: &(), _: u64) -> Self::Fetch {
+    unsafe fn fetch(_: Reach, table: &Table, _: &(), _: u64) -> Self::Fetch {
         table.entities.as_ptr()
     }
     fn direct(_: &Self::Fetch) -> bool {
@@ -653,13 +770,17 @@ unsafe impl<S: Storage> FetchQuery<S> for Entity {
     const INDICES: () = ();
 }
 macro_rules! tuple_query {
-    ($access:ty; $($data:ident:$index:tt),+) => {
+    ($access:ty, $direct:ty, $far:ty; $($data:ident:$index:tt),+) => {
         impl<$($data: QueryData),+> QueryData for ($($data,)+) {
-            type Access = $access; type Indices = ($($data::Indices,)+); type Fetch = ($($data::Fetch,)+);
+            type Access = $access; type Direct = $direct; type Far = $far;
+            const SHARED_WRITE: bool = false $(|| $data::SHARED_WRITE)+;
+            const JOINS: bool = false $(|| $data::JOINS)+;
+            const JOINS_VALID: bool = true $(&& $data::JOINS_VALID)+;
+            type Indices = ($($data::Indices,)+); type Fetch = ($($data::Fetch,)+);
             type Item<'w> = ($($data::Item<'w>,)+); type Slice<'w> = ($($data::Slice<'w>,)+);
             fn matches(indices: &Self::Indices, present: &[bool]) -> bool { true $(&& $data::matches(&indices.$index, present))+ }
             fn requires(indices: &Self::Indices, component: usize) -> bool { false $(|| $data::requires(&indices.$index, component))+ }
-            unsafe fn fetch(table: &Table, indices: &Self::Indices, tick: u64) -> Self::Fetch { unsafe { ($($data::fetch(table, &indices.$index, tick),)+) } }
+            unsafe fn fetch(reach: Reach, table: &Table, indices: &Self::Indices, tick: u64) -> Self::Fetch { unsafe { ($($data::fetch(reach, table, &indices.$index, tick),)+) } }
             fn direct(fetch: &Self::Fetch) -> bool { true $(&& $data::direct(&fetch.$index))+ }
             unsafe fn get<'a>(fetch: &Self::Fetch, row: usize, tick: u64) -> Self::Item<'a> { unsafe { ($($data::get(&fetch.$index, row, tick),)+) } }
             unsafe fn contiguous(fetch: &Self::Fetch, len: usize) -> bool { true $(&& unsafe { $data::contiguous(&fetch.$index, len) })+ }
@@ -668,20 +789,27 @@ macro_rules! tuple_query {
         unsafe impl<S: Storage, $($data: FetchQuery<S>),+> FetchQuery<S> for ($($data,)+) { const VALID: bool = true $(&& $data::VALID)+; const INDICES: Self::Indices = ($($data::INDICES,)+); }
     };
 }
-tuple_query!((A::Access, B::Access); A:0, B:1);
-tuple_query!((A::Access, (B::Access, C::Access)); A:0, B:1, C:2);
+tuple_query!((A::Access, B::Access), (A::Direct, B::Direct), (A::Far, B::Far); A:0, B:1);
+tuple_query!(
+    (A::Access, (B::Access, C::Access)),
+    (A::Direct, (B::Direct, C::Direct)),
+    (A::Far, (B::Far, C::Far));
+    A:0, B:1, C:2
+);
 impl<S: Storage> World<S> {
-    pub fn query<D: FetchQuery<S>>(&mut self) -> Query<'_, D>
+    pub fn query<D: FetchQuery<S> + JoinCheck>(&mut self) -> Query<'_, D>
     where
         D::Access: ValidAccess,
     {
         self.query_filtered::<D, ()>()
     }
-    pub fn query_filtered<D: FetchQuery<S>, F: FilterFor<S>>(&mut self) -> Query<'_, D, F>
+    pub fn query_filtered<D: FetchQuery<S> + JoinCheck, F: FilterFor<S>>(
+        &mut self,
+    ) -> Query<'_, D, F>
     where
         D::Access: ValidAccess,
     {
-        let now = if D::Access::WRITES {
+        let now = if <Union<D::Access, (D::Direct, D::Far)> as Access>::WRITES {
             self.change_tick()
         } else {
             self.latest_tick()
@@ -691,13 +819,15 @@ impl<S: Storage> World<S> {
             .map(|i| self.component_tables[i].as_slice());
         query
     }
-    pub fn single<D: FetchQuery<S>>(&mut self) -> Option<Single<'_, D>>
+    pub fn single<D: FetchQuery<S> + JoinCheck>(&mut self) -> Option<Single<'_, D>>
     where
         D::Access: ValidAccess,
     {
         self.query::<D>().single()
     }
-    pub fn single_filtered<D: FetchQuery<S>, F: FilterFor<S>>(&mut self) -> Option<Single<'_, D, F>>
+    pub fn single_filtered<D: FetchQuery<S> + JoinCheck, F: FilterFor<S>>(
+        &mut self,
+    ) -> Option<Single<'_, D, F>>
     where
         D::Access: ValidAccess,
     {

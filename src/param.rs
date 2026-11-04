@@ -1,10 +1,10 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::access::{Access, Filtered, QueryAccess, ValidAccess};
+use crate::access::{Access, Filtered, QueryAccess, Union, ValidAccess};
 use crate::change::{ChangeWindow, SystemWorld};
 use crate::command::{CommandQueue, Commands};
 use crate::filter::{FilterFor, QueryFilter};
-use crate::query::{FetchQuery, QueryData, QueryState};
+use crate::query::{FetchQuery, JoinCheck, QueryData, QueryState};
 use crate::{Query, Remote, Single, Storage, World};
 
 pub struct Local<'s, T: 'static>(&'s mut T);
@@ -79,7 +79,9 @@ unsafe impl<S: Storage> Param<World<S>> for &Remote<S> {
     }
 }
 impl<D: QueryData, F: QueryFilter> ParamShape for Query<'_, D, F> {
-    type Access = Filtered<QueryAccess<D::Access, F::Access>, F>;
+    /// The row filter narrows the rows' own access; joins reach other
+    /// entities whatever the filter.
+    type Access = Union<Filtered<QueryAccess<D::Access, F::Access>, F>, (D::Direct, D::Far)>;
     type State = QueryState;
     type Item<'a> = Query<'a, D, F>;
 }
@@ -88,8 +90,9 @@ impl<D: QueryData, F: QueryFilter> ParamShape for Query<'_, D, F> {
 unsafe impl<S: Storage, D: FetchQuery<S>, F: FilterFor<S>> Param<World<S>> for Query<'_, D, F>
 where
     D::Access: ValidAccess,
+    D: JoinCheck,
 {
-    const VALID: bool = D::VALID && F::VALID && D::Access::VALID;
+    const VALID: bool = D::VALID && F::VALID && D::Access::VALID && D::ROW_VALID;
     unsafe fn fetch<'a>(
         world: *mut World<S>,
         state: &'a mut QueryState,
@@ -99,7 +102,7 @@ where
     }
 }
 impl<D: QueryData, F: QueryFilter> ParamShape for Single<'_, D, F> {
-    type Access = Filtered<QueryAccess<D::Access, F::Access>, F>;
+    type Access = Union<Filtered<QueryAccess<D::Access, F::Access>, F>, (D::Direct, D::Far)>;
     type State = QueryState;
     type Item<'a> = Single<'a, D, F>;
 }
@@ -107,8 +110,9 @@ impl<D: QueryData, F: QueryFilter> ParamShape for Single<'_, D, F> {
 unsafe impl<S: Storage, D: FetchQuery<S>, F: FilterFor<S>> Param<World<S>> for Single<'_, D, F>
 where
     D::Access: ValidAccess,
+    D: JoinCheck,
 {
-    const VALID: bool = D::VALID && F::VALID && D::Access::VALID;
+    const VALID: bool = D::VALID && F::VALID && D::Access::VALID && D::ROW_VALID;
     unsafe fn fetch<'a>(
         world: *mut World<S>,
         state: &'a mut QueryState,

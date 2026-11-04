@@ -338,6 +338,61 @@ impl Locator<'_> {
         slot.location.map(|location| (location.table, location.row))
     }
 }
+/// What a query item may reach beyond its own row: entity locations, every
+/// table, and the pair index. Raw, so fetches stay `Copy`; valid while the
+/// query that made it borrows the world.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub struct Reach {
+    world: u64,
+    slots: *const [Slot],
+    tables: *const [Table],
+    pairs: *const PairIndex,
+}
+impl Default for Reach {
+    fn default() -> Self {
+        Self {
+            world: u64::MAX,
+            slots: &[],
+            tables: &[],
+            pairs: std::ptr::null(),
+        }
+    }
+}
+impl Reach {
+    pub(crate) fn new(locator: Locator<'_>, tables: &[Table], pairs: &PairIndex) -> Self {
+        Self {
+            world: locator.world,
+            slots: locator.slots,
+            tables,
+            pairs,
+        }
+    }
+    /// The live entity's table and logical row.
+    /// # Safety
+    /// The world this reach was made from is still borrowed by its query.
+    pub(crate) unsafe fn find<'a>(self, entity: Entity) -> Option<(&'a Table, usize)> {
+        let locator = Locator {
+            world: self.world,
+            slots: unsafe { &*self.slots },
+        };
+        let (table, row) = locator.find(entity)?;
+        Some((unsafe { &(&*self.tables)[table] }, row))
+    }
+    /// # Safety
+    /// As `find`.
+    pub(crate) unsafe fn table<'a>(self, table: usize) -> &'a Table {
+        unsafe { &(&*self.tables)[table] }
+    }
+    /// The tables holding pair `(relation, target)`.
+    /// # Safety
+    /// As `find`.
+    pub(crate) unsafe fn pair_tables<'a>(self, relation: usize, target: Entity) -> &'a [usize] {
+        unsafe { self.pairs.as_ref() }
+            .and_then(|pairs| pairs.get(&(relation, target)))
+            .map_or(&[], Vec::as_slice)
+    }
+}
 struct Archetype {
     dense: usize,
     sparse: Store,

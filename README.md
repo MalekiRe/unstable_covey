@@ -281,7 +281,7 @@ impl Relation for ChildOf {
 let mut app = App::new().relation::<ChildOf, _>().build();
 let world = &mut app.world;
 let (parent, child) = (world.spawn(), world.spawn());
-world.relate::<ChildOf>(child, parent);
+world.relate(child, ChildOf, parent);
 assert_eq!(world.get::<Relates<ChildOf>>(child).unwrap().target(), parent);
 assert_eq!(world.get::<Sources<ChildOf>>(parent).unwrap().len(), 1);
 world.despawn(parent);

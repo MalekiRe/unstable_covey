@@ -16,6 +16,7 @@ mod executor;
 mod filter;
 mod graph;
 mod hook;
+mod join;
 mod lookup;
 mod param;
 mod plan;
@@ -37,6 +38,7 @@ pub use executor::WorkerPool;
 pub use filter::{Added, Changed, Or, Related, With, Without};
 pub use graph::{GraphConfig, MAX_NODES, Node, ReadyGraph, node, ready};
 pub use hook::{Batch, Event, Hook, OnAdd, OnInsert, OnRemove, OnReplace, Trigger};
+pub use join::{From, JoinKind, Joined, To};
 pub use lookup::ComponentLookup as Has;
 pub use param::Local;
 pub use plan::{

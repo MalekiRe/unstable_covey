@@ -156,6 +156,30 @@ impl ValidAccess for Exclusive {
     const VALID: bool = true;
 }
 
+/// A query's own access and its joins' access: one set for scheduling. The
+/// two halves touch different entities, so no conflict between them makes
+/// the pair invalid; the query's join checks decide which overlaps are sound.
+pub struct Union<A, B>(PhantomData<fn() -> (A, B)>);
+impl<A: Access, B: Access> Access for Union<A, B> {
+    const WRITES: bool = A::WRITES || B::WRITES;
+    const EXCLUSIVE: bool = A::EXCLUSIVE || B::EXCLUSIVE;
+}
+impl<A: ValidAccess, B: ValidAccess> ValidAccess for Union<A, B> {
+    const VALID: bool = A::VALID && B::VALID;
+}
+impl<T: 'static, const W: bool, A: Against<T, W>, B: Against<T, W>> Against<T, W> for Union<A, B> {
+    const VALUE: bool = A::VALUE || B::VALUE;
+}
+impl<A: Conflict<R>, B: Conflict<R>, R> Conflict<R> for Union<A, B> {
+    const VALUE: bool = A::VALUE || B::VALUE;
+}
+impl<A, F, B, C> Conflict<Union<B, C>> for Filtered<A, F>
+where
+    Self: Conflict<B> + Conflict<C>,
+{
+    const VALUE: bool = <Self as Conflict<B>>::VALUE || <Self as Conflict<C>>::VALUE;
+}
+
 /// Query data and filter reads may overlap inside one query (e.g.
 /// Query<&mut T, Changed<T>>), but both participate in external conflicts.
 pub struct QueryAccess<A, B>(PhantomData<fn() -> (A, B)>);
