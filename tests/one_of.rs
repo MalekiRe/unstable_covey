@@ -190,6 +190,41 @@ fn removed_members_fire_replace_and_remove_with_old_values_before_add() {
     );
 }
 
+struct Update;
+impl Schedule for Update {}
+
+#[test]
+fn sibling_filters_are_disjoint_so_their_writers_run_together() {
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (
+                // Both borrows live at once: no entity matches both filters.
+                |mut walkers: Query<&mut u32, With<Walking>>,
+                 mut runners: Query<&mut u32, With<Running>>| {
+                    let mut walker = walkers.iter_mut().next().unwrap();
+                    let mut runner = runners.iter_mut().next().unwrap();
+                    *walker += 1;
+                    *runner += *walker;
+                },
+                (
+                    |mut q: Query<&mut u32, With<Walking>>| q.iter_mut().for_each(|mut n| *n *= 10),
+                    |mut q: Query<&mut u32, (With<Running>, Without<Dead>)>| {
+                        q.iter_mut().for_each(|mut n| *n *= 100)
+                    },
+                )
+                    .parallel(),
+            )
+                .chain(),
+        )
+        .build();
+    let walker = app.world.spawn_bundle((Walking(0), 1_u32));
+    let runner = app.world.spawn_bundle((Running(0), 5_u32));
+    app.emit(&Update);
+    assert_eq!(app.world.get::<u32>(walker), Some(&20));
+    assert_eq!(app.world.get::<u32>(runner), Some(&700));
+}
+
 /// A rider walks: its required Walking removes Running.
 #[derive(Default)]
 struct Rider;

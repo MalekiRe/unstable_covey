@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 
 use crate::access::{Access, Read};
 use crate::change::ChangeWindow;
+use crate::one_of::Shares;
 use crate::relation::{PairOf, Relates, Relation};
 use crate::storage::Table;
 use crate::{Storage, access::Same, lookup::ComponentLookup};
@@ -215,6 +216,11 @@ pub trait Excluded<T: 'static> {
     const VALUE: bool;
 }
 
+/// Holding `U` excludes `T` when they are distinct and share a `OneOf` group.
+const fn excludes<T: 'static, U: 'static>() -> bool {
+    <U as Shares<T>>::VALUE && !<T as Same<U>>::VALUE
+}
+
 /// A conservative, directional proof that two filters cannot both match.
 /// Access proofs check both directions: conjunctions can expose a useful
 /// requirement on either side, while every OR alternative must be disjoint.
@@ -236,7 +242,7 @@ impl<T: 'static, U: 'static> Required<T> for With<U> {
     const VALUE: bool = <T as Same<U>>::VALUE;
 }
 impl<T: 'static, U: 'static> Excluded<T> for With<U> {
-    const VALUE: bool = false;
+    const VALUE: bool = excludes::<T, U>();
 }
 impl<T: 'static, U: 'static> Required<T> for Without<U> {
     const VALUE: bool = false;
@@ -404,8 +410,8 @@ macro_rules! change_filter {
         impl<T: 'static, U: 'static> Required<T> for $name<U> {
             const VALUE: bool = <T as Same<U>>::VALUE;
         }
-        impl<T: 'static, U> Excluded<T> for $name<U> {
-            const VALUE: bool = false;
+        impl<T: 'static, U: 'static> Excluded<T> for $name<U> {
+            const VALUE: bool = excludes::<T, U>();
         }
         impl<T: 'static, F: Excluded<T>> Disjoint<F> for $name<T> {
             const VALUE: bool = F::VALUE;

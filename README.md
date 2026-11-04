@@ -216,7 +216,10 @@ assert!(world.despawn(entity));
   `Running` (`Locomotion`) and `Dead` (`Life`) may coexist. A bundle with two
   members sharing a group does not compile; a requirement shared with an
   inserted member's group panics on the first such insert. Bundles without
-  members or requirements compile to the plain path.
+  members or requirements compile to the plain path. Filters on members
+  sharing a group (`With<Walking>`, `With<Running>`, `Added`, `Changed`)
+  never match one entity, so writers filtered by each run in parallel and
+  may share a system; members of unrelated groups still conflict.
 - Tuple bundles (1–16 components) work with `spawn_bundle`, `spawn_batch`,
   `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
   multi-component transitions in a small table keyed by a compile-time hash of
