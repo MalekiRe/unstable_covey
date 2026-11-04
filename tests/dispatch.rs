@@ -2,7 +2,7 @@ use static_ecs::{
     App, Entity, Has, Plugin, Query, Ref, Schedule, Single, Sparse, Storage, Systems, With,
     Without, World, exclusive, schedule,
 };
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 mod first {
     pub struct Event(pub u32);
@@ -20,7 +20,7 @@ struct Unhandled;
 impl Schedule for Unhandled {}
 
 /// A plugin borrowing the caller's log: systems capture the plugin's fields.
-struct Events<'a>(&'a RefCell<Vec<(&'static str, u32)>>);
+struct Events<'a>(&'a Mutex<Vec<(&'static str, u32)>>);
 impl Plugin for Events<'_> {
     type Components = ();
     fn systems<S: Storage>(self) -> impl Systems<S> {
@@ -29,14 +29,14 @@ impl Plugin for Events<'_> {
         (
             schedule(first::Event, move |e: &first::Event| {
                 count += 1;
-                log.borrow_mut().push(("first", e.0 * count));
+                log.lock().unwrap().push(("first", e.0 * count));
             }),
             (
                 schedule(second::Event, move |e: &second::Event| {
-                    log.borrow_mut().push(("other", e.0))
+                    log.lock().unwrap().push(("other", e.0))
                 }),
                 schedule(first::Event, move |e: &first::Event| {
-                    log.borrow_mut().push(("last", e.0))
+                    log.lock().unwrap().push(("last", e.0))
                 }),
             ),
         )
@@ -45,7 +45,7 @@ impl Plugin for Events<'_> {
 
 #[test]
 fn specialization_filters_types_preserving_order_and_captures() {
-    let log = RefCell::new(Vec::new());
+    let log = Mutex::new(Vec::new());
     let mut app = App::new().add_plugins(Events(&log)).build();
     app.emit(&first::Event(3));
     app.emit(&Unhandled);
@@ -53,7 +53,7 @@ fn specialization_filters_types_preserving_order_and_captures() {
     app.emit(&first::Event(5));
     drop(app);
     assert_eq!(
-        *log.borrow(),
+        *log.lock().unwrap(),
         vec![
             ("first", 3),
             ("last", 3),
@@ -147,23 +147,23 @@ fn the_world_stores_every_component_any_registration_uses_once() {
 
 struct Tick;
 impl Schedule for Tick {}
-struct Push<'a>(&'a RefCell<Vec<&'static str>>, &'static str);
+struct Push<'a>(&'a Mutex<Vec<&'static str>>, &'static str);
 impl Plugin for Push<'_> {
     type Components = ();
     fn systems<S: Storage>(self) -> impl Systems<S> {
         let Push(log, name) = self;
-        schedule(Tick, move || log.borrow_mut().push(name))
+        schedule(Tick, move || log.lock().unwrap().push(name))
     }
 }
 
 #[test]
 fn plugins_run_where_they_were_added_in_tuples_of_any_shape() {
-    let log = RefCell::new(Vec::new());
+    let log = Mutex::new(Vec::new());
     let push = |name| Push(&log, name);
     let mut app = App::new()
-        .add_systems(Tick, || log.borrow_mut().push("app first"))
+        .add_systems(Tick, || log.lock().unwrap().push("app first"))
         .add_plugins(push("single"))
-        .add_systems(Tick, || log.borrow_mut().push("between"))
+        .add_systems(Tick, || log.lock().unwrap().push("between"))
         .add_plugins((
             push("a"),
             push("b"),
@@ -172,12 +172,12 @@ fn plugins_run_where_they_were_added_in_tuples_of_any_shape() {
             push("f"),
             push("g"),
         ))
-        .add_systems(Tick, || log.borrow_mut().push("app last"))
+        .add_systems(Tick, || log.lock().unwrap().push("app last"))
         .build();
     app.emit(&Tick);
     drop(app);
     assert_eq!(
-        *log.borrow(),
+        *log.lock().unwrap(),
         [
             "app first",
             "single",

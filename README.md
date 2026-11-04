@@ -142,10 +142,11 @@ assert_eq!(total, 9);
 - `add_plugins` takes a plugin, a `task(...)`, or a tuple of up to 12 of them,
   applied left to right. The `demo/` crates compose two independent plugin
   crates.
-- A plugin's systems stay opaque in the built app's type; dispatch into them
-  is resolved when the app is compiled, statically as for any other system.
-  Because they are opaque, an app with plugins cannot prove it is `Send`
-  (to move it to another thread), though its frames still run in parallel.
+- A plugin's systems are `Send` (they capture `Mutex`, atomics, or owned data,
+  not `RefCell` or `Rc`), so an app built from plugins can move to another
+  thread whenever its own systems can. They stay opaque in the app's type;
+  dispatch into them is resolved when the app is compiled, statically as for
+  any other system.
 
 `.build()` creates the world and checks every system against it.
 

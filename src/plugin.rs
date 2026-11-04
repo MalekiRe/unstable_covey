@@ -55,21 +55,24 @@ pub trait Plugin: Sized {
     type Relations = ();
     /// The plugin's systems, for the app's final world `S`: anything
     /// `schedule(...)` or `task(...)` returns, or a tuple of those (up to 12,
-    /// nested freely), registered in order where the plugin was added.
+    /// nested freely), registered in order where the plugin was added. They
+    /// must be `Send` (see `Systems`).
     fn systems<S: Storage>(self) -> impl Systems<S>;
 }
 
 /// Systems a plugin returns for world `S`: `schedule(label, systems)`,
-/// `task(body)`, another plugin's `systems::<S>()`, or a tuple of them.
+/// `task(body)`, another plugin's `systems::<S>()`, or a tuple of them. They
+/// are `Send`, so an app built from plugins can move to another thread:
+/// capture `Mutex`, atomics, or owned data rather than `RefCell` or `Rc`.
 pub trait Systems<S: Storage> {
     #[doc(hidden)]
-    type Listeners: Fits<World<S>>;
+    type Listeners: Fits<World<S>> + Send;
     #[doc(hidden)]
     type Hooks: HookList<S> + Send + Sync + 'static;
     #[doc(hidden)]
     fn split(self) -> (Self::Listeners, Self::Hooks);
 }
-impl<S: Storage, E: 'static, H: Handle<E, World<S>>> Systems<S> for On<E, H> {
+impl<S: Storage, E: 'static, H: Handle<E, World<S>> + Send> Systems<S> for On<E, H> {
     type Listeners = Self;
     type Hooks = Nil;
     fn split(self) -> (Self, Nil) {
@@ -96,7 +99,10 @@ where
         (Nil, self)
     }
 }
-impl<S: Storage, F: TaskFn<S>> Systems<S> for Task<S, F> {
+impl<S: Storage, F: TaskFn<S>> Systems<S> for Task<S, F>
+where
+    Self: Send,
+{
     type Listeners = Self;
     type Hooks = Nil;
     fn split(self) -> (Self, Nil) {
@@ -268,8 +274,8 @@ relation_list!(A, B, D, E, F, G, H, I);
 pub struct Pending<P>(pub(crate) P);
 
 /// A builder's listener list for world `S`: plugins become their systems,
-/// whose hooks are returned beside it. Only a plugin's systems are opaque, so
-/// the app stays `Send` exactly when its systems are.
+/// whose hooks are returned beside it. Only a plugin's systems are opaque, and
+/// they promise `Send`, so the app is `Send` exactly when its systems are.
 #[doc(hidden)]
 pub trait Instantiate<S: Storage> {
     type Listeners: Fits<World<S>>;
@@ -307,7 +313,7 @@ impl<S: Storage, F: TaskFn<S>> Instantiate<S> for Task<S, F> {
     }
 }
 impl<S: Storage, P: Plugin> Instantiate<S> for Pending<P> {
-    type Listeners = impl Fits<World<S>>;
+    type Listeners = impl Fits<World<S>> + Send;
     type Hooks = impl HookList<S> + Send + Sync + 'static;
     fn instantiate(self) -> (Self::Listeners, Self::Hooks) {
         self.0.systems::<S>().split()
