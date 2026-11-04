@@ -182,6 +182,41 @@ Final states match in all 60 processes. Intermediate commits measured
 code, measured 0.0294: the same kind of build-to-build code generation swing
 as the schema change above, not a per-frame cost of the new paths.
 
+## Plugins as types (`20db359` → `b0f81c2`)
+
+Plugins declare their components and build their systems for the final world;
+`build` instantiates them. `complex_static_plugin` registers every system of
+the matched simulation except the exclusive mutation stage through one plugin
+(`type Components` lists all 25 types); `complex_static` is unchanged. Five
+rotating repetitions per row, cores 4–7 (`plugin-paired.json`):
+
+| Actors | Workers | Before ms | After ms | Change | As plugin ms | Change |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 0.0698 | 0.0704 | +0.8% | 0.0713 | +2.2% |
+| 0 | 4 | 0.0345 | 0.0350 | +1.3% | 0.0372 | +7.8% |
+| 4,096 | 1 | 1.282 | 1.269 | −1.1% | 1.273 | −0.7% |
+| 4,096 | 4 | 1.239 | 1.212 | −2.2% | 1.209 | −2.4% |
+| 100,000 | 1 | 101.0 | 100.0 | −1.0% | 100.1 | −0.9% |
+| 100,000 | 4 | 86.0 | 84.7 | −1.5% | 84.2 | −2.1% |
+
+Final states match in all 90 processes. The empty 4-worker row swings by about
+5 µs between builds of identical source (0.0298 and 0.0345 ms for `20db359`);
+a run on an earlier build of the plugin variant measured +28% there with 0.8%
+more instructions and no extra context switches, so it reflects how the
+parallel frame's waits line up, not per-frame work.
+
+Compile time of the one binary crate (release, `-Ztime-passes`, single runs):
+
+| Build | Type check s | Mono collection s | Total s |
+|---|---:|---:|---:|
+| before, `complex_static` | 41.2 | 22.2 | 69.6 |
+| after, `complex_static` | 44.0 | 21.1 | 71.2 |
+| after, `complex_static_plugin` | 4.7 | 21.7 | 32.7 |
+
+A plugin's systems are checked against the world once, at `build`, instead of
+each system extending the inferred component set in turn, so type checking
+drops by 89% and the build by 53%.
+
 ## Schedule inputs (`3476d77` → current)
 
 Systems now receive their label's input through the frame, and `add_systems`
