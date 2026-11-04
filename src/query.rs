@@ -1,8 +1,9 @@
 use crate::{
     Entity, Storage, World,
-    access::{Access, Conflict, Read, Union, ValidAccess, Write},
+    access::{Access, Conflict, Mentions, Read, Union, ValidAccess, Write},
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
     filter::{FilterFor, QueryFilter, TableMatch},
+    init::Init,
     join::Cascading,
     lookup::ComponentLookup,
     relation::LinkComponent,
@@ -18,9 +19,31 @@ mod sealed {
     impl<T: 'static> Sealed for &T {}
     impl<T: 'static> Sealed for &mut T {}
     impl Sealed for super::Entity {}
-    impl<A: Sealed, B: Sealed> Sealed for (A, B) {}
-    impl<A: Sealed, B: Sealed, C: Sealed> Sealed for (A, B, C) {}
+    macro_rules! sealed_tuple {
+        ($($t:ident),+) => { impl<$($t: Sealed),+> Sealed for ($($t,)+) {} };
+    }
+    sealed_tuple!(D0, D1);
+    sealed_tuple!(D0, D1, D2);
+    sealed_tuple!(D0, D1, D2, D3);
+    sealed_tuple!(D0, D1, D2, D3, D4);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6, D7);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6, D7, D8);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6, D7, D8, D9);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12);
+    sealed_tuple!(D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13);
+    sealed_tuple!(
+        D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D14
+    );
+    sealed_tuple!(
+        D0, D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D14, D15
+    );
     impl<R, Q> Sealed for crate::join::To<R, Q> {}
+    impl<Q: Sealed> Sealed for Option<Q> {}
+    impl<T> Sealed for super::Has<T> {}
     impl<L> Sealed for crate::relation::LinksMut<L> {}
     impl<R, Q> Sealed for crate::join::From<R, Q> {}
 }
@@ -47,7 +70,7 @@ pub trait QueryData: sealed::Sealed {
     #[doc(hidden)]
     const WRITES_LINKS: bool = false;
     type Indices: Copy;
-    type Fetch: Copy + Default;
+    type Fetch: Copy + Init;
     type Item<'w>;
     type Slice<'w>;
     #[doc(hidden)]
@@ -110,6 +133,11 @@ pub unsafe trait FetchQuery<S: Storage>: QueryData {
 #[doc(hidden)]
 #[derive(Default)]
 pub struct QueryState(Option<Box<MatchingTables>>);
+impl Init for QueryState {
+    fn init() -> Self {
+        Self(None)
+    }
+}
 struct MatchingTables {
     world: u64,
     scanned: usize,
@@ -413,7 +441,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             filter: self.filter,
             window: self.window,
             table: None,
-            fetch: Default::default(),
+            fetch: Init::init(),
             row: 0,
             end: 0,
             class: TableMatch::None,
@@ -823,10 +851,113 @@ unsafe impl<S: Storage> FetchQuery<S> for Entity {
     const VALID: bool = true;
     const INDICES: () = ();
 }
+/// `Q` where the row matches it, `None` elsewhere: every row matches. Its
+/// access is `Q`'s, so `Option<&mut T>` schedules like `&mut T`.
+impl<Q: QueryData> QueryData for Option<Q> {
+    type Access = Q::Access;
+    type Direct = Q::Direct;
+    type Far = Q::Far;
+    const SHARED_WRITE: bool = Q::SHARED_WRITE;
+    const JOINS: bool = Q::JOINS;
+    const JOINS_VALID: bool = Q::JOINS_VALID;
+    const WRITES_LINKS: bool = Q::WRITES_LINKS;
+    type Indices = Q::Indices;
+    /// Resolved per table: a table matches `Q` for all its rows or none.
+    type Fetch = Option<Q::Fetch>;
+    type Item<'w> = Option<Q::Item<'w>>;
+    type Slice<'w> = Option<Q::Slice<'w>>;
+    fn matches(_: &Self::Indices, _: &[bool]) -> bool {
+        true
+    }
+    fn requires(_: &Self::Indices, _: usize) -> bool {
+        false
+    }
+    unsafe fn fetch(
+        reach: Reach,
+        table: &Table,
+        indices: &Self::Indices,
+        tick: u64,
+    ) -> Self::Fetch {
+        Q::matches(indices, &table.present)
+            .then(|| unsafe { Q::fetch(reach, table, indices, tick) })
+    }
+    fn direct(fetch: &Self::Fetch) -> bool {
+        fetch.as_ref().is_none_or(Q::direct)
+    }
+    #[inline(always)]
+    unsafe fn get<'a>(fetch: &Self::Fetch, row: usize, tick: u64) -> Self::Item<'a> {
+        fetch
+            .as_ref()
+            .map(|fetch| unsafe { Q::get(fetch, row, tick) })
+    }
+    unsafe fn contiguous(fetch: &Self::Fetch, len: usize) -> bool {
+        fetch
+            .as_ref()
+            .is_none_or(|fetch| unsafe { Q::contiguous(fetch, len) })
+    }
+    unsafe fn slice<'a>(fetch: &Self::Fetch, len: usize, tick: u64) -> Self::Slice<'a> {
+        fetch
+            .as_ref()
+            .map(|fetch| unsafe { Q::slice(fetch, len, tick) })
+    }
+}
+// SAFETY: exactly `Q`'s indices; `Q` is fetched only from tables matching it.
+unsafe impl<S: Storage, Q: FetchQuery<S>> FetchQuery<S> for Option<Q> {
+    const VALID: bool = Q::VALID;
+    const INDICES: Self::Indices = Q::INDICES;
+}
+
+/// Whether the row has component `T`, without accessing it: no conflict
+/// with systems writing `T`. Mentioning `T` stores it in the world.
+pub struct Has<T>(PhantomData<fn() -> T>);
+impl<T: 'static> QueryData for Has<T> {
+    type Access = Mentions<T>;
+    type Direct = ();
+    type Far = ();
+    type Indices = usize;
+    type Fetch = bool;
+    type Item<'w> = bool;
+    type Slice<'w> = bool;
+    fn matches(_: &usize, _: &[bool]) -> bool {
+        true
+    }
+    fn requires(_: &usize, _: usize) -> bool {
+        false
+    }
+    unsafe fn fetch(_: Reach, table: &Table, index: &usize, _: u64) -> bool {
+        table.present[*index]
+    }
+    fn direct(_: &bool) -> bool {
+        true
+    }
+    #[inline(always)]
+    unsafe fn get<'a>(fetch: &bool, _: usize, _: u64) -> Self::Item<'a> {
+        *fetch
+    }
+    unsafe fn contiguous(_: &bool, _: usize) -> bool {
+        true
+    }
+    unsafe fn slice<'a>(fetch: &bool, _: usize, _: u64) -> Self::Slice<'a> {
+        *fetch
+    }
+}
+// SAFETY: one index, read only from table membership.
+unsafe impl<T: 'static, S: ComponentLookup<T>> FetchQuery<S> for Has<T> {
+    const VALID: bool = S::COUNT == 1;
+    const INDICES: usize = S::INDEX;
+}
+
+/// `(A::X, (B::X, (C::X, ...)))`: tuple access nests pairwise.
+macro_rules! nest {
+    ($f:ident; $a:ident) => { $a::$f };
+    ($f:ident; $a:ident, $($r:ident),+) => { ($a::$f, nest!($f; $($r),+)) };
+}
 macro_rules! tuple_query {
-    ($access:ty, $direct:ty, $far:ty; $($data:ident:$index:tt),+) => {
+    ($($data:ident:$index:tt),+) => {
         impl<$($data: QueryData),+> QueryData for ($($data,)+) {
-            type Access = $access; type Direct = $direct; type Far = $far;
+            type Access = nest!(Access; $($data),+);
+            type Direct = nest!(Direct; $($data),+);
+            type Far = nest!(Far; $($data),+);
             const SHARED_WRITE: bool = false $(|| $data::SHARED_WRITE)+;
             const JOINS: bool = false $(|| $data::JOINS)+;
             const JOINS_VALID: bool = true $(&& $data::JOINS_VALID)+;
@@ -844,13 +975,21 @@ macro_rules! tuple_query {
         unsafe impl<S: Storage, $($data: FetchQuery<S>),+> FetchQuery<S> for ($($data,)+) { const VALID: bool = true $(&& $data::VALID)+; const INDICES: Self::Indices = ($($data::INDICES,)+); }
     };
 }
-tuple_query!((A::Access, B::Access), (A::Direct, B::Direct), (A::Far, B::Far); A:0, B:1);
-tuple_query!(
-    (A::Access, (B::Access, C::Access)),
-    (A::Direct, (B::Direct, C::Direct)),
-    (A::Far, (B::Far, C::Far));
-    A:0, B:1, C:2
-);
+tuple_query!(D0:0, D1:1);
+tuple_query!(D0:0, D1:1, D2:2);
+tuple_query!(D0:0, D1:1, D2:2, D3:3);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8, D9:9);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8, D9:9, D10:10);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8, D9:9, D10:10, D11:11);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8, D9:9, D10:10, D11:11, D12:12);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8, D9:9, D10:10, D11:11, D12:12, D13:13);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8, D9:9, D10:10, D11:11, D12:12, D13:13, D14:14);
+tuple_query!(D0:0, D1:1, D2:2, D3:3, D4:4, D5:5, D6:6, D7:7, D8:8, D9:9, D10:10, D11:11, D12:12, D13:13, D14:14, D15:15);
 impl<S: Storage> World<S> {
     pub fn query<D: FetchQuery<S> + JoinCheck>(&mut self) -> Query<'_, D>
     where

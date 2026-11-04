@@ -134,12 +134,12 @@ assert_eq!(total, 9);
   name them. A system using a component the plugin did not declare (and
   nothing else stores) fails to compile at `build`.
 - `systems` returns `schedule(label, systems)`, `task(body)`, another plugin's
-  `systems::<S>()`, or a tuple of up to 12 of them, nested freely. Inside, `S`
+  `systems::<S>()`, or a tuple of up to 16 of them, nested freely. Inside, `S`
   is the final world: `Commands<S>`, `&mut World<S>`, `AsyncWorld<S>` (or
   `_`). It is called once, by `build`, and its systems run where the plugin was
   added among the app's registrations. A plugin's hooks run after the app's
   own, and like all hooks they own what they capture (`'static`).
-- `add_plugins` takes a plugin, a `task(...)`, or a tuple of up to 12 of them,
+- `add_plugins` takes a plugin, a `task(...)`, or a tuple of up to 16 of them,
   applied left to right. The `demo/` crates compose two independent plugin
   crates.
 - A plugin's systems are `Send` (they capture `Mutex`, atomics, or owned data,
@@ -166,7 +166,7 @@ compile-time constants.
   compilation fails rather than silently keeping dense storage.
 - Exclusive systems name the world as `World<_>`, inferred at `build`. A
   plugin's exclusive system can instead be generic over any world storing what
-  it needs: `fn tag_new<S: Has<Tag>>() -> ExclusiveSystem<impl FnMut(&mut
+  it needs: `fn tag_new<S: Stores<Tag>>() -> ExclusiveSystem<impl FnMut(&mut
   World<S>)>`.
 
 The world exists only after `build`, so spawn entities afterwards. Changing a
@@ -196,7 +196,7 @@ assert!(world.despawn(entity));
 
 - `spawn`, `insert`, `remove`, `despawn`, `get`, `get_mut` work on any stored
   component. `insert` and `remove` return the previous value.
-- Tuple bundles (1–8 components) work with `spawn_bundle`, `spawn_batch`,
+- Tuple bundles (1–16 components) work with `spawn_bundle`, `spawn_batch`,
   `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
   multi-component transitions in a small table keyed by a compile-time hash of
   the bundle's component indices; single components use per-archetype arrays.
@@ -206,8 +206,12 @@ assert!(world.despawn(entity));
 
 ## Queries
 
-- `Query<D, F>`: `D` is `&T`, `&mut T`, `Entity`, or tuples of those. `F` is
-  `With<T>`, `Without<T>`, `Added<T>`, `Changed<T>`, tuples (and), or `Or<(F, G)>`.
+- `Query<D, F>`: `D` is `&T`, `&mut T`, `Entity`, `Option<D>` (every row,
+  `None` where `D` does not match; schedules like `D`), `Has<T>` (whether the
+  row has `T`, a `bool`; reads table membership only, so it never conflicts
+  with writers of `T`), joins, or tuples of up to 16 of those. `F` is
+  `With<T>`, `Without<T>`, `Added<T>`, `Changed<T>`, `Related<R>`,
+  `Relinked<R>`, tuples of up to 16 (and), or `Or<(F, G, ...)>`.
 - `Single<D, F>` requires exactly one match; otherwise the system is skipped
   without running or advancing its locals.
 - Registered queries cache matching archetypes and scan only new ones.
@@ -236,14 +240,14 @@ or to its next one. Unordered, non-conflicting writers may share a tick value.
 ## Systems and composition
 
 Systems are functions or closures taking their label's input (if any), then up
-to four parameters: `Query`, `Single`, `Local<T>` (per-registration state), and
+to 16 parameters: `Query`, `Single`, `Local<T>` (per-registration state), and
 `Commands<_>`.
 
 ```rust,ignore
 app.add_systems(Update, ((integrate, decay).parallel(), validate).chain().run_if(running))
 ```
 
-- Tuples (2–4) run in order; `.chain()` states it explicitly.
+- Tuples (2–16) run in order; `.chain()` states it explicitly.
 - `.parallel()` runs branches concurrently. Overlapping access fails to compile;
   complementary filters (`With<T>`/`Without<T>`) prove disjointness.
 - `.run_if(condition)` runs a read-only boolean system before the group.
@@ -551,7 +555,7 @@ assert_eq!(app.world.get::<Score>(entity).unwrap().0, 42);
 - **Envelopes.** By default a sync point is exclusive: it orders against
   everything and applies each wave's commands at once. With `type Env =
   Query<'static, &'static mut Score>;` (system parameters: one, or a tuple
-  of up to four) its driver runs in parallel with systems that do not
+  of up to 16) its driver runs in parallel with systems that do not
   conflict with the envelope, the envelope's components join the inferred
   world, a bridge reaching outside it fails to compile, and commands (always
   allowed) apply when the emit ends.

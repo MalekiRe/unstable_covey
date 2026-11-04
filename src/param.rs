@@ -1,3 +1,4 @@
+use crate::init::{Init, LocalState};
 use std::ops::{Deref, DerefMut};
 
 use crate::access::{Access, Filtered, QueryAccess, Union, ValidAccess};
@@ -31,7 +32,7 @@ mod sealed {
 /// What a parameter accesses and yields, independent of any world type.
 pub trait ParamShape: sealed::Sealed {
     type Access: Access;
-    type State: Default;
+    type State: Init;
     type Item<'a>;
 }
 /// Fetching a parameter from world type `S`. Implementations are sealed.
@@ -55,14 +56,18 @@ pub unsafe trait Param<S: SystemWorld>: ParamShape {
 }
 impl<T: Default + 'static> ParamShape for Local<'_, T> {
     type Access = ();
-    type State = T;
+    type State = LocalState<T>;
     type Item<'a> = Local<'a, T>;
 }
 // SAFETY: Local only borrows its own per-system state, never world storage.
 unsafe impl<S: SystemWorld, T: Default + 'static> Param<S> for Local<'_, T> {
     const VALID: bool = true;
-    unsafe fn fetch<'a>(_: *mut S, local: &'a mut T, _: ChangeWindow) -> Option<Local<'a, T>> {
-        Some(Local(local))
+    unsafe fn fetch<'a>(
+        _: *mut S,
+        local: &'a mut LocalState<T>,
+        _: ChangeWindow,
+    ) -> Option<Local<'a, T>> {
+        Some(Local(&mut local.0))
     }
 }
 impl<S: Storage> ParamShape for &Remote<S> {

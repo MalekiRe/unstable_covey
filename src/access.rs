@@ -123,6 +123,24 @@ where
         || B::EXCLUSIVE
         || (<A as Conflict<B>>::VALUE && !<F as Disjoint<G>>::VALUE && !<G as Disjoint<F>>::VALUE);
 }
+/// Mentions `T` without accessing its values (table membership only): the
+/// world stores `T`, and only exclusive access conflicts.
+pub struct Mentions<T>(PhantomData<fn() -> T>);
+impl<T: 'static> Access for Mentions<T> {
+    const WRITES: bool = false;
+}
+impl<T> ValidAccess for Mentions<T> {
+    const VALID: bool = true;
+}
+impl<U: 'static, const W: bool, T> Against<U, W> for Mentions<T> {
+    const VALUE: bool = false;
+}
+impl<B: Access, T> Conflict<B> for Mentions<T> {
+    const VALUE: bool = B::EXCLUSIVE;
+}
+impl<A: Access, F, T> Conflict<Mentions<T>> for Filtered<A, F> {
+    const VALUE: bool = A::EXCLUSIVE;
+}
 impl<B, P> Conflict<B> for Drives<P> {
     const VALUE: bool = false;
 }

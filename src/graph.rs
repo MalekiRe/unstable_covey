@@ -55,44 +55,40 @@ impl<K: Input, L, F: IntoSystems<K, M>, M, D> IntoNodes<K, M> for Node<L, F, D> 
         }
     }
 }
-impl<K: Input, A: IntoNodes<K, AM>, B: IntoNodes<K, BM>, AM, BM> IntoNodes<K, (AM, BM)> for (A, B) {
-    type Nodes = Pair<A::Nodes, B::Nodes>;
-    fn into_nodes(self) -> Self::Nodes {
-        Pair(self.0.into_nodes(), self.1.into_nodes())
-    }
+/// `Pair<A, Pair<B, ...>>` of a tuple's nodes.
+macro_rules! pair_type {
+    ($a:ident) => { $a::Nodes };
+    ($a:ident, $($r:ident),+) => { Pair<$a::Nodes, pair_type!($($r),+)> };
 }
-impl<K: Input, A, B, C, AM, BM, CM> IntoNodes<K, (AM, BM, CM)> for (A, B, C)
-where
-    A: IntoNodes<K, AM>,
-    B: IntoNodes<K, BM>,
-    C: IntoNodes<K, CM>,
-{
-    type Nodes = Pair<A::Nodes, Pair<B::Nodes, C::Nodes>>;
-    fn into_nodes(self) -> Self::Nodes {
-        Pair(
-            self.0.into_nodes(),
-            Pair(self.1.into_nodes(), self.2.into_nodes()),
-        )
-    }
+macro_rules! pair_value {
+    ($v:ident; $i:tt) => { $v.$i.into_nodes() };
+    ($v:ident; $i:tt, $($r:tt),+) => { Pair($v.$i.into_nodes(), pair_value!($v; $($r),+)) };
 }
-impl<K: Input, A, B, C, D, AM, BM, CM, DM> IntoNodes<K, (AM, BM, CM, DM)> for (A, B, C, D)
-where
-    A: IntoNodes<K, AM>,
-    B: IntoNodes<K, BM>,
-    C: IntoNodes<K, CM>,
-    D: IntoNodes<K, DM>,
-{
-    type Nodes = Pair<A::Nodes, Pair<B::Nodes, Pair<C::Nodes, D::Nodes>>>;
-    fn into_nodes(self) -> Self::Nodes {
-        Pair(
-            self.0.into_nodes(),
-            Pair(
-                self.1.into_nodes(),
-                Pair(self.2.into_nodes(), self.3.into_nodes()),
-            ),
-        )
-    }
+macro_rules! node_tuple {
+    ($($t:ident $m:ident $i:tt),+) => {
+        impl<K: Input, $($t: IntoNodes<K, $m>, $m),+> IntoNodes<K, ($($m,)+)> for ($($t,)+) {
+            type Nodes = pair_type!($($t),+);
+            fn into_nodes(self) -> Self::Nodes {
+                pair_value!(self; $($i),+)
+            }
+        }
+    };
 }
+node_tuple!(T0 M0 0, T1 M1 1);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12, T13 M13 13);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12, T13 M13 13, T14 M14 14);
+node_tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12, T13 M13 13, T14 M14 14, T15 M15 15);
 trait Labels<L: 'static> {
     const COUNT: usize;
 }

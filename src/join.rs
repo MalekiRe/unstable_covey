@@ -216,6 +216,11 @@ impl<Q: QueryData> Clone for JoinFetch<Q> {
     }
 }
 impl<Q: QueryData> Copy for JoinFetch<Q> {}
+impl<Q: QueryData> crate::init::Init for JoinFetch<Q> {
+    fn init() -> Self {
+        Self::default()
+    }
+}
 impl<Q: QueryData> Default for JoinFetch<Q> {
     fn default() -> Self {
         Self {
@@ -484,21 +489,34 @@ impl<R: Relation, Q: JoinCheck> Cascading for To<R, Q> {
         }
     }
 }
-impl<A: Cascading, B: QueryData> Cascading for (A, B) {
-    const CASCADES: bool = A::CASCADES;
-    unsafe fn parent(i: &Self::Indices, table: &Table, row: usize) -> Option<Entity> {
-        unsafe { A::parent(&i.0, table, row) }
-    }
-    unsafe fn children(i: &Self::Indices, reach: Reach, entity: Entity, f: impl FnMut(Entity)) {
-        unsafe { A::children(&i.0, reach, entity, f) }
-    }
+/// A tuple cascades by its first element.
+macro_rules! cascading_tuple {
+    ($($t:ident),+) => {
+        impl<A: Cascading, $($t: QueryData),+> Cascading for (A, $($t),+) {
+            const CASCADES: bool = A::CASCADES;
+            unsafe fn parent(i: &Self::Indices, table: &Table, row: usize) -> Option<Entity> {
+                unsafe { A::parent(&i.0, table, row) }
+            }
+            unsafe fn children(i: &Self::Indices, reach: Reach, entity: Entity, f: impl FnMut(Entity)) {
+                unsafe { A::children(&i.0, reach, entity, f) }
+            }
+        }
+    };
 }
-impl<A: Cascading, B: QueryData, C: QueryData> Cascading for (A, B, C) {
-    const CASCADES: bool = A::CASCADES;
-    unsafe fn parent(i: &Self::Indices, table: &Table, row: usize) -> Option<Entity> {
-        unsafe { A::parent(&i.0, table, row) }
-    }
-    unsafe fn children(i: &Self::Indices, reach: Reach, entity: Entity, f: impl FnMut(Entity)) {
-        unsafe { A::children(&i.0, reach, entity, f) }
-    }
-}
+cascading_tuple!(D1);
+cascading_tuple!(D1, D2);
+cascading_tuple!(D1, D2, D3);
+cascading_tuple!(D1, D2, D3, D4);
+cascading_tuple!(D1, D2, D3, D4, D5);
+cascading_tuple!(D1, D2, D3, D4, D5, D6);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7, D8);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7, D8, D9);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7, D8, D9, D10);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13);
+cascading_tuple!(D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D14);
+cascading_tuple!(
+    D1, D2, D3, D4, D5, D6, D7, D8, D9, D10, D11, D12, D13, D14, D15
+);

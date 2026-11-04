@@ -22,6 +22,11 @@ pub struct CommandQueue<S: Storage> {
 }
 // Every queued command is Send.
 unsafe impl<S: Storage> Send for CommandQueue<S> {}
+impl<S: Storage> crate::init::Init for CommandQueue<S> {
+    fn init() -> Self {
+        Self::default()
+    }
+}
 impl<S: Storage> Default for CommandQueue<S> {
     fn default() -> Self {
         Self {

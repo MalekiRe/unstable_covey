@@ -765,3 +765,217 @@ fn get_mut_resolves_one_entity_through_data_archetype_and_row_filters() {
         [Some(10), None, Some(11)]
     );
 }
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct Shield(u32);
+struct Stunned;
+
+#[test]
+fn optional_items_and_presence_checks_follow_each_row() {
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            |mut q: Query<(&Position, Option<&mut Shield>, Has<Stunned>)>| {
+                for (pos, shield, stunned) in &mut q {
+                    // Shields charge unless stunned; rows without one still match.
+                    if let Some(mut shield) = shield
+                        && !stunned
+                    {
+                        shield.0 += pos.0 as u32;
+                    }
+                }
+            },
+        )
+        .build();
+    let world = &mut app.world;
+    let bare = world.spawn_bundle((Position(1),));
+    let shielded = world.spawn_bundle((Position(2), Shield(10)));
+    let stunned = world.spawn_bundle((Position(3), Shield(10), Stunned));
+    app.emit(&Update);
+    let world = &mut app.world;
+    assert_eq!(world.get::<Shield>(shielded), Some(&Shield(12)));
+    assert_eq!(world.get::<Shield>(stunned), Some(&Shield(10)));
+    let mut q = world.query::<(Entity, Option<&Shield>, Has<Stunned>)>();
+    let mut rows: Vec<_> = q.iter_mut().map(|(e, s, h)| (e, s.copied(), h)).collect();
+    rows.sort_by_key(|row| row.0);
+    assert_eq!(
+        rows,
+        [
+            (bare, None, false),
+            (shielded, Some(Shield(12)), false),
+            (stunned, Some(Shield(10)), true)
+        ]
+    );
+    // `Has` alone stores its component: `Stunned` above came only from it.
+    world.remove::<Stunned>(stunned);
+    assert!(!world.query::<Has<Stunned>>().iter_mut().any(|has| has));
+}
+
+#[test]
+fn presence_checks_run_beside_writers_and_options_conflict_like_writes() {
+    struct Count(u32);
+    with_workers(|| {
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                (
+                    // Reads only membership: runs beside the writer of `Stunned`.
+                    |mut q: Query<Has<Stunned>>, mut count: Single<&mut Count>| {
+                        count.0 += q.iter_mut().filter(|&has| has).count() as u32;
+                    },
+                    |mut q: Query<&mut Stunned>| {
+                        for _ in &mut q {}
+                    },
+                )
+                    .parallel(),
+            )
+            .build();
+        app.world.spawn_bundle((Count(0),));
+        app.world.spawn_bundle((Stunned,));
+        app.emit(&Update);
+        assert_eq!(app.world.query::<&Count>().iter_mut().next().unwrap().0, 1);
+    });
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+struct C<const N: usize>(u32);
+
+#[test]
+fn tuples_reach_sixteen_for_queries_filters_bundles_params_and_chains() {
+    type Sixteen = (
+        &'static C<0>,
+        &'static C<1>,
+        &'static C<2>,
+        &'static C<3>,
+        &'static C<4>,
+        &'static C<5>,
+        &'static C<6>,
+        &'static C<7>,
+        &'static C<8>,
+        &'static C<9>,
+        &'static C<10>,
+        &'static C<11>,
+        &'static C<12>,
+        &'static C<13>,
+        &'static C<14>,
+        &'static mut C<15>,
+    );
+    type Filters = (
+        With<C<0>>,
+        With<C<1>>,
+        With<C<2>>,
+        With<C<3>>,
+        With<C<4>>,
+        With<C<5>>,
+        With<C<6>>,
+        With<C<7>>,
+        With<C<8>>,
+        With<C<9>>,
+        With<C<10>>,
+        With<C<11>>,
+        With<C<12>>,
+        With<C<13>>,
+        With<C<14>>,
+        Without<Tag>,
+    );
+    let log = std::sync::Mutex::new(Vec::new());
+    let push = |i: u32| {
+        let log = &log;
+        move || log.lock().unwrap().push(i)
+    };
+    let mut app = App::new()
+        .register::<Tag>()
+        .add_systems(Update, |mut q: Query<Sixteen, Filters>| {
+            for row in &mut q {
+                let (c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13, c14, mut c15) =
+                    row;
+                c15.0 = c0.0
+                    + c1.0
+                    + c2.0
+                    + c3.0
+                    + c4.0
+                    + c5.0
+                    + c6.0
+                    + c7.0
+                    + c8.0
+                    + c9.0
+                    + c10.0
+                    + c11.0
+                    + c12.0
+                    + c13.0
+                    + c14.0;
+            }
+        })
+        .add_systems(
+            Update,
+            // Sixteen parameters in one system.
+            |a: Query<&C<0>>,
+             b: Query<&C<1>>,
+             c: Query<&C<2>>,
+             d: Query<&C<3>>,
+             e: Query<&C<4>>,
+             f: Query<&C<5>>,
+             g: Query<&C<6>>,
+             h: Query<&C<7>>,
+             i: Query<&C<8>>,
+             j: Query<&C<9>>,
+             k: Query<&C<10>>,
+             l: Query<&C<11>>,
+             m: Query<&C<12>>,
+             n: Query<&C<13>>,
+             o: Query<&C<14>>,
+             mut p: Query<&C<15>>| {
+                let _ = (a, b, c, d, e, f, g, h, i, j, k, l, m, n, o);
+                assert_eq!(p.iter_mut().filter(|c| c.0 == 105).count(), 1);
+            },
+        )
+        .add_systems(
+            Update,
+            (
+                push(0),
+                push(1),
+                push(2),
+                push(3),
+                push(4),
+                push(5),
+                push(6),
+                push(7),
+                push(8),
+                push(9),
+                push(10),
+                push(11),
+                push(12),
+                push(13),
+                push(14),
+                push(15),
+            )
+                .chain(),
+        )
+        .build();
+    let bundle = (
+        C::<0>(0),
+        C::<1>(1),
+        C::<2>(2),
+        C::<3>(3),
+        C::<4>(4),
+        C::<5>(5),
+        C::<6>(6),
+        C::<7>(7),
+        C::<8>(8),
+        C::<9>(9),
+        C::<10>(10),
+        C::<11>(11),
+        C::<12>(12),
+        C::<13>(13),
+        C::<14>(14),
+        C::<15>(0),
+    );
+    let entity = app.world.spawn_bundle(bundle);
+    let tagged = app.world.spawn_bundle(bundle);
+    app.world.insert(tagged, Tag);
+    app.emit(&Update);
+    assert_eq!(app.world.get::<C<15>>(entity), Some(&C(105)));
+    assert_eq!(app.world.get::<C<15>>(tagged), Some(&C(0)));
+    drop(app);
+    assert_eq!(log.into_inner().unwrap(), (0..16).collect::<Vec<_>>());
+}

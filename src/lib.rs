@@ -17,6 +17,7 @@ mod executor;
 mod filter;
 mod graph;
 mod hook;
+mod init;
 mod join;
 mod lookup;
 mod param;
@@ -41,14 +42,14 @@ pub use filter::{Added, Changed, Or, Related, Relinked, With, Without};
 pub use graph::{GraphConfig, MAX_NODES, Node, ReadyGraph, node, ready};
 pub use hook::{Batch, Event, Hook, OnAdd, OnInsert, OnRemove, OnReplace, Trigger};
 pub use join::{From, JoinKind, Joined, To};
-pub use lookup::ComponentLookup as Has;
+pub use lookup::ComponentLookup as Stores;
 pub use param::Local;
 pub use plan::{
     ExclusiveSystem, ExecutionMode, FunctionSystem, Input, IntoSystemConfigs, IntoSystems, NoInput,
     Ref, Shape, System, exclusive,
 };
 pub use plugin::{Plugin, Systems};
-pub use query::{ContiguousError, Query, QueryChunks, Single};
+pub use query::{ContiguousError, Has, Query, QueryChunks, Single};
 pub use relation::{ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources};
 pub use remote::{
     Envelope, Everything, Remote, RemoteBridge, RemoteState, SyncPoint, SyncPointSystem, sync_point,
@@ -60,9 +61,9 @@ pub mod prelude {
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
         Entity, ExecutionMode, Has, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice, NoInput,
         OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Plugin, Query, Ref, Related,
-        Relates, Relation, Relinked, Remote, Schedule, Single, Sources, Sparse, Storage, SyncPoint,
-        Systems, Trigger, With, Without, WorkerPool, World, exclusive, node, ready, schedule,
-        sync_point, task,
+        Relates, Relation, Relinked, Remote, Schedule, Single, Sources, Sparse, Storage, Stores,
+        SyncPoint, Systems, Trigger, With, Without, WorkerPool, World, exclusive, node, ready,
+        schedule, sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

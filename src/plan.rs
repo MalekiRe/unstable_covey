@@ -4,6 +4,7 @@ use crate::executor::{
     self, Context, Continue, Done, Fields, First, Flow, Join, Outlined, Project, Root, Second,
     Tail, Then,
 };
+use crate::init::Init;
 use crate::param::{Param, ParamShape};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -218,11 +219,11 @@ pub struct FunctionSystem<F, P, L, R, K = NoInput> {
 /// Parameter, output, and input types, without owning any of them.
 type Marker<P, R, K> = PhantomData<fn() -> (P, R, K)>;
 impl<F, P, L, R, K> sealed::Sealed for FunctionSystem<F, P, L, R, K> {}
-impl<F, P, L: Default, R, K> FunctionSystem<F, P, L, R, K> {
+impl<F, P, L: Init, R, K> FunctionSystem<F, P, L, R, K> {
     fn new(function: F) -> Self {
         Self {
             function,
-            local: L::default(),
+            local: L::init(),
             last_run: 0,
             last_world: u64::MAX,
             marker: PhantomData,
@@ -235,7 +236,7 @@ impl<F, P, L: Default, R, K> FunctionSystem<F, P, L, R, K> {
 /// the function's first parameter.
 #[diagnostic::on_unimplemented(
     message = "this function does not fit a schedule with input `{K}`",
-    note = "every system under a label takes the label's input first: nothing for plain labels, `&E` for `Ref<E>`, `Trigger` for lifecycle labels; then up to four parameters"
+    note = "every system under a label takes the label's input first: nothing for plain labels, `&E` for `Ref<E>`, `Trigger` for lifecycle labels; then up to 16 parameters"
 )]
 pub trait IntoFunction<K, M, R> {
     type Function: Shape<Output = R, In = K>;
@@ -315,10 +316,22 @@ macro_rules! function {
     };
 }
 function!();
-function!(A 0);
-function!(A 0, B 1);
-function!(A 0, B 1, C 2);
-function!(A 0, B 1, C 2, D 3);
+function!(P0 0);
+function!(P0 0, P1 1);
+function!(P0 0, P1 1, P2 2);
+function!(P0 0, P1 1, P2 2, P3 3);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12, P13 13);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12, P13 13, P14 14);
+function!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12, P13 13, P14 14, P15 15);
 
 pub struct Sequential<A, B>(A, B);
 /// The flag records whether B was published for the current invocation.
@@ -557,7 +570,7 @@ impl<S, P: System<S, Output = ()>, C: System<S, Output = bool, In = P::In>> Syst
 }
 
 /// Exclusive world access, for structural changes. Name the world as `World<_>`
-/// in the app body; a plugin can be generic over it (`World<S>` with `S: Has<T>`).
+/// in the app body; a plugin can be generic over it (`World<S>` with `S: Stores<T>`).
 /// Under a schedule with input, the input comes first: `|hit: &Damage, world|`.
 pub struct ExclusiveSystem<F, K = NoInput>(F, PhantomData<fn() -> K>);
 pub fn exclusive<F>(function: F) -> ExclusiveSystem<F> {
@@ -691,6 +704,18 @@ macro_rules! tuple {
         }
     };
 }
-tuple!(A MA 0, B MB 1);
-tuple!(A MA 0, B MB 1, C MC 2);
-tuple!(A MA 0, B MB 1, C MC 2, D MD 3);
+tuple!(T0 M0 0, T1 M1 1);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12, T13 M13 13);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12, T13 M13 13, T14 M14 14);
+tuple!(T0 M0 0, T1 M1 1, T2 M2 2, T3 M3 3, T4 M4 4, T5 M5 5, T6 M6 6, T7 M7 7, T8 M8 8, T9 M9 9, T10 M10 10, T11 M11 11, T12 M12 12, T13 M13 13, T14 M14 14, T15 M15 15);

@@ -347,8 +347,21 @@ macro_rules! filter_tuple {
     };
 }
 
-filter_tuple!(A: 0, B: 1);
-filter_tuple!(A: 0, B: 1, C: 2);
+filter_tuple!(F0: 0, F1: 1);
+filter_tuple!(F0: 0, F1: 1, F2: 2);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8, F9: 9);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8, F9: 9, F10: 10);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8, F9: 9, F10: 10, F11: 11);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8, F9: 9, F10: 10, F11: 11, F12: 12);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8, F9: 9, F10: 10, F11: 11, F12: 12, F13: 13);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8, F9: 9, F10: 10, F11: 11, F12: 12, F13: 13, F14: 14);
+filter_tuple!(F0: 0, F1: 1, F2: 2, F3: 3, F4: 4, F5: 5, F6: 6, F7: 7, F8: 8, F9: 9, F10: 10, F11: 11, F12: 12, F13: 13, F14: 14, F15: 15);
 /// Matches components inserted since this system last ran successfully.
 pub struct Added<T>(PhantomData<fn() -> T>);
 /// Matches inserted, replaced, or mutably dereferenced components since last run.

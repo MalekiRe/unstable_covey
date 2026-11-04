@@ -1,5 +1,5 @@
 use static_ecs::{
-    App, Entity, Has, Plugin, Query, Ref, Schedule, Single, Sparse, Storage, Systems, With,
+    App, Entity, Plugin, Query, Ref, Schedule, Single, Sparse, Storage, Stores, Systems, With,
     Without, World, exclusive, schedule,
 };
 use std::sync::Mutex;
@@ -96,7 +96,8 @@ fn schedule_labels_and_event_payloads_select_only_matching_systems() {
 }
 
 /// A plugin's structural system, generic over whatever world the app infers.
-fn tag_new<S: Has<u64> + Has<Tag>>() -> static_ecs::ExclusiveSystem<impl FnMut(&mut World<S>)> {
+fn tag_new<S: Stores<u64> + Stores<Tag>>() -> static_ecs::ExclusiveSystem<impl FnMut(&mut World<S>)>
+{
     exclusive(|world: &mut World<S>| {
         let untagged: Vec<_> = world
             .query_filtered::<Entity, (With<u64>, Without<Tag>)>()

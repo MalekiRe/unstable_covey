@@ -22,7 +22,8 @@ use std::task::{Context, Poll, Waker};
 use std::thread::{self, Thread};
 
 use crate::access::{
-    Access, Against, Drives, Exclusive, Filtered, QueryAccess, Read, Union, ValidAccess, Write,
+    Access, Against, Drives, Exclusive, Filtered, Mentions, QueryAccess, Read, Union, ValidAccess,
+    Write,
 };
 use crate::bridge::{BridgeCell, BridgeError, BridgeFn, StateBox, StateRef, in_task, site};
 use crate::change::{SystemWorld, next};
@@ -66,6 +67,7 @@ fn overlaps(a: &Mask, b: &Mask) -> bool {
     a.iter().zip(b).any(|(a, b)| a & b != 0)
 }
 impl<S: Storage> Masks<S> for () {}
+impl<S: Storage, T> Masks<S> for Mentions<T> {}
 impl<S: Storage> Masks<S> for Exclusive {
     const EXCLUSIVE: bool = true;
 }
@@ -299,7 +301,7 @@ impl<S: Storage> Drop for Points<S> {
 }
 
 /// System parameters whose combined access bounds a sync point's bridges:
-/// one parameter, or a tuple of up to four.
+/// one parameter, or a tuple of up to 16.
 pub trait Envelope {
     type Access: Access + ValidAccess;
 }
@@ -319,9 +321,25 @@ macro_rules! envelope {
         }
     };
 }
-envelope!(A, B);
-envelope!(A, B, C);
-envelope!(A, B, C, D);
+envelope!(P0, P1);
+envelope!(P0, P1, P2);
+envelope!(P0, P1, P2, P3);
+envelope!(P0, P1, P2, P3, P4);
+envelope!(P0, P1, P2, P3, P4, P5);
+envelope!(P0, P1, P2, P3, P4, P5, P6);
+envelope!(P0, P1, P2, P3, P4, P5, P6, P7);
+envelope!(P0, P1, P2, P3, P4, P5, P6, P7, P8);
+envelope!(P0, P1, P2, P3, P4, P5, P6, P7, P8, P9);
+envelope!(P0, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10);
+envelope!(P0, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11);
+envelope!(P0, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12);
+envelope!(P0, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13);
+envelope!(
+    P0, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13, P14
+);
+envelope!(
+    P0, P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12, P13, P14, P15
+);
 
 /// Whether access `Self` stays within envelope `Env`.
 #[doc(hidden)]
@@ -329,6 +347,9 @@ pub trait Within<Env> {
     const VALUE: bool;
 }
 impl<Env> Within<Env> for () {
+    const VALUE: bool = true;
+}
+impl<Env, T> Within<Env> for Mentions<T> {
     const VALUE: bool = true;
 }
 // A read is covered by any access to `T`; a write only by a write.
@@ -673,7 +694,7 @@ impl<S: Storage> Remote<S> {
     }
     /// Parameter state kept across bridges, as `AsyncWorld::state`. Bridges
     /// sharing it are never granted in the same wave.
-    pub fn state<T: Default>(&self) -> RemoteState<S, T> {
+    pub fn state<T: crate::init::Init>(&self) -> RemoteState<S, T> {
         RemoteState {
             shared: Arc::default(),
             remote: self.clone(),

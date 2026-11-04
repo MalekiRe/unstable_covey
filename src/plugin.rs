@@ -50,11 +50,11 @@ pub trait Plugin: Sized {
     /// `(Pos, Vel)`, or `()`. Components the app already stores, under any
     /// storage, are kept as they are.
     type Components;
-    /// Relations the plugin uses, installed once however many plugins and
-    /// apps name them: `(ChildOf,)`.
+    /// Relations the plugin uses (a tuple of up to 16), installed once
+    /// however many plugins and apps name them: `(ChildOf,)`.
     type Relations = ();
     /// The plugin's systems, for the app's final world `S`: anything
-    /// `schedule(...)` or `task(...)` returns, or a tuple of those (up to 12,
+    /// `schedule(...)` or `task(...)` returns, or a tuple of those (up to 16,
     /// nested freely), registered in order where the plugin was added. They
     /// must be `Send` (see `Systems`).
     fn systems<S: Storage>(self) -> impl Systems<S>;
@@ -137,16 +137,20 @@ macro_rules! systems_tuples {
         }
     };
 }
-systems_tuples!(A 1 B 2 C);
-systems_tuples!(A 1 B 2 C 3 D);
-systems_tuples!(A 1 B 2 C 3 D 4 E);
-systems_tuples!(A 1 B 2 C 3 D 4 E 5 F);
-systems_tuples!(A 1 B 2 C 3 D 4 E 5 F 6 G);
-systems_tuples!(A 1 B 2 C 3 D 4 E 5 F 6 G 7 H);
-systems_tuples!(A 1 B 2 C 3 D 4 E 5 F 6 G 7 H 8 I);
-systems_tuples!(A 1 B 2 C 3 D 4 E 5 F 6 G 7 H 8 I 9 J);
-systems_tuples!(A 1 B 2 C 3 D 4 E 5 F 6 G 7 H 8 I 9 J 10 K);
-systems_tuples!(A 1 B 2 C 3 D 4 E 5 F 6 G 7 H 8 I 9 J 10 K 11 L);
+systems_tuples!(P0 1 P1 2 P2);
+systems_tuples!(P0 1 P1 2 P2 3 P3);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12 13 P13);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12 13 P13 14 P14);
+systems_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12 13 P13 14 P14 15 P15);
 
 /// `C` extended with a tuple of component types.
 #[doc(hidden)]
@@ -266,7 +270,9 @@ macro_rules! relation_list {
     };
     () => {};
 }
-relation_list!(A, B, D, E, F, G, H, I);
+relation_list!(
+    R0, R1, R2, R3, R4, R5, R6, R7, R8, R9, R10, R11, R12, R13, R14, R15
+);
 
 /// A plugin added to a builder, waiting at its registration position for the
 /// final world.

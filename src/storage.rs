@@ -1,3 +1,4 @@
+use crate::init::Init;
 use crate::{
     change::{Mut, SystemWorld},
     column::{Column, Info, Store, Summary},
@@ -192,6 +193,12 @@ pub struct ColumnPtr {
     changed: NonNull<u64>,
     summary: *const Summary,
     rows: *const usize,
+}
+impl crate::init::Init for ColumnPtr {
+    #[inline]
+    fn init() -> Self {
+        Self::default()
+    }
 }
 impl Default for ColumnPtr {
     fn default() -> Self {
@@ -1192,7 +1199,7 @@ impl<S: Storage> World<S> {
     pub fn remove_bundle<B: Bundle<S>>(&mut self, entity: Entity) -> B::Replaced {
         Self::check_bundle::<B>();
         let Some(location) = self.location(entity) else {
-            return B::Replaced::default();
+            return B::Replaced::init();
         };
         let present = B::mask(&self.tables[location.table].present);
         B::fire::<Replace>(self, &[entity], present);
@@ -1353,7 +1360,7 @@ pub trait Bundle<S: Storage>: bundle_sealed::Sealed + 'static {
     #[doc(hidden)]
     const KEY: u64 = bundle_key(Self::INDICES);
     const VALID: bool;
-    type Replaced: Default;
+    type Replaced: Init;
     /// # Safety
     /// Unique correctly typed columns and reserved destination row are required.
     unsafe fn write(self, table: &Table, row: usize, tick: u64);
@@ -1372,13 +1379,13 @@ pub trait Bundle<S: Storage>: bundle_sealed::Sealed + 'static {
     unsafe fn take(table: &Table, row: usize) -> Self::Replaced;
     /// One bit per member.
     #[doc(hidden)]
-    const ALL: u8;
+    const ALL: u16;
     /// The members `present` marks.
     #[doc(hidden)]
-    fn mask(present: &[bool]) -> u8;
+    fn mask(present: &[bool]) -> u16;
     /// Fire kind `K` hooks for the members in `members`, in member order.
     #[doc(hidden)]
-    fn fire<K: Kind>(world: &mut World<S>, entities: &[Entity], members: u8);
+    fn fire<K: Kind>(world: &mut World<S>, entities: &[Entity], members: u16);
 }
 macro_rules! bundle {
     ($($t:ident:$i:tt),+) => {
@@ -1390,12 +1397,12 @@ macro_rules! bundle {
                 let mut i = 0; while i < indices.len() { let mut j = i + 1; while j < indices.len() { valid = valid && indices[i] != indices[j]; j += 1; } i += 1; } valid
             };
             type Replaced = ($(Option<$t>,)+);
-            const ALL: u8 = 0 $(| 1 << $i)+;
-            fn mask(present: &[bool]) -> u8 {
-                0 $(| (present[<S as ComponentLookup<$t>>::INDEX] as u8) << $i)+
+            const ALL: u16 = 0 $(| 1 << $i)+;
+            fn mask(present: &[bool]) -> u16 {
+                0 $(| (present[<S as ComponentLookup<$t>>::INDEX] as u16) << $i)+
             }
             #[inline]
-            fn fire<K: Kind>(world: &mut World<S>, entities: &[Entity], members: u8) {
+            fn fire<K: Kind>(world: &mut World<S>, entities: &[Entity], members: u16) {
                 $(if members & 1 << $i != 0 { world.fire::<<K as Kind>::Of<$t>>(entities); })+
             }
             unsafe fn write(self, table: &Table, row: usize, tick: u64) { $(unsafe {
@@ -1417,11 +1424,19 @@ macro_rules! bundle {
         }
     };
 }
-bundle!(A:0);
-bundle!(A:0, B:1);
-bundle!(A:0, B:1, C:2);
-bundle!(A:0, B:1, C:2, D:3);
-bundle!(A:0, B:1, C:2, D:3, E:4);
-bundle!(A:0, B:1, C:2, D:3, E:4, F:5);
-bundle!(A:0, B:1, C:2, D:3, E:4, F:5, G:6);
-bundle!(A:0, B:1, C:2, D:3, E:4, F:5, G:6, H:7);
+bundle!(T0:0);
+bundle!(T0:0, T1:1);
+bundle!(T0:0, T1:1, T2:2);
+bundle!(T0:0, T1:1, T2:2, T3:3);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11, T12:12);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11, T12:12, T13:13);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11, T12:12, T13:13, T14:14);
+bundle!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11, T12:12, T13:13, T14:14, T15:15);

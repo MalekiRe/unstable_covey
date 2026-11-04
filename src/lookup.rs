@@ -1,7 +1,7 @@
 use crate::storage::{Components, Point, Sparse, Storage};
 
 /// A world schema that stores `T`. Use it to bound code generic over worlds:
-/// `fn f<S: Has<Position>>(world: &mut World<S>)`.
+/// `fn f<S: Stores<Position>>(world: &mut World<S>)`.
 /// # Safety
 /// COUNT and INDEX identify matching typed leaves in the static schema.
 pub unsafe trait ComponentLookup<T: 'static>: Storage {

@@ -1,6 +1,6 @@
 //! Infers a world's component vocabulary from the systems an app composes.
 //! The result is an ordinary nested-pair schema, deduplicated by component type.
-use crate::access::{Drives, Exclusive, Filtered, QueryAccess, Read, Union, Write};
+use crate::access::{Drives, Exclusive, Filtered, Mentions, QueryAccess, Read, Union, Write};
 use crate::filter::{Added, Changed, Or, With, Without};
 use crate::lookup::{ComponentLookup, PointLookup};
 use crate::storage::{Components, Point, Sparse, Storage};
@@ -83,13 +83,40 @@ macro_rules! component {
         }
     )*};
 }
-component!(Read, Write, With, Without, Added, Changed);
+component!(Read, Write, Mentions, With, Without, Added, Changed);
 impl<C, A: Uses<C>, B: Uses<A::Out>> Uses<C> for (A, B) {
     type Out = B::Out;
 }
-impl<C, A: Uses<C>, B: Uses<A::Out>, D: Uses<B::Out>> Uses<C> for (A, B, D) {
-    type Out = D::Out;
+/// Longer tuples (filters): their head, then the rest as one tuple.
+macro_rules! uses_tuple {
+    ($a:ident, $($t:ident),+) => {
+        impl<C, $a: Uses<C>, $($t),+> Uses<C> for ($a, $($t),+)
+        where
+            ($($t,)+): Uses<$a::Out>,
+        {
+            type Out = <($($t,)+) as Uses<$a::Out>>::Out;
+        }
+    };
 }
+uses_tuple!(U0, U1, U2);
+uses_tuple!(U0, U1, U2, U3);
+uses_tuple!(U0, U1, U2, U3, U4);
+uses_tuple!(U0, U1, U2, U3, U4, U5);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6, U7);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6, U7, U8);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6, U7, U8, U9);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6, U7, U8, U9, U10);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6, U7, U8, U9, U10, U11);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6, U7, U8, U9, U10, U11, U12);
+uses_tuple!(U0, U1, U2, U3, U4, U5, U6, U7, U8, U9, U10, U11, U12, U13);
+uses_tuple!(
+    U0, U1, U2, U3, U4, U5, U6, U7, U8, U9, U10, U11, U12, U13, U14
+);
+uses_tuple!(
+    U0, U1, U2, U3, U4, U5, U6, U7, U8, U9, U10, U11, U12, U13, U14, U15
+);
+
 impl<C, A: Uses<C>, F: Uses<A::Out>> Uses<C> for Filtered<A, F> {
     type Out = F::Out;
 }

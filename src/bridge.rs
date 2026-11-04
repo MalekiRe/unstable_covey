@@ -2,6 +2,7 @@
 //! like a one-shot system, when its task reaches the bridge's label during
 //! `emit`. Closures run on the polling thread and may borrow the task's
 //! locals, including `&mut`, so nothing here requires `Send`.
+use crate::init::Init;
 use std::any::TypeId;
 use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
@@ -172,7 +173,7 @@ impl<S: Storage> AsyncWorld<S> {
     /// Parameter state kept across bridges, inferred from its first use:
     /// `Local`s persist, `Changed` sees changes since the previous bridge, and
     /// query caches stay warm, so bridging through it allocates nothing.
-    pub fn state<T: Default>(&self) -> BridgeState<S, T> {
+    pub fn state<T: Init>(&self) -> BridgeState<S, T> {
         BridgeState {
             shared: Arc::default(),
             world: *self,
@@ -182,11 +183,19 @@ impl<S: Storage> AsyncWorld<S> {
 
 /// One bridge's parameter states and change cursor.
 #[doc(hidden)]
-#[derive(Default)]
 pub struct BridgeCell<T> {
     pub(crate) params: T,
     pub(crate) last_run: u64,
     pub(crate) last_world: u64,
+}
+impl<T: Init> Default for BridgeCell<T> {
+    fn default() -> Self {
+        Self {
+            params: T::init(),
+            last_run: 0,
+            last_world: 0,
+        }
+    }
 }
 impl<T> BridgeCell<T> {
     /// The change window of a run at `now` in world `id`.
@@ -221,10 +230,17 @@ impl<T> StateRef<T> for BridgeCell<T> {
 /// State shared by bridges, plus the stamp of the remote wave that last
 /// granted one of them, written only by sync points.
 #[doc(hidden)]
-#[derive(Default)]
 pub struct StateBox<T> {
     stamp: Cell<u64>,
     cell: UnsafeCell<BridgeCell<T>>,
+}
+impl<T: Init> Default for StateBox<T> {
+    fn default() -> Self {
+        Self {
+            stamp: Cell::new(0),
+            cell: UnsafeCell::new(BridgeCell::default()),
+        }
+    }
 }
 // SAFETY: a running bridge alone accesses the cell: local bridges hold the
 // world exclusively and never nest, and a remote wave grants each stamp once.
@@ -297,12 +313,12 @@ impl std::error::Error for BridgeError {}
 /// `Commands`, `Local`) or `&mut World<_>` alone.
 #[diagnostic::on_unimplemented(
     message = "this closure cannot run as a bridge",
-    note = "bridges take up to eight system parameters (`Query`, `Single`, `Commands`, `Local`), or `&mut World<_>` alone"
+    note = "bridges take up to 16 system parameters (`Query`, `Single`, `Commands`, `Local`), or `&mut World<_>` alone"
 )]
 pub trait BridgeFn<S: Storage, M>: Sized {
     type Out;
     #[doc(hidden)]
-    type State: Default;
+    type State: Init;
     #[doc(hidden)]
     type Access: Access;
     #[doc(hidden)]
@@ -357,14 +373,22 @@ macro_rules! bridge_fn {
     };
 }
 bridge_fn!();
-bridge_fn!(A 0);
-bridge_fn!(A 0, B 1);
-bridge_fn!(A 0, B 1, C 2);
-bridge_fn!(A 0, B 1, C 2, D 3);
-bridge_fn!(A 0, B 1, C 2, D 3, E 4);
-bridge_fn!(A 0, B 1, C 2, D 3, E 4, F 5);
-bridge_fn!(A 0, B 1, C 2, D 3, E 4, F 5, G 6);
-bridge_fn!(A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7);
+bridge_fn!(P0 0);
+bridge_fn!(P0 0, P1 1);
+bridge_fn!(P0 0, P1 1, P2 2);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12, P13 13);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12, P13 13, P14 14);
+bridge_fn!(P0 0, P1 1, P2 2, P3 3, P4 4, P5 5, P6 6, P7 7, P8 8, P9 9, P10 10, P11 11, P12 12, P13 13, P14 14, P15 15);
 
 #[doc(hidden)]
 pub struct Exclusively<R>(PhantomData<fn() -> R>);

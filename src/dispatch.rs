@@ -486,7 +486,7 @@ where
 }
 
 /// Anything `add_plugins` accepts: a `Plugin`, a `task(...)`, or a tuple of up
-/// to 12 of them, nested freely, applied left to right. Each changes the
+/// to 16 of them, nested freely, applied left to right. Each changes the
 /// builder's type: `Components` is `C` extended with what it stores; systems
 /// extend the listener list `L` (plugins as placeholders until `build`),
 /// relations the hook list `K`.
@@ -552,16 +552,20 @@ macro_rules! plugin_tuples {
         }
     };
 }
-plugin_tuples!(A 1 B 2 C2);
-plugin_tuples!(A 1 B 2 C2 3 D);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I 9 J);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I 9 J 10 K2);
-plugin_tuples!(A 1 B 2 C2 3 D 4 E 5 F 6 G 7 H 8 I 9 J 10 K2 11 L2);
+plugin_tuples!(P0 1 P1 2 P2);
+plugin_tuples!(P0 1 P1 2 P2 3 P3);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12 13 P13);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12 13 P13 14 P14);
+plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 P12 13 P13 14 P14 15 P15);
 
 /// Every handler in a listener list runs against world `W`. Checked once at
 /// `build`, which also fixes the world type of systems written as `World<_>`.
@@ -593,7 +597,7 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         self.execution_mode = mode;
         self
     }
-    /// Add a plugin or a tuple of plugins (up to 12, nested freely), applied
+    /// Add a plugin or a tuple of plugins (up to 16, nested freely), applied
     /// left to right: `.add_plugins((Physics, Net { stats: &mut stats }))`.
     pub fn add_plugins<P: Plugins<C, L, K>>(
         self,
