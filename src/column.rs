@@ -24,21 +24,35 @@ impl Info {
         }
     }
     fn allocation(self, capacity: usize) -> Layout {
-        Layout::from_size_align(
-            self.layout
-                .size()
-                .checked_mul(capacity)
-                .expect("column capacity overflow"),
-            self.layout.align(),
+        lines(
+            Layout::from_size_align(
+                self.layout
+                    .size()
+                    .checked_mul(capacity)
+                    .expect("column capacity overflow"),
+                self.layout.align(),
+            )
+            .expect("column capacity overflow"),
         )
-        .expect("column capacity overflow")
     }
 }
+/// Parallel systems write different columns' rows and change ticks, so each
+/// buffer takes whole 128-byte line pairs (x86 prefetches lines in adjacent
+/// pairs): no two columns, nor a column and another allocation, share one.
+fn lines(layout: Layout) -> Layout {
+    layout
+        .align_to(128)
+        .expect("column capacity overflow")
+        .pad_to_align()
+}
+fn ticks(capacity: usize) -> Layout {
+    lines(Layout::array::<u64>(capacity).expect("tick capacity overflow"))
+}
+#[repr(align(128))]
 pub(crate) struct Summary {
     pub added: AtomicU64,
     pub changed: AtomicU64,
 }
-
 /// Raw buffers; the owning store supplies their common length and capacity.
 pub(crate) struct Column {
     pub info: Info,
@@ -68,7 +82,7 @@ impl Column {
     }
     pub fn validate_capacity(&self, capacity: usize) {
         self.info.allocation(capacity);
-        Layout::array::<u64>(capacity).expect("tick capacity overflow");
+        ticks(capacity);
     }
     pub unsafe fn grow(&mut self, old: usize, new: usize) {
         unsafe fn resize(pointer: *mut u8, old: Layout, new: Layout) -> *mut u8 {
@@ -93,8 +107,8 @@ impl Column {
                 self.info.allocation(old),
                 self.info.allocation(new),
             );
-            let old = Layout::array::<u64>(old).unwrap();
-            let new = Layout::array::<u64>(new).unwrap();
+            let old = ticks(old);
+            let new = ticks(new);
             self.added = resize(self.added.cast(), old, new).cast();
             self.changed = resize(self.changed.cast(), old, new).cast();
         }
@@ -149,7 +163,7 @@ impl Column {
                 alloc::dealloc(self.data, layout);
             }
             if capacity != 0 {
-                let layout = Layout::array::<u64>(capacity).unwrap();
+                let layout = ticks(capacity);
                 alloc::dealloc(self.added.cast(), layout);
                 alloc::dealloc(self.changed.cast(), layout);
             }
