@@ -191,15 +191,17 @@ impl Relation for Tagged {
     const FRAGMENTING: bool = true;
 }
 
-/// Sources of `target` through the table-level path, by name.
-fn related<R: Relation>(
-    world: &mut World<impl Has<Name> + Has<Relates<R>>>,
-    target: Entity,
-) -> Vec<u32> {
-    let mut query = world.query_filtered::<&Name, Related<R>>();
-    let mut names: Vec<_> = query.iter_related(target).map(|n| n.0).collect();
-    names.sort_unstable();
-    names
+/// Sources of `target` by name, through a `From` join.
+macro_rules! related {
+    ($relation:ty, $world:expr, $target:expr) => {{
+        let mut query = $world.query::<static_ecs::From<$relation, &Name>>();
+        let names = query.get_mut($target).into_iter().flatten().map(|n| n.0);
+        sorted(names.collect::<Vec<_>>())
+    }};
+}
+
+fn ids(entities: impl Iterator<Item = Entity>) -> Vec<Entity> {
+    entities.collect()
 }
 
 #[test]
@@ -215,21 +217,21 @@ fn fragmenting_one_to_many_groups_each_targets_sources_into_tables() {
     for (i, &member) in members.iter().enumerate() {
         world.relate(member, InSquad, if i % 2 == 0 { alpha } else { beta });
     }
-    assert_eq!(related::<InSquad>(world, alpha), [0, 2, 4]);
-    assert_eq!(related::<InSquad>(world, beta), [1, 3, 5]);
+    assert_eq!(related!(InSquad, world, alpha), [0, 2, 4]);
+    assert_eq!(related!(InSquad, world, beta), [1, 3, 5]);
     // Nothing besides the source's table key stores the relation.
     assert!(world.get::<Relates<InSquad>>(members[0]).is_none());
     assert!(world.get::<Sources<InSquad>>(alpha).is_none());
-    assert_eq!(world.targets::<InSquad>(members[0]), [alpha]);
+    assert_eq!(ids(world.targets::<InSquad>(members[0])), [alpha]);
     // Reparenting is one move between the squads' tables.
     world.relate(members[0], InSquad, beta);
-    assert_eq!(related::<InSquad>(world, alpha), [2, 4]);
-    assert_eq!(related::<InSquad>(world, beta), [0, 1, 3, 5]);
-    assert_eq!(world.targets::<InSquad>(members[0]), [beta]);
+    assert_eq!(related!(InSquad, world, alpha), [2, 4]);
+    assert_eq!(related!(InSquad, world, beta), [0, 1, 3, 5]);
+    assert_eq!(ids(world.targets::<InSquad>(members[0])), [beta]);
     assert!(world.unrelate::<InSquad>(members[1], beta));
     assert!(!world.unrelate::<InSquad>(members[1], beta));
-    assert_eq!(related::<InSquad>(world, beta), [0, 3, 5]);
-    assert_eq!(world.sources::<InSquad>(beta).len(), 3);
+    assert_eq!(related!(InSquad, world, beta), [0, 3, 5]);
+    assert_eq!(ids(world.sources::<InSquad>(beta)).len(), 3);
     // Plain iteration still sees every source, whatever its table.
     assert_eq!(
         world
@@ -240,7 +242,7 @@ fn fragmenting_one_to_many_groups_each_targets_sources_into_tables() {
     );
     // Components added later keep the entity in its target's table.
     world.insert(members[3], Elite);
-    assert_eq!(related::<InSquad>(world, beta), [0, 3, 5]);
+    assert_eq!(related!(InSquad, world, beta), [0, 3, 5]);
 }
 struct Elite;
 
@@ -257,16 +259,19 @@ fn fragmenting_many_to_many_keys_tables_by_target_sets() {
     world.relate(things[1], Tagged, red);
     world.relate(things[1], Tagged, blue);
     world.relate(things[2], Tagged, blue);
-    assert_eq!(related::<Tagged>(world, red), [0, 1]);
-    assert_eq!(related::<Tagged>(world, blue), [1, 2]);
+    assert_eq!(related!(Tagged, world, red), [0, 1]);
+    assert_eq!(related!(Tagged, world, blue), [1, 2]);
     world.unrelate::<Tagged>(things[1], red);
-    assert_eq!(related::<Tagged>(world, red), [0]);
-    assert_eq!(related::<Tagged>(world, blue), [1, 2]);
+    assert_eq!(related!(Tagged, world, red), [0]);
+    assert_eq!(related!(Tagged, world, blue), [1, 2]);
     // A despawned target leaves its sources in tables without its pair.
     world.despawn(blue);
-    assert!(world.targets::<Tagged>(things[2]).is_empty());
-    assert_eq!(world.targets::<Tagged>(things[1]), Vec::<Entity>::new());
-    assert_eq!(related::<Tagged>(world, red), [0]);
+    assert!(ids(world.targets::<Tagged>(things[2])).is_empty());
+    assert_eq!(
+        ids(world.targets::<Tagged>(things[1])),
+        Vec::<Entity>::new()
+    );
+    assert_eq!(related!(Tagged, world, red), [0]);
     assert_eq!(
         world
             .query_filtered::<&Name, Related<Tagged>>()
@@ -290,7 +295,7 @@ fn churning_fragmenting_targets_reuses_dead_tables() {
         for &member in &members {
             world.relate(member, InSquad, squad);
         }
-        assert_eq!(related::<InSquad>(world, squad), [0, 1, 2], "round {round}");
+        assert_eq!(related!(InSquad, world, squad), [0, 1, 2], "round {round}");
         for member in members {
             world.despawn(member);
         }
@@ -320,8 +325,8 @@ fn descendants_come_parents_first_for_both_storages() {
         world.relate(names[child], InSquad, names[parent]);
     }
     for order in [
-        world.descendants::<ChildOf>(names[0]),
-        world.descendants::<InSquad>(names[0]),
+        ids(world.descendants::<ChildOf>(names[0])),
+        ids(world.descendants::<InSquad>(names[0])),
     ] {
         let position = |i: usize| order.iter().position(|&e| e == names[i]).unwrap();
         assert_eq!(order.len(), 6);
@@ -362,28 +367,30 @@ fn linked_fragmenting_relations_despawn_subtrees_and_terminate_on_cycles() {
 }
 
 #[test]
-fn fragmenting_queries_read_targets_and_subtrees_inside_systems() {
+fn fragmenting_joins_read_targets_and_subtrees_inside_systems() {
+    use static_ecs::{From, To};
     struct Update;
     impl Schedule for Update {}
     struct Log(Vec<(u32, Option<u32>)>, usize);
+    type Grandchildren = From<InSquad, From<InSquad, Entity>>;
     let mut app = App::new()
         .relation::<InSquad, _>()
         .add_systems(
             Update,
-            |members: Query<(Entity, &Name), Related<InSquad>>,
-             names: Query<&Name>,
+            |mut members: Query<(&Name, To<InSquad, &Name>), Related<InSquad>>,
+             mut trees: Query<(&Name, Grandchildren)>,
              mut log: Single<&mut Log>| {
-                let mut members = members;
-                let mut names = names;
-                let pairs: Vec<_> = members.iter_mut().map(|(e, n)| (e, n.0)).collect();
-                for (entity, name) in pairs {
-                    let target = members.target(entity);
-                    let target = target.and_then(|t| names.get_mut(t)).map(|n| n.0);
-                    log.0.push((name, target));
+                for (name, squad) in &mut members {
+                    log.0.push((name.0, squad.map(|s| s.0)));
                 }
-                let root = members.iter_mut().find(|(_, n)| n.0 == 1).map(|(e, _)| e);
-                let parent = root.and_then(|r| members.target(r)).unwrap();
-                log.1 = members.related_descendants(parent).len();
+                // Two levels below the root, through nested joins.
+                for (name, children) in &mut trees {
+                    if name.0 == 0 {
+                        log.1 = children
+                            .map(|grandchildren| 1 + grandchildren.count())
+                            .sum();
+                    }
+                }
             },
         )
         .build();
@@ -421,14 +428,14 @@ fn bundle_values_relate_retarget_and_unrelate_with_edge_data() {
     let ship = world.spawn_bundle((Name(3), DockedAt { berth: 3 }.to(kestrel)));
     let docked = world.get::<Relates<DockedAt>>(ship).unwrap();
     assert_eq!((docked.target(), docked.berth), (kestrel, 3));
-    assert_eq!(world.sources::<DockedAt>(kestrel), [ship]);
+    assert_eq!(ids(world.sources::<DockedAt>(kestrel)), [ship]);
 
     // Inserting again retargets: the old link goes, the new value arrives.
     world.insert(ship, DockedAt { berth: 5 }.to(osprey));
     let docked = world.get::<Relates<DockedAt>>(ship).unwrap();
     assert_eq!((docked.target(), docked.berth), (osprey, 5));
     assert!(world.get::<Sources<DockedAt>>(kestrel).is_none());
-    assert_eq!(world.sources::<DockedAt>(osprey), [ship]);
+    assert_eq!(ids(world.sources::<DockedAt>(osprey)), [ship]);
 
     // Removing the link unrelates.
     world.remove::<Relates<DockedAt>>(ship);
@@ -456,7 +463,7 @@ fn commands_spawn_related_entities_and_many_to_many_values_replace_edges() {
     let dock = app.world.spawn_bundle((Name(9),));
     app.world.spawn_bundle((Station(dock),));
     app.emit(&Update);
-    let ship = app.world.sources::<DockedAt>(dock)[0];
+    let ship = ids(app.world.sources::<DockedAt>(dock))[0];
     assert_eq!(app.world.get::<Relates<DockedAt>>(ship).unwrap().berth, 7);
 
     let world = &mut app.world;
@@ -468,13 +475,13 @@ fn commands_spawn_related_entities_and_many_to_many_values_replace_edges() {
     );
     world.relate(fan, Likes, a);
     world.relate(fan, Likes, b);
-    assert_eq!(world.targets::<Likes>(fan).len(), 2);
+    assert_eq!(ids(world.targets::<Likes>(fan)).len(), 2);
     // A value replaces every edge of a many-to-many source; `relate` adds one.
     world.insert(fan, Likes.to(station));
-    assert_eq!(world.targets::<Likes>(fan), [station]);
+    assert_eq!(ids(world.targets::<Likes>(fan)), [station]);
     assert!(world.get::<Sources<Likes>>(a).is_none());
     world.relate(fan, Likes, a);
-    let mut targets = world.targets::<Likes>(fan);
+    let mut targets = ids(world.targets::<Likes>(fan));
     targets.sort();
     let mut expected = vec![station, a];
     expected.sort();
@@ -494,7 +501,7 @@ fn many_to_many_relations_allow_self_edges() {
     let mut app = App::new().relation::<Likes, _>().build();
     let narcissus = app.world.spawn();
     app.world.relate(narcissus, Likes, narcissus);
-    assert_eq!(app.world.targets::<Likes>(narcissus), [narcissus]);
+    assert_eq!(ids(app.world.targets::<Likes>(narcissus)), [narcissus]);
 }
 
 #[test]
@@ -509,12 +516,12 @@ fn fragmenting_bundle_values_become_pairs() {
         world.spawn_bundle((Name(2),)),
     );
     let member = world.spawn_bundle((Name(3), InSquad.to(alpha)));
-    assert_eq!(world.targets::<InSquad>(member), [alpha]);
+    assert_eq!(ids(world.targets::<InSquad>(member)), [alpha]);
     assert!(world.get::<Relates<InSquad>>(member).is_none());
     world.insert(member, InSquad.to(beta));
-    assert_eq!(world.targets::<InSquad>(member), [beta]);
-    assert_eq!(world.sources::<InSquad>(beta), [member]);
-    assert!(world.sources::<InSquad>(alpha).is_empty());
+    assert_eq!(ids(world.targets::<InSquad>(member)), [beta]);
+    assert_eq!(ids(world.sources::<InSquad>(beta)), [member]);
+    assert!(ids(world.sources::<InSquad>(alpha)).is_empty());
 }
 
 #[derive(Debug, PartialEq)]

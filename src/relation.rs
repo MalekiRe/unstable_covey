@@ -9,7 +9,6 @@ use std::marker::PhantomData;
 
 use crate::command::CommandQueue;
 use crate::dispatch::schedule;
-use crate::filter::QueryFilter;
 use crate::hook::{Batch, Hook, HookList, OnInsert, OnReplace};
 use crate::join::JoinKind;
 use crate::lookup::ComponentLookup;
@@ -24,10 +23,10 @@ pub trait Relation: Send + Sync + 'static {
     /// Despawn every source with its target (e.g. a scene hierarchy).
     /// Otherwise a despawned target is just unlinked from its sources.
     const LINKED: bool = false;
-    /// Give each target's sources their own tables: "every source of X" is a
-    /// table-level query (`Query::iter_related`), at the cost of a table move
-    /// per relate/unrelate and a table per distinct target set. One-to-one
-    /// relations cannot fragment:
+    /// Give each target's sources their own tables: `From<R, Q>` walks whole
+    /// tables of sources and `To<R, Q>` resolves a table's target once, at
+    /// the cost of a table move per relate/unrelate and a table per distinct
+    /// target set. One-to-one relations cannot fragment:
     /// ```compile_fail
     /// use static_ecs::prelude::*;
     /// struct Spouse;
@@ -471,36 +470,52 @@ impl<S: Storage> World<S> {
         true
     }
     /// `source`'s targets along `R`, for either storage.
-    pub fn targets<R: Relation>(&self, source: Entity) -> Vec<Entity>
+    pub fn targets<R: Relation>(&self, source: Entity) -> impl Iterator<Item = Entity> + '_
     where
         S: ComponentLookup<Relates<R>> + ComponentLookup<PairOf<R>>,
     {
-        if const { R::FRAGMENTING } {
-            return self.pair_targets(source, pair_index::<R, S>()).collect();
-        }
-        self.get::<Relates<R>>(source)
-            .map_or_else(Vec::new, |r| r.targets().collect())
+        let pairs = R::FRAGMENTING.then(|| self.pair_targets(source, pair_index::<R, S>()));
+        let links = if R::FRAGMENTING {
+            None
+        } else {
+            self.get::<Relates<R>>(source)
+        };
+        pairs
+            .into_iter()
+            .flatten()
+            .chain(links.into_iter().flat_map(Relates::targets))
     }
     /// `target`'s sources along `R`, for either storage.
-    pub fn sources<R: Relation>(&self, target: Entity) -> Vec<Entity>
+    pub fn sources<R: Relation>(&self, target: Entity) -> impl Iterator<Item = Entity> + '_
     where
         S: ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
     {
-        let mut sources = Vec::new();
-        self.append_sources::<R>(target, &mut sources);
-        sources
+        let pairs = R::FRAGMENTING.then(|| self.pair_sources(pair_index::<R, S>(), target));
+        let links = if R::FRAGMENTING {
+            None
+        } else {
+            self.get::<Sources<R>>(target)
+        };
+        pairs
+            .into_iter()
+            .flatten()
+            .chain(links.into_iter().flat_map(Sources::sources))
     }
-    fn append_sources<R: Relation>(&self, target: Entity, out: &mut Vec<Entity>)
+    /// Every entity below `root` along `R`, parents before children (breadth
+    /// first), for either storage. With `R` as a hierarchy, propagate
+    /// transforms in this order.
+    pub fn descendants<R: Relation>(&self, root: Entity) -> impl Iterator<Item = Entity> + '_
     where
         S: ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
     {
-        if const { R::FRAGMENTING } {
-            self.pair_sources(pair_index::<R, S>(), target, out);
-            return;
-        }
-        if let Some(sources) = self.get::<Sources<R>>(target) {
-            out.extend(sources.sources());
-        }
+        let mut queue: Vec<Entity> = self.sources::<R>(root).collect();
+        let mut next = 0;
+        std::iter::from_fn(move || {
+            let entity = *queue.get(next)?;
+            next += 1;
+            queue.extend(self.sources::<R>(entity));
+            Some(entity)
+        })
     }
     fn drop_if_empty_source<R: Relation>(&mut self, source: Entity)
     where
@@ -705,41 +720,5 @@ fn check_self_edge<R: Relation>(source: Entity, target: Entity) {
             source != target,
             "relate: an entity cannot relate to itself through a relation with a one-side"
         );
-    }
-}
-
-/// Breadth first from `root` (excluded): every parent before its children.
-/// `sources` appends an entity's sources to the order.
-fn breadth_first(root: Entity, mut sources: impl FnMut(Entity, &mut Vec<Entity>)) -> Vec<Entity> {
-    let mut order = Vec::new();
-    sources(root, &mut order);
-    let mut next = 0;
-    while let Some(&parent) = order.get(next) {
-        sources(parent, &mut order);
-        next += 1;
-    }
-    order
-}
-impl<S: Storage> World<S> {
-    /// Every entity below `root` along `R`, parents before children (breadth
-    /// first), for either storage. With `R` as a hierarchy, propagate
-    /// transforms in this order.
-    pub fn descendants<R: Relation>(&self, root: Entity) -> Vec<Entity>
-    where
-        S: ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
-    {
-        breadth_first(root, |e, order| self.append_sources::<R>(e, order))
-    }
-}
-/// Non-fragmenting relations from inside a system; fragmenting ones use
-/// `Query<D, Related<R>>::related_descendants`.
-impl<R: Relation, F: QueryFilter> Query<'_, &Sources<R>, F> {
-    /// `World::descendants` from inside a system.
-    pub fn descendants(&mut self, root: Entity) -> Vec<Entity> {
-        breadth_first(root, |e, order| {
-            if let Some(s) = self.get_mut(e) {
-                order.extend(s.sources());
-            }
-        })
     }
 }

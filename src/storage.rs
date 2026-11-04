@@ -938,11 +938,14 @@ impl<S: Storage> World<S> {
                 .is_ok()
         })
     }
-    /// Append the entities of every table holding `(relation, target)`.
-    pub(crate) fn pair_sources(&self, relation: usize, target: Entity, out: &mut Vec<Entity>) {
-        for &table in self.pairs.get(&(relation, target)).into_iter().flatten() {
-            out.extend_from_slice(&self.tables[table].entities);
-        }
+    /// The entities of every table holding `(relation, target)`.
+    pub(crate) fn pair_sources(
+        &self,
+        relation: usize,
+        target: Entity,
+    ) -> impl Iterator<Item = Entity> + '_ {
+        let tables = self.pairs.get(&(relation, target)).into_iter().flatten();
+        tables.flat_map(|&table| self.tables[table].entities.iter().copied())
     }
     /// Before `entity` is despawned: despawn the sources of every linked
     /// fragmenting relation targeting it, and move the others out of its pair.
@@ -963,7 +966,7 @@ impl<S: Storage> World<S> {
         {
             i += 1;
             sources.clear();
-            self.pair_sources(relation, entity, &mut sources);
+            sources.extend(self.pair_sources(relation, entity));
             for &source in &sources {
                 if !linked {
                     self.move_pair(source, relation, Some(entity), None);

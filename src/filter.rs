@@ -130,7 +130,7 @@ impl<T: 'static, S: Storage + ComponentLookup<T>> FilterFor<S> for Without<T> {
 }
 
 /// Matches sources of relation `R`, through `Relates<R>` or, for fragmenting
-/// relations, the table's pairs. Its queries add `iter_related`/`target`.
+/// relations, the table's pairs.
 pub struct Related<R>(PhantomData<fn() -> R>);
 impl<R: Relation> Related<R> {
     /// The component whose presence marks a source table.
