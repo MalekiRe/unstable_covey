@@ -3,6 +3,8 @@
 use crate::access::{Drives, Exclusive, Filtered, Mentions, QueryAccess, Read, Union, Write};
 use crate::filter::{Added, Changed, Or, With, Without};
 use crate::lookup::{ComponentLookup, PointLookup};
+use crate::plugin::ComponentList;
+use crate::require::{HasRequired, Requires};
 use crate::storage::{Components, Point, Sparse, Storage};
 
 /// A storage declaration for one component type.
@@ -42,17 +44,50 @@ impl<A, B> Choose<A, B> for If<false> {
     type Out = B;
 }
 
-/// `Self` plus declaration `D`, unless `Self` already stores its component.
-/// New components append, so existing indices never change.
+/// `Self` plus declaration `D` and everything its component requires, unless
+/// `Self` already stores the component. New components append, so existing
+/// indices never change.
 #[doc(hidden)]
 pub trait Insert<D> {
     type Out: Storage;
 }
 impl<C: Storage + Present<D::Component>, D: Declaration> Insert<D> for C
 where
-    If<{ core::gca!(<C as Present<D::Component>>::VALUE) }>: Choose<C, (C, D), Out: Storage>,
+    If<{ core::gca!(<C as Present<D::Component>>::VALUE) }>: Append<C, D>,
 {
-    type Out = <If<{ core::gca!(<C as Present<D::Component>>::VALUE) }> as Choose<C, (C, D)>>::Out;
+    type Out = <If<{ core::gca!(<C as Present<D::Component>>::VALUE) }> as Append<C, D>>::Out;
+}
+/// Selected by whether `C` already stores `D`'s component.
+#[doc(hidden)]
+pub trait Append<C, D> {
+    type Out: Storage;
+}
+impl<C: Storage, D> Append<C, D> for If<true> {
+    type Out = C;
+}
+impl<C: Storage, D: Declaration> Append<C, D> for If<false>
+where
+    (C, D): Storage,
+    If<{ core::gca!(<D::Component as HasRequired>::HAS) }>: AppendRequired<(C, D), D::Component>,
+{
+    type Out = <If<{ core::gca!(<D::Component as HasRequired>::HAS) }> as AppendRequired<
+        (C, D),
+        D::Component,
+    >>::Out;
+}
+/// Selected by whether `T` requires components: `C` plus `T::Required`.
+#[doc(hidden)]
+pub trait AppendRequired<C, T> {
+    type Out: Storage;
+}
+impl<C: Storage, T> AppendRequired<C, T> for If<false> {
+    type Out = C;
+}
+impl<C: Storage, T: Requires> AppendRequired<C, T> for If<true>
+where
+    T::Required: ComponentList<C>,
+{
+    type Out = <T::Required as ComponentList<C>>::Out;
 }
 
 /// `C` extended with every component an access or filter type mentions.

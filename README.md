@@ -201,6 +201,13 @@ assert!(world.despawn(entity));
 - `impl Immutable for T {}` makes `T` immutable: `&mut T` in queries and
   `get_mut` do not compile, so it changes only by inserting a new value or
   removing it, and its `OnReplace`/`OnInsert` hooks see every change.
+- `impl Requires for Bird { type Required = (Pos, Vel); }`: inserting `Bird`
+  also inserts `Pos::default()` and `Vel::default()` unless the entity has
+  them or the same bundle provides them, recursively and in the same table
+  move; their `OnAdd`/`OnInsert` hooks run after the bundle's. Storing `Bird`
+  stores what it requires, so required types need no registration. Each
+  archetype caches the result per bundle; bundles without requirements
+  compile to the plain path.
 - Tuple bundles (1–16 components) work with `spawn_bundle`, `spawn_batch`,
   `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
   multi-component transitions in a small table keyed by a compile-time hash of

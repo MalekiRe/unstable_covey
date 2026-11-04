@@ -27,6 +27,7 @@ mod plugin;
 mod query;
 mod relation;
 mod remote;
+mod require;
 mod storage;
 mod task;
 mod vocab;
@@ -56,6 +57,7 @@ pub use relation::{ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationH
 pub use remote::{
     Envelope, Everything, Remote, RemoteBridge, RemoteState, SyncPoint, SyncPointSystem, sync_point,
 };
+pub use require::Requires;
 pub use task::{Task, TaskFn, task};
 
 pub mod prelude {
@@ -63,9 +65,9 @@ pub mod prelude {
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
         Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice,
         NoInput, OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Plugin, Query, Ref,
-        Related, Relates, Relation, Relinked, Remote, Schedule, Single, Sources, Sparse, Storage,
-        Stores, SyncPoint, Systems, Trigger, With, Without, WorkerPool, World, exclusive, node,
-        ready, schedule, sync_point, task,
+        Related, Relates, Relation, Relinked, Remote, Requires, Schedule, Single, Sources, Sparse,
+        Storage, Stores, SyncPoint, Systems, Trigger, With, Without, WorkerPool, World, exclusive,
+        node, ready, schedule, sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

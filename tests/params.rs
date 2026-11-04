@@ -682,6 +682,7 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         ("cascade_cyclic", Some("E0080")),
         ("plugin_missing_component", Some("E0080")),
         ("immutable_write", Some("E0080")),
+        ("required_unstored", Some("E0080")),
     ] {
         std::fs::copy(
             root.join("tests/ui").join(format!("{fixture}.rs")),
