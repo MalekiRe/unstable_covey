@@ -670,6 +670,7 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         ("world_borrow", Some("E0499")),
         ("missing_dependency", Some("E0080")),
         ("duplicate_node", Some("E0080")),
+        ("bridge_outside_envelope", Some("E0080")),
     ] {
         std::fs::copy(
             root.join("tests/ui").join(format!("{fixture}.rs")),

@@ -19,14 +19,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::thread::{self, Thread};
 
-use crate::access::{Exclusive, Filtered, QueryAccess, Read, Write};
+use crate::access::{Access, Against, Exclusive, Filtered, QueryAccess, Read, ValidAccess, Write};
 use crate::bridge::{BridgeCell, BridgeError, BridgeFn, StateBox, StateRef, in_task, site};
 use crate::change::{SystemWorld, next};
 use crate::command::CommandQueue;
-use crate::dispatch::{Cons, Emitted, Fits, Label, MaybeHandle, Plugins, Schedule};
-use crate::executor::{self, Continue, Flow, Project, Tail};
+use crate::executor::{self, Continue, Flow, Project, Tail, Wait};
 use crate::lookup::ComponentLookup;
-use crate::{Storage, World};
+use crate::param::ParamShape;
+use crate::plan::{Input, IntoSystems, NoInput, Shape, accesses, sealed};
+use crate::{Storage, System, World};
 
 /// Words of an access mask: worlds of up to 256 components.
 const WORDS: usize = 4;
@@ -190,15 +191,32 @@ impl<S: Storage> Point<S> {
 /// Unique wave identifiers, so shared state is granted once per wave.
 static WAVES: AtomicU64 = AtomicU64::new(1);
 
-/// Create a sync point on `label`: add the returned `SyncPoint` to an app,
-/// where its position in registration order decides when, during `emit` of
-/// `label`, queued bridges run; bridge from any thread through the `Remote`.
-pub fn sync_point<S, E, X, LM>(_: X) -> (SyncPoint<S, E>, Remote<S, E>)
-where
-    S: Storage,
-    E: Schedule<Route = Emitted>,
-    X: Label<E, LM>,
-{
+/// Create an exclusive sync point and its `Remote` handle. The `SyncPoint` is
+/// a system: add it under a label (`add_systems(Update, point)`, or inside a
+/// chain or graph); wherever it runs, it drives the bridges queued so far,
+/// with exclusive world access, applying each wave's commands immediately.
+pub fn sync_point<S: Storage>() -> (SyncPoint<S>, Remote<S>) {
+    point()
+}
+/// Envelope sync points: `SyncPoint::within::<Env>()`.
+impl<S: Storage> SyncPoint<S> {
+    /// Create a sync point whose bridges stay within the access of system
+    /// parameters `Env`, e.g. `SyncPoint::within::<(Query<&mut Score>,
+    /// Query<&Name>)>()`. It runs in parallel with systems that do not
+    /// conflict with `Env`, and `Env`'s components join the inferred world.
+    /// Bridges reaching outside `Env` fail to compile. `Commands` need no
+    /// envelope; their commands apply when the emit ends.
+    pub fn within<Env: Envelope>() -> (SyncPoint<S, Env::Access>, Remote<S, Env::Access>) {
+        const {
+            assert!(
+                <Env::Access as ValidAccess>::VALID,
+                "invalid sync point envelope: conflicting access"
+            );
+        }
+        point()
+    }
+}
+fn point<S: Storage, Env, K>() -> (SyncPoint<S, Env, K>, Remote<S, Env>) {
     let point = Arc::new(Point {
         list: Mutex::new(List {
             head: std::ptr::null(),
@@ -217,14 +235,65 @@ where
     });
     let remote = Remote {
         point: point.clone(),
-        label: PhantomData,
+        envelope: PhantomData,
     };
     let driver = SyncPoint {
         point,
         drive: Drive::default(),
-        label: PhantomData,
+        queue: CommandQueue::default(),
+        marker: PhantomData,
     };
     (driver, remote)
+}
+
+/// System parameters whose combined access bounds a sync point's bridges:
+/// one parameter, or a tuple of up to four.
+pub trait Envelope {
+    type Access: Access + ValidAccess;
+}
+impl<A: ParamShape<Access: ValidAccess>> Envelope for A {
+    type Access = A::Access;
+}
+macro_rules! envelope {
+    ($($p:ident),+) => {
+        impl<$($p: ParamShape),+> Envelope for ($($p,)+)
+        where
+            accesses!($($p),+): ValidAccess,
+        {
+            type Access = accesses!($($p),+);
+        }
+    };
+}
+envelope!(A, B);
+envelope!(A, B, C);
+envelope!(A, B, C, D);
+
+/// Whether access `Self` stays within envelope `Env`.
+#[doc(hidden)]
+pub trait Within<Env> {
+    const VALUE: bool;
+}
+impl<Env> Within<Env> for () {
+    const VALUE: bool = true;
+}
+// A read is covered by any access to `T`; a write only by a write.
+impl<Env: Against<T, true>, T: 'static> Within<Env> for Read<T> {
+    const VALUE: bool = <Env as Against<T, true>>::VALUE;
+}
+impl<Env: Against<T, false>, T: 'static> Within<Env> for Write<T> {
+    const VALUE: bool = <Env as Against<T, false>>::VALUE;
+}
+impl<Env: Access> Within<Env> for Exclusive {
+    const VALUE: bool = Env::EXCLUSIVE;
+}
+impl<Env, A: Within<Env>, B: Within<Env>> Within<Env> for (A, B) {
+    const VALUE: bool = A::VALUE && B::VALUE;
+}
+impl<Env, A: Within<Env>, B: Within<Env>> Within<Env> for QueryAccess<A, B> {
+    const VALUE: bool = A::VALUE && B::VALUE;
+}
+impl<Env, A: Within<Env>, F> Within<Env> for Filtered<A, F> {
+    const VALUE: bool = A::VALUE;
 }
 
 /// The driver's buffers, reused across drives so warm drives allocate nothing.
@@ -250,20 +319,29 @@ impl<S: Storage> Default for Drive<S> {
 unsafe impl<S: Storage> Send for Drive<S> {}
 unsafe impl<S: Storage> Sync for Drive<S> {}
 
-/// A sync point's driver, as a plugin: runs queued remote bridges when the
-/// app reaches it while emitting `E`. Dropping it (with its app) closes the
-/// point: pending and later bridges fail with `BridgeError::Closed`.
-pub struct SyncPoint<S: Storage, E> {
+/// A sync point's driver: a system that runs the remote bridges queued when
+/// it runs. `Env` bounds their access (`Exclusive` by default). Dropping it
+/// (with its app) closes the point: pending and later bridges fail with
+/// `BridgeError::Closed`.
+pub struct SyncPoint<S: Storage, Env = Exclusive, K = NoInput> {
     point: Arc<Point<S>>,
     drive: Drive<S>,
-    label: PhantomData<fn() -> E>,
+    /// Envelope mode: commands granted bridges recorded, until `defer`.
+    queue: CommandQueue<S>,
+    marker: PhantomData<fn() -> (Env, K)>,
 }
-impl<S: Storage, E> SyncPoint<S, E> {
+impl<S: Storage, Env: Access, K> SyncPoint<S, Env, K> {
     /// Grant waves until no queued request is admissible. Returns whether
     /// any bridge ran.
     /// # Safety
-    /// `world` is live and held exclusively by this call.
-    unsafe fn run(&mut self, world: *mut World<S>, clock: &mut u64) -> bool {
+    /// `world` is live; this call holds `Env`'s access to it (all of it when
+    /// `Env` is exclusive) and `clock` is its path's clock.
+    unsafe fn run(
+        &mut self,
+        world: *mut World<S>,
+        clock: &mut u64,
+        wait: impl Fn(&AtomicUsize, &mut dyn FnMut()),
+    ) -> bool {
         let point = &*self.point;
         if point.queued.load(Ordering::Acquire) == 0 {
             return false;
@@ -330,51 +408,57 @@ impl<S: Storage, E> SyncPoint<S, E> {
             if drive.slots.len() < granted {
                 drive.slots.resize_with(granted, CommandQueue::default);
             }
-            // SAFETY: nothing is granted yet; the world is exclusively ours.
+            // SAFETY: nothing is granted yet. Only an exclusive point may
+            // touch the world's own clock.
             unsafe {
                 let wave = &mut *point.wave.get();
                 wave.read = *clock;
                 wave.write = if writes { next(*clock) } else { *clock };
-                World::set_clock(world, *clock);
+                if Env::EXCLUSIVE {
+                    World::set_clock(world, *clock);
+                }
             }
             point.pending.store(granted + 1, Ordering::Relaxed);
             point.queued.fetch_sub(granted, Ordering::Relaxed);
-            for (request, slot) in drive.grants.iter().zip(&mut drive.slots) {
-                // SAFETY: unlinked under this lock: live until it completes.
-                let request = unsafe { &**request };
-                request.slot.set(slot);
-                request.state.store(GRANTED, Ordering::Release);
-            }
-            drive.grants.clear();
-            drop(list);
-            for waker in drive.wakers.drain(..) {
-                waker.wake();
-            }
-            // One left means the last bridge is between its unpark and its
-            // release: that unpark may already be consumed, so don't park.
-            loop {
-                match point.pending.load(Ordering::Acquire) {
-                    0 => break,
-                    1 => thread::yield_now(),
-                    _ => thread::park(),
+            let mut list = Some(list);
+            let mut grant = || {
+                for (request, slot) in drive.grants.iter().zip(&mut drive.slots) {
+                    // SAFETY: unlinked under this lock: live until it completes.
+                    let request = unsafe { &**request };
+                    request.slot.set(slot);
+                    request.state.store(GRANTED, Ordering::Release);
                 }
-            }
+                drive.grants.clear();
+                drop(list.take());
+                for waker in drive.wakers.drain(..) {
+                    waker.wake();
+                }
+            };
+            // The waiter grants once it can run other work meanwhile.
+            wait(&point.pending, &mut grant);
             // SAFETY: every granted bridge has finished with the world.
             unsafe {
-                let queue = &mut *World::queue(world);
-                for slot in &mut drive.slots[..granted] {
-                    queue.append(slot);
-                }
                 let write = (*point.wave.get()).write;
-                World::set_clock(world, World::clock(world).max(write));
-                (*world).flush();
-                *clock = World::clock(world);
+                if Env::EXCLUSIVE {
+                    let queue = &mut *World::queue(world);
+                    for slot in &mut drive.slots[..granted] {
+                        queue.append(slot);
+                    }
+                    World::set_clock(world, World::clock(world).max(write));
+                    (*world).flush();
+                    *clock = World::clock(world);
+                } else {
+                    for slot in &mut drive.slots[..granted] {
+                        self.queue.append(slot);
+                    }
+                    *clock = (*clock).max(write);
+                }
             }
         }
         ran
     }
 }
-impl<S: Storage, E> Drop for SyncPoint<S, E> {
+impl<S: Storage, Env, K> Drop for SyncPoint<S, Env, K> {
     fn drop(&mut self) {
         let mut list = self.point.lock();
         list.closed = true;
@@ -391,33 +475,38 @@ impl<S: Storage, E> Drop for SyncPoint<S, E> {
     }
 }
 
-impl<S: Storage, E, C: Storage, L, K> Plugins<C, L, K> for SyncPoint<S, E> {
-    type Components = C;
-    type Listeners = Cons<Self, L>;
-    type Hooks = K;
-    fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, K) {
-        (Cons(self, listeners), hooks)
+impl<S: Storage, Env, K> sealed::Sealed for SyncPoint<S, Env, K> {}
+impl<S: Storage, Env: Access, K: Input> Shape for SyncPoint<S, Env, K> {
+    type Access = Env;
+    type Output = ();
+    type In = K;
+}
+/// Where a wave stands: one left means the last bridge is between its unpark
+/// and its release, so its unpark may already be consumed.
+fn progress(pending: &AtomicUsize) -> Wait {
+    match pending.load(Ordering::Acquire) {
+        0 => Wait::Done,
+        1 => Wait::Soon,
+        _ => Wait::Blocked,
     }
 }
-impl<S: Storage, E> Fits<World<S>> for SyncPoint<S, E> {
-    const VALID: bool = true;
-}
-impl<E: 'static, S: Storage> MaybeHandle<E, World<S>> for SyncPoint<S, E> {
-    const HAS_PARALLEL: bool = false;
-    const WEIGHT: usize = 0;
-    #[inline]
-    unsafe fn maybe_handle(&mut self, _: *const (), world: &mut World<S>) {
-        let world: *mut World<S> = world;
-        unsafe {
-            let mut clock = World::clock(world);
-            self.run(world, &mut clock);
-            World::set_clock(world, clock);
+/// Grant, then wait for the wave's bridges by parking.
+fn park(pending: &AtomicUsize, grant: &mut dyn FnMut()) {
+    grant();
+    loop {
+        match progress(pending) {
+            Wait::Done => break,
+            Wait::Soon => thread::yield_now(),
+            Wait::Blocked => thread::park(),
         }
     }
+}
+impl<S: Storage, Env: Access, K: Input> System<World<S>> for SyncPoint<S, Env, K> {
+    const VALID: bool = true;
+    /// Inside a frame, a waiting envelope point runs work published to its
+    /// worker meanwhile; an exclusive one has nothing to share it with.
     #[inline]
-    fn maybe_defer(&mut self, _: &mut <World<S> as SystemWorld>::Queue) {}
-    #[inline]
-    unsafe fn maybe_enter<R: Send, P: Project<R, Target = Self>, K: Continue<World<S>, R>>(
+    unsafe fn enter<R: Send, P: Project<R, Target = Self>, C: Continue<World<S>, R>>(
         context: &executor::Context<'_, World<S>, R>,
         flow: Flow,
     ) -> Tail<World<S>, R>
@@ -425,48 +514,90 @@ impl<E: 'static, S: Storage> MaybeHandle<E, World<S>> for SyncPoint<S, E> {
         World<S>: Send + Sync,
     {
         let mut clock = flow.clock();
-        // SAFETY: registrations run in order, so this driver holds the world.
+        // SAFETY: the path owns this node and `Env`'s access.
+        let ran = unsafe {
+            (*P::get(context.nodes)).run(context.world, &mut clock, |pending, grant| {
+                // Lend the worker before granting: anything forked once a
+                // bridge runs can then be handed to this thread.
+                match (!Env::EXCLUSIVE).then(|| executor::lend(context)).flatten() {
+                    Some(lent) => {
+                        grant();
+                        lent.wait(&|| progress(pending));
+                    }
+                    None => park(pending, grant),
+                }
+            })
+        };
+        unsafe { C::resume(context, Flow::new(clock, flow.ran() || ran)) }
+    }
+    #[inline]
+    unsafe fn run_unchecked(
+        &mut self,
+        _: *const (),
+        world: *mut World<S>,
+        clock: &mut u64,
+    ) -> Option<()> {
+        // SAFETY: the scheduler grants this system `Env`'s access.
+        unsafe { self.run(world, clock, park) }.then_some(())
+    }
+    fn defer(&mut self, queue: &mut <World<S> as SystemWorld>::Queue) {
+        queue.append(&mut self.queue);
+    }
+}
+#[doc(hidden)]
+pub struct SyncMarker;
+impl<K: Input, S: Storage, Env: Access> IntoSystems<K, SyncMarker> for SyncPoint<S, Env> {
+    type Systems = SyncPoint<S, Env, K>;
+    fn into_systems(self) -> Self::Systems {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: each field moves out exactly once; `this` is never dropped.
         unsafe {
-            let ran = (*P::get(context.nodes)).run(context.world, &mut clock);
-            K::resume(context, Flow::new(clock, flow.ran() || ran))
+            SyncPoint {
+                point: std::ptr::read(&this.point),
+                drive: std::ptr::read(&this.drive),
+                queue: std::ptr::read(&this.queue),
+                marker: PhantomData,
+            }
         }
     }
 }
 
-/// A handle for bridging into an app from any thread, at sync point `E`.
-/// Cheap to clone; await its bridges on threads other than the app's, since
-/// the app waits for a granted bridge to run.
-pub struct Remote<S: Storage, E> {
+/// A handle for bridging into an app from any thread, through one sync
+/// point whose bridges stay within `Env`. Cheap to clone; await its bridges
+/// on threads other than the app's, since the app waits for granted bridges.
+pub struct Remote<S: Storage, Env = Exclusive> {
     point: Arc<Point<S>>,
-    label: PhantomData<fn() -> E>,
+    envelope: PhantomData<fn() -> Env>,
 }
-impl<S: Storage, E> Clone for Remote<S, E> {
+impl<S: Storage, Env> Clone for Remote<S, Env> {
     fn clone(&self) -> Self {
         Self {
             point: self.point.clone(),
-            label: PhantomData,
+            envelope: PhantomData,
         }
     }
 }
-impl<S: Storage, E> Remote<S, E> {
+impl<S: Storage, Env> Remote<S, Env> {
     /// Run `function` once at this sync point, with fresh parameter state,
     /// on the awaiting thread, in parallel with other bridges of its wave.
     pub fn bridge<F, M>(&self, function: F) -> RemoteBridge<S, F, M, BridgeCell<F::State>>
     where
-        F: BridgeFn<S, M, Access: Masks<S>>,
+        F: BridgeFn<S, M, Access: Masks<S> + Within<Env>>,
     {
+        within::<F::Access, Env>();
         RemoteBridge::new(self.point.clone(), function, BridgeCell::default(), false)
     }
     /// As `bridge`, but retry at the next drive while a parameter cannot be fetched.
     pub fn until<F, M>(&self, function: F) -> RemoteBridge<S, F, M, BridgeCell<F::State>>
     where
-        F: BridgeFn<S, M, Access: Masks<S>>,
+        F: BridgeFn<S, M, Access: Masks<S> + Within<Env>>,
     {
+        within::<F::Access, Env>();
         RemoteBridge::new(self.point.clone(), function, BridgeCell::default(), true)
     }
     /// Parameter state kept across this point's bridges, as `AsyncWorld::state`.
     /// Bridges sharing it are never granted in the same wave.
-    pub fn state<T: Default>(&self) -> RemoteState<S, E, T> {
+    pub fn state<T: Default>(&self) -> RemoteState<S, Env, T> {
         RemoteState {
             shared: Arc::default(),
             remote: self.clone(),
@@ -474,12 +605,22 @@ impl<S: Storage, E> Remote<S, E> {
     }
 }
 
-/// Shared parameter state for remote bridges, from `Remote::state`.
-pub struct RemoteState<S: Storage, E, T> {
-    shared: Arc<StateBox<T>>,
-    remote: Remote<S, E>,
+#[inline(always)]
+fn within<A: Within<Env>, Env>() {
+    const {
+        assert!(
+            A::VALUE,
+            "this bridge reaches outside its sync point's envelope"
+        );
+    }
 }
-impl<S: Storage, E, T> Clone for RemoteState<S, E, T> {
+
+/// Shared parameter state for remote bridges, from `Remote::state`.
+pub struct RemoteState<S: Storage, Env, T> {
+    shared: Arc<StateBox<T>>,
+    remote: Remote<S, Env>,
+}
+impl<S: Storage, Env, T> Clone for RemoteState<S, Env, T> {
     fn clone(&self) -> Self {
         Self {
             shared: self.shared.clone(),
@@ -487,20 +628,22 @@ impl<S: Storage, E, T> Clone for RemoteState<S, E, T> {
         }
     }
 }
-impl<S: Storage, E, T> RemoteState<S, E, T> {
+impl<S: Storage, Env, T> RemoteState<S, Env, T> {
     /// `Remote::bridge` through this state.
     pub fn bridge<F, M>(&self, function: F) -> RemoteBridge<S, F, M, Arc<StateBox<T>>>
     where
-        F: BridgeFn<S, M, State = T, Access: Masks<S>>,
+        F: BridgeFn<S, M, State = T, Access: Masks<S> + Within<Env>>,
     {
+        within::<F::Access, Env>();
         let point = self.remote.point.clone();
         RemoteBridge::new(point, function, self.shared.clone(), false)
     }
     /// `Remote::until` through this state.
     pub fn until<F, M>(&self, function: F) -> RemoteBridge<S, F, M, Arc<StateBox<T>>>
     where
-        F: BridgeFn<S, M, State = T, Access: Masks<S>>,
+        F: BridgeFn<S, M, State = T, Access: Masks<S> + Within<Env>>,
     {
+        within::<F::Access, Env>();
         let point = self.remote.point.clone();
         RemoteBridge::new(point, function, self.shared.clone(), true)
     }

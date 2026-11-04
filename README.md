@@ -381,9 +381,9 @@ assert_eq!(log, [2, 1]);
 ### Remote bridges
 
 Futures on other threads or runtimes (tokio, a thread pool) bridge in through
-a sync point. `sync_point(Label)` returns a plugin and a `Remote` handle; the
-plugin's position in registration order is where, during `emit` of `Label`,
-queued remote bridges run.
+a sync point. `sync_point()` returns a `SyncPoint`, which is a system, and a
+`Remote` handle; wherever the system runs (`add_systems(Update, point)`, or
+inside a chain or graph), it drives the remote bridges queued so far.
 
 ```rust
 use static_ecs::prelude::*;
@@ -391,8 +391,8 @@ struct Update;
 impl Schedule for Update {}
 struct Score(u32);
 
-let (point, remote) = sync_point(Update);
-let mut app = App::new().register::<Score>().add_plugins(point).build();
+let (point, remote) = sync_point();
+let mut app = App::new().register::<Score>().add_systems(Update, point).build();
 let entity = app.world.spawn_bundle((Score(0),));
 let worker = std::thread::spawn(move || {
     let mut fetched = 40; // e.g. from the network; borrowed mutably below
@@ -434,6 +434,16 @@ assert_eq!(app.world.get::<Score>(entity).unwrap().0, 42);
 - The driver waits for granted bridges, so poll remote bridges on threads
   other than the app's. Inside a task, use `AsyncWorld::bridge`; awaiting a
   remote bridge there panics rather than deadlocking.
+- **Envelopes.** `sync_point()` is exclusive: it orders against everything
+  and applies each wave's commands at once. `SyncPoint::within::<Env>()`
+  bounds its bridges by the access of system parameters `Env` (one, or a
+  tuple of up to four, e.g. `(Query<&mut Score>, Query<&Name>)`): it runs in
+  parallel with systems that do not conflict with `Env`, `Env`'s components
+  join the inferred world, a bridge reaching outside `Env` fails to compile,
+  and commands (always allowed) apply when the emit ends.
+- While an envelope point waits for its bridges, its worker stays useful: it
+  lends its slot to the pool before granting, runs branches published to it
+  meanwhile, and holds the slot again once the wave is done.
 
 ## Execution model
 

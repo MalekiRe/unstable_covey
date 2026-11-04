@@ -47,7 +47,7 @@ pub use query::{ContiguousError, Query, QueryChunks, Single};
 pub use relation::{
     ManyToMany, OneToMany, OneToOne, Relates, Relation, RelationHooks, Sources, relation,
 };
-pub use remote::{Remote, RemoteBridge, RemoteState, SyncPoint, sync_point};
+pub use remote::{Envelope, Remote, RemoteBridge, RemoteState, SyncPoint, sync_point};
 pub use task::{Task, TaskFn, task};
 
 pub mod prelude {

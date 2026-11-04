@@ -1,3 +1,4 @@
+use static_ecs::SyncPoint;
 use static_ecs::prelude::*;
 use std::pin::pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -48,7 +49,7 @@ fn wait_until(mut condition: impl FnMut() -> bool) {
 fn bridges_run_at_the_sync_points_position_and_apply_commands_there() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let (before, after) = (log.clone(), log.clone());
-    let (point, remote) = sync_point(Update);
+    let (point, remote) = sync_point();
     let mut app = App::new()
         .add_systems(Update, move |mut q: Query<&A>| {
             before
@@ -56,7 +57,7 @@ fn bridges_run_at_the_sync_points_position_and_apply_commands_there() {
                 .unwrap()
                 .push(("before", q.iter_mut().count()))
         })
-        .add_plugins(point)
+        .add_systems(Update, point)
         .add_systems(Update, move |mut q: Query<&A, With<Player>>| {
             after.lock().unwrap().push(("after", q.iter_mut().count()))
         })
@@ -86,11 +87,11 @@ fn bridges_run_at_the_sync_points_position_and_apply_commands_there() {
 
 #[test]
 fn disjoint_bridges_run_in_parallel_in_one_wave() {
-    let (point, remote) = sync_point(Update);
+    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
         .register::<B>()
-        .add_plugins(point)
+        .add_systems(Update, point)
         .build();
     app.world.spawn_bundle((A(0), B(0)));
     let barrier = Barrier::new(2);
@@ -143,11 +144,11 @@ impl InFlight {
 
 #[test]
 fn conflicting_shared_state_and_exclusive_bridges_never_share_a_wave() {
-    let (point, remote) = sync_point(Update);
+    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
         .register::<B>()
-        .add_plugins(point)
+        .add_systems(Update, point)
         .build();
     app.world.spawn_bundle((A(0), B(0)));
     let state = remote.state();
@@ -188,11 +189,11 @@ fn conflicting_shared_state_and_exclusive_bridges_never_share_a_wave() {
 
 #[test]
 fn invalid_parameters_fail_and_until_retries_at_later_drives() {
-    let (point, remote) = sync_point(Update);
+    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
         .register::<Player>()
-        .add_plugins(point)
+        .add_systems(Update, point)
         .build();
     let queued = AtomicUsize::new(0);
     let done = AtomicBool::new(false);
@@ -227,8 +228,11 @@ fn invalid_parameters_fail_and_until_retries_at_later_drives() {
 
 #[test]
 fn a_loop_runs_once_per_drive_while_a_chain_may_finish_in_one() {
-    let (point, remote) = sync_point(Update);
-    let mut app = App::new().register::<A>().add_plugins(point).build();
+    let (point, remote) = sync_point();
+    let mut app = App::new()
+        .register::<A>()
+        .add_systems(Update, point)
+        .build();
     let runs = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let queued = AtomicUsize::new(0);
@@ -271,8 +275,11 @@ fn a_loop_runs_once_per_drive_while_a_chain_may_finish_in_one() {
 #[test]
 fn dropping_the_app_or_a_granted_bridge_never_strands_anyone() {
     // A request queued when its app drops fails, as does any later one.
-    let (point, remote) = sync_point(Update);
-    let app = App::new().register::<A>().add_plugins(point).build();
+    let (point, remote) = sync_point();
+    let app = App::new()
+        .register::<A>()
+        .add_systems(Update, point)
+        .build();
     let queued = AtomicUsize::new(0);
     thread::scope(|scope| {
         let waiter = scope.spawn(|| block_on(remote.bridge(|_: Query<&A>| ()), Some(&queued)));
@@ -286,8 +293,11 @@ fn dropping_the_app_or_a_granted_bridge_never_strands_anyone() {
     );
 
     // A bridge granted, then dropped without running, releases the driver.
-    let (point, remote) = sync_point(Update);
-    let mut app = App::new().register::<A>().add_plugins(point).build();
+    let (point, remote) = sync_point();
+    let mut app = App::new()
+        .register::<A>()
+        .add_systems(Update, point)
+        .build();
     let woken = Arc::new(AtomicBool::new(false));
     struct Flag(Arc<AtomicBool>);
     impl Wake for Flag {
@@ -321,15 +331,156 @@ fn dropping_the_app_or_a_granted_bridge_never_strands_anyone() {
 #[test]
 #[should_panic(expected = "inside a task, use `AsyncWorld::bridge`")]
 fn awaiting_a_remote_bridge_inside_a_task_panics_instead_of_deadlocking() {
-    let (point, remote) = sync_point(Update);
+    let (point, remote) = sync_point();
     let mut app = App::new()
         .register::<A>()
-        .add_plugins((
-            point,
-            task(move |_: AsyncWorld<_>| async move {
-                let _ = remote.bridge(|_: Query<&A>| ()).await;
-            }),
-        ))
+        .add_systems(Update, point)
+        .add_plugins(task(move |_: AsyncWorld<_>| async move {
+            let _ = remote.bridge(|_: Query<&A>| ()).await;
+        }))
         .build();
     app.emit(&Update);
+}
+
+/// Each side waits up to five seconds for the other; true if both met.
+fn rendezvous(mine: &AtomicBool, theirs: &AtomicBool) -> bool {
+    mine.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    while !theirs.load(Ordering::SeqCst) {
+        if start.elapsed() > Duration::from_secs(5) {
+            return false;
+        }
+        thread::yield_now();
+    }
+    true
+}
+
+#[test]
+fn an_envelope_point_runs_beside_disjoint_systems_and_infers_its_components() {
+    let (bridge_side, system_side) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let met = Arc::new(AtomicUsize::new(0));
+    let (mine, theirs, system_met) = (system_side.clone(), bridge_side.clone(), met.clone());
+    WorkerPool::new(3).install(|| {
+        // `A` is stored only because the envelope mentions it.
+        let (point, remote) = SyncPoint::within::<Query<&mut A>>();
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                (point, move |mut q: Query<&mut B>| {
+                    if rendezvous(&mine, &theirs) {
+                        system_met.fetch_add(1, Ordering::SeqCst);
+                    }
+                    q.iter_mut().for_each(|mut b| b.0 += 1);
+                })
+                    .parallel(),
+            )
+            .build();
+        let entity = app.world.spawn_bundle((A(1), B(1)));
+        let queued = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                block_on(
+                    remote.bridge(|mut q: Query<&mut A>| {
+                        if rendezvous(&bridge_side, &system_side) {
+                            met.fetch_add(1, Ordering::SeqCst);
+                        }
+                        q.iter_mut().for_each(|mut a| a.0 += 1);
+                    }),
+                    Some(&queued),
+                )
+                .unwrap()
+            });
+            wait_until(|| queued.load(Ordering::SeqCst) == 1);
+            app.emit(&Update);
+        });
+        assert_eq!(app.world.get::<A>(entity), Some(&A(2)));
+        assert_eq!(app.world.get::<B>(entity).map(|b| b.0), Some(2));
+    });
+    assert_eq!(
+        met.load(Ordering::SeqCst),
+        2,
+        "bridge and system overlapped"
+    );
+}
+
+#[test]
+fn envelope_commands_apply_when_the_emit_ends() {
+    let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    let during = seen.clone();
+    let (point, remote) = SyncPoint::within::<Query<&A>>();
+    let mut app = App::new()
+        .add_systems(
+            Update,
+            (point, move |mut q: Query<&A>| {
+                during.store(q.iter_mut().count(), Ordering::SeqCst)
+            })
+                .chain(),
+        )
+        .build();
+    let queued = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            block_on(
+                remote.bridge(|mut commands: Commands<_>| {
+                    commands.spawn((A(3),));
+                }),
+                Some(&queued),
+            )
+            .unwrap()
+        });
+        wait_until(|| queued.load(Ordering::SeqCst) == 1);
+        app.emit(&Update);
+    });
+    assert_eq!(seen.load(Ordering::SeqCst), 0);
+    assert_eq!(app.world.query::<&A>().iter_mut().count(), 1);
+}
+
+#[test]
+fn a_waiting_envelope_point_runs_work_published_to_its_worker() {
+    let started = Arc::new(AtomicBool::new(false));
+    let y_ran = Arc::new(AtomicBool::new(false));
+    let y_thread = Arc::new(Mutex::new(None));
+    let caller = thread::current().id();
+    let (gate_started, y_flag, y_where) = (started.clone(), y_ran.clone(), y_thread.clone());
+    WorkerPool::new(2).install(|| {
+        let (point, remote) = SyncPoint::within::<Query<&mut A>>();
+        // The driver lends its worker before granting, so once the bridge runs,
+        // a fork can hand work to the driver.
+        let gate = move || wait_until(|| gate_started.load(Ordering::SeqCst));
+        // Holds the other worker until `y` ran: only the driver can run `y`.
+        let x_waits = y_ran.clone();
+        let x = move |_: Query<&B>| wait_until(|| x_waits.load(Ordering::SeqCst));
+        let y = move |_: Query<&B>| {
+            *y_where.lock().unwrap() = Some(thread::current().id());
+            y_flag.store(true, Ordering::SeqCst);
+        };
+        let mut app = App::new()
+            .add_systems(
+                Update,
+                (point, (gate, (x, y).parallel()).chain()).parallel(),
+            )
+            .build();
+        app.world.spawn_bundle((A(0), B(0)));
+        let queued = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                block_on(
+                    remote.bridge(|_: Query<&mut A>| {
+                        started.store(true, Ordering::SeqCst);
+                        wait_until(|| y_ran.load(Ordering::SeqCst));
+                    }),
+                    Some(&queued),
+                )
+                .unwrap()
+            });
+            wait_until(|| queued.load(Ordering::SeqCst) == 1);
+            app.emit(&Update);
+        });
+    });
+    // The other worker was busy in `x`: the waiting driver (the calling
+    // thread) ran `y`. A driver that blocked would leave `x` waiting forever.
+    assert_eq!(*y_thread.lock().unwrap(), Some(caller));
 }

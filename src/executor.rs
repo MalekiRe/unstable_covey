@@ -9,15 +9,19 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
         Arc, Condvar, LazyLock, Mutex, PoisonError,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering, fence},
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
     },
-    thread::{self, JoinHandle},
+    thread::{self, JoinHandle, Thread},
 };
 
 type Panic = Box<dyn Any + Send>;
 thread_local! {
     static CURRENT: Cell<*const WorkerPool> = const { Cell::new(std::ptr::null()) };
     static SERIAL: Cell<bool> = const { Cell::new(false) };
+    /// The pool and slot this thread serves as a worker, while it does.
+    static WORKER: Cell<(*const Shared, usize)> = const { Cell::new((std::ptr::null(), 0)) };
+    /// This thread's handle, for publishers to unpark it as a lending caller.
+    static HANDLE: Thread = thread::current();
 }
 static DEFAULT: LazyLock<WorkerPool> =
     LazyLock::new(|| WorkerPool::new(thread::available_parallelism().map_or(1, usize::from)));
@@ -46,6 +50,91 @@ pub(crate) fn serially<T>(body: impl FnOnce() -> T) -> T {
     }
     let _restore = Restore(SERIAL.with(|serial| serial.replace(true)));
     body()
+}
+
+/// What a waiting branch should do next.
+pub(crate) enum Wait {
+    Done,
+    /// About to be done; parking could miss the wake.
+    Soon,
+    /// Parking is safe: whoever finishes the wait unparks this thread.
+    Blocked,
+}
+
+/// A worker's slot, lent to publishers while its branch waits on work outside
+/// the pool: the waiting worker runs branches published to it meanwhile.
+/// Dropping it holds the slot again, after running anything published to it.
+pub(crate) struct Lent<'a> {
+    shared: &'a Shared,
+    me: usize,
+}
+/// Lend this thread's slot if it is a worker of `context`'s pool.
+pub(crate) fn lend<'a, S, R>(context: &'a Context<'_, S, R>) -> Option<Lent<'a>> {
+    let shared: &Shared = &context.pool.shared;
+    let (pool, me) = WORKER.get();
+    if !std::ptr::eq(pool, shared) {
+        return None;
+    }
+    if me == 0 {
+        // Publishers to slot 0 then unpark the caller, not only its condvar.
+        shared.caller_lent.store(true, Ordering::Relaxed);
+    }
+    // This thread runs a branch, so it holds its slot; the release orders the
+    // flag above before any publication that observes the slot idle.
+    shared.slots[me].state.store(IDLE, Ordering::Release);
+    Some(Lent { shared, me })
+}
+impl Lent<'_> {
+    /// Run published branches until `state` reports done.
+    pub(crate) fn wait(&self, state: &dyn Fn() -> Wait) {
+        let own = &self.shared.slots[self.me];
+        let mut idle = 0;
+        loop {
+            match state() {
+                Wait::Done => return,
+                Wait::Soon => {
+                    thread::yield_now();
+                    continue;
+                }
+                Wait::Blocked => {}
+            }
+            if let Some(branch) = own.take() {
+                // The branch entry releases our slot again when it finishes.
+                unsafe { (branch.call)(branch.context, branch.flow, &own.state) };
+                idle = 0;
+            } else if idle < SPIN {
+                idle += 1;
+                hint::spin_loop();
+            } else {
+                idle = 0;
+                // Both publication and the waited-on work unpark this thread.
+                thread::park();
+            }
+        }
+    }
+}
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        let own = &self.shared.slots[self.me];
+        loop {
+            match own
+                .state
+                .compare_exchange(IDLE, RUNNING, Ordering::Acquire, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(READY) => {
+                    if let Some(branch) = own.take() {
+                        unsafe { (branch.call)(branch.context, branch.flow, &own.state) };
+                    }
+                }
+                // A publisher or thief holds it for a moment.
+                Err(_) => hint::spin_loop(),
+            }
+        }
+        if self.me == 0 {
+            self.shared.caller_lent.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Idle iterations before a worker or waiting caller blocks.
@@ -82,6 +171,10 @@ struct Shared {
     sleeping: AtomicBool,
     lock: Mutex<()>,
     wake: Condvar,
+    /// The current invocation's caller, valid while it runs.
+    caller: AtomicPtr<Thread>,
+    /// The caller lent slot 0 and parks on its thread.
+    caller_lent: AtomicBool,
 }
 impl Shared {
     /// Run one published branch as worker `me`: its own slot first, then steal.
@@ -116,6 +209,10 @@ impl Shared {
         false
     }
     fn wake_caller(&self) {
+        if self.caller_lent.load(Ordering::Relaxed) {
+            // SAFETY: set by the running invocation's caller, who is lending.
+            unsafe { (*self.caller.load(Ordering::Relaxed)).unpark() };
+        }
         fence(Ordering::SeqCst);
         if self.sleeping.load(Ordering::Relaxed) {
             drop(self.lock.lock().unwrap_or_else(PoisonError::into_inner));
@@ -147,6 +244,8 @@ impl WorkerPool {
                 sleeping: AtomicBool::new(false),
                 lock: Mutex::new(()),
                 wake: Condvar::new(),
+                caller: AtomicPtr::new(std::ptr::null_mut()),
+                caller_lent: AtomicBool::new(false),
             }),
             threads: Vec::with_capacity(workers - 1),
             submission: Mutex::new(()),
@@ -158,6 +257,7 @@ impl WorkerPool {
                 .name(format!("ecs-{worker}"))
                 .spawn(move || {
                     shared.started.fetch_add(1, Ordering::Release);
+                    WORKER.set((Arc::as_ptr(&shared), worker));
                     let mut idle = 0;
                     while !shared.closing.load(Ordering::Acquire) {
                         if shared.help(worker) {
@@ -520,6 +620,16 @@ pub(crate) unsafe fn execute<S: Send + Sync, R: Send, C: Continue<S, R>>(
         panic: Mutex::new(Vec::new()),
     };
     let shared = &*pool.shared;
+    // The caller serves as worker 0 for this invocation.
+    struct Restore((*const Shared, usize));
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            WORKER.set(self.0);
+        }
+    }
+    let _worker = Restore(WORKER.replace((shared, 0)));
+    let handle = HANDLE.with(|handle| std::ptr::from_ref(handle).cast_mut());
+    shared.caller.store(handle, Ordering::Relaxed);
     shared.slots[0].state.store(RUNNING, Ordering::Relaxed);
     let root = std::ptr::from_ref(&context).cast();
     unsafe { invoke::<S, R, C>(root, flow, &shared.slots[0].state) };

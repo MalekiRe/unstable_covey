@@ -100,8 +100,11 @@ fn warm_remote_bridges_allocate_nothing_on_either_side() {
             self.0.unpark();
         }
     }
-    let (point, remote) = sync_point(Update);
-    let mut app = App::new().register::<Health>().add_plugins(point).build();
+    let (point, remote) = sync_point();
+    let mut app = App::new()
+        .register::<Health>()
+        .add_systems(Update, point)
+        .build();
     app.world.spawn_bundle((Health(0),));
     const WARM: usize = 3;
     const ROUNDS: usize = 50;
