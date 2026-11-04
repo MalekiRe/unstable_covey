@@ -1246,8 +1246,8 @@ impl<S: Storage> World<S> {
     {
         const {
             assert!(
-                !<T as crate::relation::LinkComponent>::IS,
-                "relation links are read-only: relate, unrelate, or insert `R.to(target)`"
+                !<T as crate::immutable::IsImmutable>::IS,
+                "immutable component: change it by inserting a new value or removing it (relation links: relate, unrelate, or insert `R.to(target)`)"
             );
         }
         self.links_mut(entity)

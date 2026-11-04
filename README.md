@@ -198,6 +198,9 @@ assert!(world.despawn(entity));
 
 - `spawn`, `insert`, `remove`, `despawn`, `get`, `get_mut` work on any stored
   component. `insert` and `remove` return the previous value.
+- `impl Immutable for T {}` makes `T` immutable: `&mut T` in queries and
+  `get_mut` do not compile, so it changes only by inserting a new value or
+  removing it, and its `OnReplace`/`OnInsert` hooks see every change.
 - Tuple bundles (1–16 components) work with `spawn_bundle`, `spawn_batch`,
   `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
   multi-component transitions in a small table keyed by a compile-time hash of
@@ -383,8 +386,8 @@ assert_eq!(allies.get_mut(lead).unwrap().map(|n| n.0).collect::<Vec<_>>(), ["Osp
   too); inserting again retargets, and for many-to-many replaces every edge.
   `relate(source, value, target)` adds one edge (or replaces its value);
   removing `Relates<R>`, `unrelate`, or despawning either side unlinks.
-  `Relates<R>` and `Sources<R>` are read-only otherwise: `&mut` to them does
-  not compile, since swapping two rows' lists would corrupt the index. A
+  `Relates<R>` and `Sources<R>` are `Immutable`: `&mut` to them does not
+  compile, since swapping two rows' lists would corrupt the index. A
   relation with a one-side refuses self-edges; an `ACYCLIC` one refuses edges
   closing a cycle; `LINKED` despawns sources with their target.
 - **Joins.** `To<R, Q>` fetches `Q` on the row's targets, `From<R, Q>` on its

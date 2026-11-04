@@ -3,10 +3,10 @@ use crate::{
     access::{Access, Conflict, Mentions, Read, Union, ValidAccess, Write},
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
     filter::{FilterFor, QueryFilter, TableMatch},
+    immutable::IsImmutable,
     init::Init,
     join::Cascading,
     lookup::ComponentLookup,
-    relation::LinkComponent,
     storage::{ColumnPtr, Locator, PairIndex, Reach, Table},
 };
 use std::{
@@ -66,9 +66,9 @@ pub trait QueryData: sealed::Sealed {
     /// Every join inside is sound on its own (see `JoinCheck::ROW_VALID`).
     #[doc(hidden)]
     const JOINS_VALID: bool = true;
-    /// Writes a relation link component (`LinkComponent`).
+    /// Writes an `Immutable` component in place.
     #[doc(hidden)]
-    const WRITES_LINKS: bool = false;
+    const WRITES_IMMUTABLE: bool = false;
     type Indices: Copy;
     type Fetch: Copy + Init;
     type Item<'w>;
@@ -250,8 +250,8 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
                 "invalid query: missing/ambiguous component or conflicting access"
             );
             assert!(
-                !D::WRITES_LINKS,
-                "relation links are read-only: relate, unrelate, or insert `R.to(target)`"
+                !D::WRITES_IMMUTABLE,
+                "immutable component: change it by inserting a new value or removing it (relation links: relate, unrelate, or insert `R.to(target)`)"
             );
             assert!(
                 D::ROW_VALID,
@@ -818,7 +818,7 @@ impl<T: 'static> QueryData for &mut T {
     type Access = Write<T>;
     type Direct = ();
     type Far = ();
-    const WRITES_LINKS: bool = <T as LinkComponent>::IS;
+    const WRITES_IMMUTABLE: bool = <T as IsImmutable>::IS;
     type Indices = usize;
     type Fetch = ColumnPtr;
     type Item<'w> = Mut<'w, T>;
@@ -900,7 +900,7 @@ impl<Q: QueryData> QueryData for Option<Q> {
     const SHARED_WRITE: bool = Q::SHARED_WRITE;
     const JOINS: bool = Q::JOINS;
     const JOINS_VALID: bool = Q::JOINS_VALID;
-    const WRITES_LINKS: bool = Q::WRITES_LINKS;
+    const WRITES_IMMUTABLE: bool = Q::WRITES_IMMUTABLE;
     type Indices = Q::Indices;
     /// Resolved per table: a table matches `Q` for all its rows or none.
     type Fetch = Option<Q::Fetch>;
@@ -1001,7 +1001,7 @@ macro_rules! tuple_query {
             const SHARED_WRITE: bool = false $(|| $data::SHARED_WRITE)+;
             const JOINS: bool = false $(|| $data::JOINS)+;
             const JOINS_VALID: bool = true $(&& $data::JOINS_VALID)+;
-            const WRITES_LINKS: bool = false $(|| $data::WRITES_LINKS)+;
+            const WRITES_IMMUTABLE: bool = false $(|| $data::WRITES_IMMUTABLE)+;
             type Indices = ($($data::Indices,)+); type Fetch = ($($data::Fetch,)+);
             type Item<'w> = ($($data::Item<'w>,)+); type Slice<'w> = ($($data::Slice<'w>,)+);
             fn matches(indices: &Self::Indices, present: &[bool]) -> bool { true $(&& $data::matches(&indices.$index, present))+ }

@@ -12,6 +12,7 @@ use crate::change::{Mut, MutSlice};
 use crate::command::CommandQueue;
 use crate::dispatch::schedule;
 use crate::hook::{Batch, Hook, HookList, OnInsert, OnReplace};
+use crate::immutable::Immutable;
 use crate::join::JoinKind;
 use crate::lookup::ComponentLookup;
 use crate::plan::FunctionSystem;
@@ -250,23 +251,11 @@ where
     }
 }
 
-/// Link components: their lists index each other across entities, so only
-/// relating writes them; `&mut` access to one does not compile.
-#[doc(hidden)]
-pub trait LinkComponent {
-    const IS: bool;
-}
-impl<T: ?Sized> LinkComponent for T {
-    default const IS: bool = false;
-}
-impl<R: Relation> LinkComponent for Relates<R> {
-    const IS: bool = true;
-}
-impl<R: Relation> LinkComponent for Sources<R> {
-    const IS: bool = true;
-}
+// Link lists index each other across entities: only relating writes them.
+impl<R: Relation> Immutable for Relates<R> {}
+impl<R: Relation> Immutable for Sources<R> {}
 
-/// `&mut L` for the relation's own hooks, past the `LinkComponent` gate.
+/// `&mut L` for the relation's own hooks, past the `Immutable` gate.
 #[doc(hidden)]
 pub struct LinksMut<L>(PhantomData<fn() -> L>);
 impl<L: 'static> QueryData for LinksMut<L> {

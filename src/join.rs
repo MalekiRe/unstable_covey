@@ -300,7 +300,7 @@ impl<R: Relation, Q: JoinCheck> QueryData for To<R, Q> {
         <R::Kind as JoinKind>::SHARED_TARGETS && <Q::Access as Access>::WRITES;
     const JOINS: bool = true;
     const JOINS_VALID: bool = join_valid::<R, Q>(<R::Kind as JoinKind>::TO_MANY);
-    const WRITES_LINKS: bool = Q::WRITES_LINKS;
+    const WRITES_IMMUTABLE: bool = Q::WRITES_IMMUTABLE;
     type Indices = JoinIndices<Q::Indices>;
     type Fetch = JoinFetch<Q>;
     type Item<'w> = <R::Kind as JoinKind>::To<'w, Q>;
@@ -354,7 +354,7 @@ impl<R: Relation, Q: JoinCheck> QueryData for From<R, Q> {
     type Far = <R::Kind as JoinKind>::Far<Q::Access, (Q::Direct, Q::Far)>;
     const JOINS: bool = true;
     const JOINS_VALID: bool = join_valid::<R, Q>(<R::Kind as JoinKind>::FROM_MANY);
-    const WRITES_LINKS: bool = Q::WRITES_LINKS;
+    const WRITES_IMMUTABLE: bool = Q::WRITES_IMMUTABLE;
     type Indices = JoinIndices<Q::Indices>;
     type Fetch = JoinFetch<Q>;
     type Item<'w> = <R::Kind as JoinKind>::From<'w, Q>;
