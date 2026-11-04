@@ -210,7 +210,9 @@ impl<'a> Tables<'a> {
         filter: &F::State,
     ) -> Option<&'a Table> {
         let matches = |table: &&Table| {
-            D::matches(indices, &table.present) && F::matches(filter, &table.present)
+            !table.resource
+                && D::matches(indices, &table.present)
+                && F::matches(filter, &table.present)
         };
         match self {
             Self::All(tables) => tables.find(matches),
@@ -315,7 +317,8 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
                 }
             } else {
                 for (i, table) in query.tables.iter().enumerate().skip(state.scanned) {
-                    if D::matches(&query.indices, &table.present)
+                    if !table.resource
+                        && D::matches(&query.indices, &table.present)
                         && F::matches(&query.filter, &table.present)
                     {
                         state.matching.push(i);
@@ -346,7 +349,10 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
     fn row_of(&self, entity: Entity) -> Option<(usize, usize)> {
         let (index, row) = self.locator.find(entity)?;
         let table = &self.tables[index];
-        if !D::matches(&self.indices, &table.present) || !F::matches(&self.filter, &table.present) {
+        if table.resource
+            || !D::matches(&self.indices, &table.present)
+            || !F::matches(&self.filter, &table.present)
+        {
             return None;
         }
         // SAFETY: filters read only tick metadata of a live row.

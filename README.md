@@ -212,9 +212,30 @@ assert!(world.despawn(entity));
   `insert_bundle`, and `remove_bundle`, without declaration. Each world caches
   multi-component transitions in a small table keyed by a compile-time hash of
   the bundle's component indices; single components use per-archetype arrays.
-- Global state is ordinary component data on singleton entities.
 - Structural changes need `&mut World`: between emissions, in `exclusive`
   systems, or in payload handlers.
+
+## Resources
+
+Resources are components of one hidden entity, made by the first insert.
+Queries never see it: its tables stay out of the component index, so this
+costs nothing per query or row.
+
+```rust,ignore
+App::new()
+    .insert_resource(Gravity(9.8))
+    .init_resource::<Score>() // Default, unless already inserted
+    .add_systems(Update, |gravity: Res<Gravity>, mut score: ResMut<Score>| score.0 += 1)
+```
+
+- `Res<T>` reads (as `Read<T>`), `ResMut<T>` writes with change detection (as
+  `Write<T>`), so they schedule like queries of `T`. A missing resource skips
+  the system, like `Single`; `Option<Res<T>>` (any `Option<P>`) runs anyway.
+- `world.insert_resource`, `init_resource`, `remove_resource`, `resource`,
+  `resource_mut`; `commands.insert_resource`/`remove_resource`. Builder
+  resources are inserted at `build` in order, after hooks are installed.
+- Hooks fire as for any component. `ResMut` of an `Immutable` resource does
+  not compile.
 
 ## Queries
 
@@ -252,8 +273,8 @@ or to its next one. Unordered, non-conflicting writers may share a tick value.
 ## Systems and composition
 
 Systems are functions or closures taking their label's input (if any), then up
-to 16 parameters: `Query`, `Single`, `Local<T>` (per-registration state), and
-`Commands<_>`.
+to 16 parameters: `Query`, `Single`, `Res<T>`, `ResMut<T>`, `Option<P>`,
+`Local<T>` (per-registration state), and `Commands<_>`.
 
 ```rust,ignore
 app.add_systems(Update, ((integrate, decay).parallel(), validate).chain().run_if(running))

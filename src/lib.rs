@@ -46,7 +46,7 @@ pub use hook::{Batch, Event, Hook, OnAdd, OnInsert, OnRemove, OnReplace, Trigger
 pub use immutable::Immutable;
 pub use join::{From, JoinKind, Joined, To};
 pub use lookup::ComponentLookup as Stores;
-pub use param::Local;
+pub use param::{Local, Res, ResMut};
 pub use plan::{
     ExclusiveSystem, ExecutionMode, FunctionSystem, Input, IntoSystemConfigs, IntoSystems, NoInput,
     Ref, Shape, System, exclusive,
@@ -65,9 +65,9 @@ pub mod prelude {
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
         Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local, ManyToMany, Mut, MutSlice,
         NoInput, OnAdd, OnInsert, OnRemove, OnReplace, OneToMany, OneToOne, Or, Plugin, Query, Ref,
-        Related, Relates, Relation, Relinked, Remote, Requires, Schedule, Single, Sources, Sparse,
-        Storage, Stores, SyncPoint, Systems, Trigger, With, Without, WorkerPool, World, exclusive,
-        node, ready, schedule, sync_point, task,
+        Related, Relates, Relation, Relinked, Remote, Requires, Res, ResMut, Schedule, Single,
+        Sources, Sparse, Storage, Stores, SyncPoint, Systems, Trigger, With, Without, WorkerPool,
+        World, exclusive, node, ready, schedule, sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

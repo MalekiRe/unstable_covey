@@ -310,6 +310,8 @@ pub struct Table {
     pub(crate) present: Vec<bool>,
     /// Fragmenting relation pairs `(index of Relates<R>, target)`, sorted.
     pub(crate) targets: Pairs,
+    /// Holds the resource entity: no query matches it.
+    pub(crate) resource: bool,
     pub(crate) entities: Entities,
     pub(crate) columns: Columns,
 }
@@ -448,6 +450,8 @@ pub struct World<S: Storage> {
     hooks: Option<HookTable<S>>,
     /// Request queues of the schema's sync points; dropping closes them.
     pub(crate) points: Points<S>,
+    /// The entity holding every resource, made by the first insert.
+    resources: Option<Entity>,
     schema: PhantomData<S>,
 }
 impl<S: Storage> Default for World<S> {
@@ -484,9 +488,10 @@ impl<S: Storage> World<S> {
             flushing: false,
             hooks: None,
             points: Points::new(),
+            resources: None,
             schema: PhantomData,
         };
-        world.add_table(vec![false; S::LEN], Box::new([]));
+        world.add_table(vec![false; S::LEN], Box::new([]), false);
         world
     }
     /// A handle for bridging into this world from any thread, through its
@@ -582,7 +587,9 @@ impl<S: Storage> World<S> {
             self.flush();
         }
     }
-    fn add_table(&mut self, present: Vec<bool>, targets: Pairs) -> usize {
+    /// Resource tables get their own dense stores and stay out of
+    /// `component_tables`, so queries never see the resource entity.
+    fn add_table(&mut self, present: Vec<bool>, targets: Pairs, resource: bool) -> usize {
         let components: Vec<_> = present
             .iter()
             .enumerate()
@@ -599,7 +606,12 @@ impl<S: Storage> World<S> {
             .filter(|&i| self.info[i].sparse)
             .collect();
         let dense = (0..self.dense.len())
-            .find(|&d| self.dense[d].indices == dense_indices && self.dense_targets[d] == targets)
+            .find(|&d| {
+                self.dense[d].indices == dense_indices
+                    && self.dense_targets[d] == targets
+                    // A store's first table was created with it.
+                    && self.tables[self.dense[d].archetypes[0]].resource == resource
+            })
             .unwrap_or_else(|| {
                 self.dense.push(Store::new(dense_indices, &self.info));
                 self.dense_targets.push(targets.clone());
@@ -608,7 +620,9 @@ impl<S: Storage> World<S> {
         let mut map = vec![usize::MAX; S::LEN];
         for (position, &component) in components.iter().enumerate() {
             map[component] = position;
-            self.component_tables[component].reserve(1);
+            if !resource {
+                self.component_tables[component].reserve(1);
+            }
         }
         let id = self.tables.len();
         self.tables.reserve(1);
@@ -632,6 +646,7 @@ impl<S: Storage> World<S> {
         self.tables.push(Table {
             present,
             targets,
+            resource,
             entities: Entities {
                 pointer: std::ptr::NonNull::dangling().as_ptr(),
                 len: 0,
@@ -640,8 +655,10 @@ impl<S: Storage> World<S> {
         });
         self.archetypes.push(archetype);
         self.dense[dense].archetypes.push(id);
-        for &component in &self.archetypes[id].components {
-            self.component_tables[component].push(id);
+        if !resource {
+            for &component in &self.archetypes[id].components {
+                self.component_tables[component].push(id);
+            }
         }
         self.refresh(id);
         id
@@ -821,7 +838,11 @@ impl<S: Storage> World<S> {
         for r in &inits {
             signature[r.index] = true;
         }
-        let destination = self.table_for(signature, self.tables[source].targets.clone());
+        let destination = self.table_for(
+            signature,
+            self.tables[source].targets.clone(),
+            self.tables[source].resource,
+        );
         let list = &mut self.archetypes[source].required;
         list.push(RequiredMove {
             key: B::KEY,
@@ -878,7 +899,11 @@ impl<S: Storage> World<S> {
         for &i in B::INDICES {
             signature[i] = adding;
         }
-        let destination = self.table_for(signature, self.tables[source].targets.clone());
+        let destination = self.table_for(
+            signature,
+            self.tables[source].targets.clone(),
+            self.tables[source].resource,
+        );
         if B::INDICES.len() == 1 {
             self.archetypes[source].transitions[B::INDICES[0]][adding as usize] =
                 NonZeroUsize::new(destination + 1);
@@ -896,11 +921,11 @@ impl<S: Storage> World<S> {
     /// The table with exactly these components and pairs, reusing an empty
     /// table whose targets died before creating one.
     #[cold]
-    fn table_for(&mut self, present: Vec<bool>, targets: Pairs) -> usize {
+    fn table_for(&mut self, present: Vec<bool>, targets: Pairs, resource: bool) -> usize {
         let find = |tables: &[Table]| {
-            tables
-                .iter()
-                .position(|t| t.present == present && t.targets == targets)
+            tables.iter().position(|t| {
+                t.present == present && t.targets == targets && t.resource == resource
+            })
         };
         if let Some(table) = find(&self.tables) {
             return table;
@@ -911,7 +936,7 @@ impl<S: Storage> World<S> {
         {
             return table;
         }
-        self.add_table(present, targets)
+        self.add_table(present, targets, resource)
     }
     /// Retarget an empty dense store whose pairs name a dead entity, so
     /// churning parents do not accumulate tables. Query caches stay valid:
@@ -984,7 +1009,11 @@ impl<S: Storage> World<S> {
                 }
                 let mut present = self.tables[location.table].present.clone();
                 present[relation] = targets.iter().any(|&(r, _)| r == relation);
-                let destination = self.table_for(present, targets.into());
+                let destination = self.table_for(
+                    present,
+                    targets.into(),
+                    self.tables[location.table].resource,
+                );
                 self.pair_moves.insert(key, destination);
                 destination
             }
@@ -1336,6 +1365,83 @@ impl<S: Storage> World<S> {
         S: ComponentLookup<T>,
     {
         self.remove_bundle::<(T,)>(entity).0
+    }
+    /// The resource entity, made on first use in its own empty table.
+    fn resource_entity(&mut self) -> Entity {
+        if let Some(entity) = self.resources
+            && self.contains(entity)
+        {
+            return entity;
+        }
+        self.flush_reserved();
+        let table = self.table_for(vec![false; S::LEN], Box::new([]), true);
+        self.reserve_slots(1);
+        self.reserve_rows(table, 1, true);
+        let entity = self.allocate();
+        let dense = self.archetypes[table].dense;
+        let row = self.tables[table].entities.len();
+        if S::HAS_SPARSE {
+            self.archetypes[table]
+                .rows
+                .push(self.dense[dense].entities.len());
+            self.archetypes[table].sparse.entities.push(entity);
+        }
+        self.dense[dense].entities.push(entity);
+        self.locations[entity.slot as usize].location = Some(Location { table, row });
+        self.refresh_len(table);
+        self.resources = Some(entity);
+        entity
+    }
+    /// Insert or replace resource `T`, returning the previous value. Its
+    /// hooks run as for any component.
+    pub fn insert_resource<T: 'static>(&mut self, value: T) -> Option<T>
+    where
+        S: ComponentLookup<T>,
+    {
+        let entity = self.resource_entity();
+        self.insert(entity, value)
+    }
+    /// Insert `T::default()` unless resource `T` exists.
+    pub fn init_resource<T: Default + 'static>(&mut self)
+    where
+        S: ComponentLookup<T>,
+    {
+        if self.resource::<T>().is_none() {
+            self.insert_resource(T::default());
+        }
+    }
+    pub fn remove_resource<T: 'static>(&mut self) -> Option<T>
+    where
+        S: ComponentLookup<T>,
+    {
+        self.remove(self.resources?)
+    }
+    pub fn resource<T: 'static>(&self) -> Option<&T>
+    where
+        S: ComponentLookup<T>,
+    {
+        self.get(self.resources?)
+    }
+    pub fn resource_mut<T: 'static>(&mut self) -> Option<Mut<'_, T>>
+    where
+        S: ComponentLookup<T>,
+    {
+        self.get_mut(self.resources?)
+    }
+    /// Resource `T`'s column and row, for system parameters.
+    /// # Safety
+    /// `world` is live; no structural change runs.
+    #[inline]
+    pub(crate) unsafe fn resource_cell<T: 'static>(
+        world: *const Self,
+    ) -> Option<(ColumnPtr, usize)>
+    where
+        S: ComponentLookup<T>,
+    {
+        let world = unsafe { &*world };
+        let location = world.location(world.resources?)?;
+        let table = &world.tables[location.table];
+        table.present[S::INDEX].then(|| (table.columns[S::INDEX], location.row))
     }
     pub fn get<T: 'static>(&self, entity: Entity) -> Option<&T>
     where

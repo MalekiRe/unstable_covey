@@ -4,6 +4,7 @@
 use std::marker::PhantomData;
 use std::mem::{MaybeUninit, size_of};
 
+use crate::lookup::ComponentLookup;
 use crate::storage::Reserve;
 use crate::{Bundle, Entity, Storage, World};
 
@@ -150,6 +151,22 @@ impl<S: Storage> Commands<'_, S> {
     pub fn despawn(&mut self, entity: Entity) {
         self.queue.push(move |world: &mut World<S>| {
             world.despawn(entity);
+        });
+    }
+    pub fn insert_resource<T: Send + 'static>(&mut self, value: T)
+    where
+        S: ComponentLookup<T>,
+    {
+        self.queue.push(move |world: &mut World<S>| {
+            world.insert_resource(value);
+        });
+    }
+    pub fn remove_resource<T: 'static>(&mut self)
+    where
+        S: ComponentLookup<T>,
+    {
+        self.queue.push(move |world: &mut World<S>| {
+            world.remove_resource::<T>();
         });
     }
     /// Any deferred change with exclusive world access.

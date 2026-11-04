@@ -585,14 +585,16 @@ impl<W, E: 'static, H: Handle<E, W>> Fits<W> for On<E, H> {
 
 /// Composes plugins, systems, and hooks; `build` creates a world storing
 /// exactly the components they use. `C` is that inferred component set.
-pub struct AppBuilder<C = (), L = Nil, K = Nil> {
+pub struct AppBuilder<C = (), L = Nil, K = Nil, R = Nil> {
     listeners: L,
     hooks: K,
+    /// Resources to insert at `build`, newest first.
+    resources: R,
     execution_mode: ExecutionMode,
     components: PhantomData<fn() -> C>,
 }
 
-impl<C: Storage, L, K> AppBuilder<C, L, K> {
+impl<C: Storage, L, K, R: Resources<C>> AppBuilder<C, L, K, R> {
     pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
         self.execution_mode = mode;
         self
@@ -602,11 +604,12 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
     pub fn add_plugins<P: Plugins<C, L, K>>(
         self,
         plugins: P,
-    ) -> AppBuilder<P::Components, P::Listeners, P::Hooks> {
+    ) -> AppBuilder<P::Components, P::Listeners, P::Hooks, R> {
         let (listeners, hooks) = plugins.add_to(self.listeners, self.hooks);
         AppBuilder {
             listeners,
             hooks,
+            resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
@@ -640,6 +643,7 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         <Placed<E, P::Systems> as Register<C, L, K>>::Components,
         <Placed<E, P::Systems> as Register<C, L, K>>::Listeners,
         <Placed<E, P::Systems> as Register<C, L, K>>::Hooks,
+        R,
     >
     where
         Placed<E, P::Systems>: Register<C, L, K>,
@@ -648,6 +652,7 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         AppBuilder {
             listeners,
             hooks,
+            resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
@@ -656,13 +661,18 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
     /// hooks keeping them consistent. Installing it again, here or from a
     /// plugin's `Relations`, changes nothing.
     #[allow(clippy::type_complexity)]
-    pub fn relation<R: InstallRelation<C, K>>(
+    pub fn relation<Rel: InstallRelation<C, K>>(
         self,
-    ) -> AppBuilder<<R as InstallRelation<C, K>>::Components, L, <R as InstallRelation<C, K>>::Hooks>
-    {
+    ) -> AppBuilder<
+        <Rel as InstallRelation<C, K>>::Components,
+        L,
+        <Rel as InstallRelation<C, K>>::Hooks,
+        R,
+    > {
         AppBuilder {
             listeners: self.listeners,
-            hooks: R::install(self.hooks),
+            hooks: Rel::install(self.hooks),
+            resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
@@ -677,13 +687,14 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
     /// let entity = app.world.spawn();
     /// app.world.insert(entity, Tag); // never used or registered
     /// ```
-    pub fn register<T: 'static>(self) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K>
+    pub fn register<T: 'static>(self) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K, R>
     where
         C: Insert<Components<T>>,
     {
         AppBuilder {
             listeners: self.listeners,
             hooks: self.hooks,
+            resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
@@ -699,7 +710,7 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
     ///     .storage::<Sparse<Tag>>() // too late: Tag is already dense
     ///     .build();
     /// ```
-    pub fn storage<D: Declaration>(self) -> AppBuilder<<C as Insert<D>>::Out, L, K>
+    pub fn storage<D: Declaration>(self) -> AppBuilder<<C as Insert<D>>::Out, L, K, R>
     where
         C: Insert<D>,
     {
@@ -714,6 +725,41 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         AppBuilder {
             listeners: self.listeners,
             hooks: self.hooks,
+            resources: self.resources,
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
+    /// Insert resource `T` at `build`, after hooks are installed, so its
+    /// `OnAdd`/`OnInsert` hooks run; resources apply in the order given.
+    #[allow(clippy::type_complexity)]
+    pub fn insert_resource<T: Send + 'static>(
+        self,
+        value: T,
+    ) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K, Cons<InsertResource<T>, R>>
+    where
+        C: Insert<Components<T>>,
+    {
+        AppBuilder {
+            listeners: self.listeners,
+            hooks: self.hooks,
+            resources: Cons(InsertResource(value), self.resources),
+            execution_mode: self.execution_mode,
+            components: PhantomData,
+        }
+    }
+    /// Insert `T::default()` at `build` unless an earlier insert provided `T`.
+    #[allow(clippy::type_complexity)]
+    pub fn init_resource<T: Default + Send + 'static>(
+        self,
+    ) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K, Cons<InitResource<T>, R>>
+    where
+        C: Insert<Components<T>>,
+    {
+        AppBuilder {
+            listeners: self.listeners,
+            hooks: self.hooks,
+            resources: Cons(InitResource(PhantomData), self.resources),
             execution_mode: self.execution_mode,
             components: PhantomData,
         }
@@ -741,11 +787,40 @@ impl<C: Storage, L, K> AppBuilder<C, L, K> {
         if !is_empty::<C, _>(&hooks) {
             world.set_hooks(hooks);
         }
+        self.resources.apply(&mut world);
         App {
             world,
             listeners,
             execution_mode: self.execution_mode,
         }
+    }
+}
+/// A builder's resources, inserted into the built world oldest first.
+#[doc(hidden)]
+pub trait Resources<S: Storage> {
+    fn apply(self, world: &mut World<S>);
+}
+impl<S: Storage> Resources<S> for Nil {
+    fn apply(self, _: &mut World<S>) {}
+}
+impl<S: Storage, H: Resources<S>, T: Resources<S>> Resources<S> for Cons<H, T> {
+    fn apply(self, world: &mut World<S>) {
+        self.1.apply(world);
+        self.0.apply(world);
+    }
+}
+#[doc(hidden)]
+pub struct InsertResource<T>(T);
+impl<S: Storage, T: 'static> Resources<S> for InsertResource<T> {
+    fn apply(self, world: &mut World<S>) {
+        world.insert_resource(self.0);
+    }
+}
+#[doc(hidden)]
+pub struct InitResource<T>(PhantomData<fn() -> T>);
+impl<S: Storage, T: Default + 'static> Resources<S> for InitResource<T> {
+    fn apply(self, world: &mut World<S>) {
+        world.init_resource::<T>();
     }
 }
 /// Whether a hook list holds no hooks at all.
@@ -767,6 +842,7 @@ impl App<()> {
         AppBuilder {
             listeners: Nil,
             hooks: Nil,
+            resources: Nil,
             execution_mode: ExecutionMode::Parallel,
             components: PhantomData,
         }
