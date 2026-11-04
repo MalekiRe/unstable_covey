@@ -1238,6 +1238,19 @@ impl<S: Storage> World<S> {
     {
         const {
             assert!(
+                !<T as crate::relation::LinkComponent>::IS,
+                "relation links are read-only: relate, unrelate, or insert `R.to(target)`"
+            );
+        }
+        self.links_mut(entity)
+    }
+    /// `get_mut` past the link gate, for relating.
+    pub(crate) fn links_mut<T: 'static>(&mut self, entity: Entity) -> Option<Mut<'_, T>>
+    where
+        S: ComponentLookup<T>,
+    {
+        const {
+            assert!(
                 S::COUNT == 1,
                 "component must exist exactly once in the vocabulary"
             );

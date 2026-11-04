@@ -4,6 +4,7 @@ use crate::{
     change::{ChangeWindow, Mut, MutSlice, SystemWorld},
     filter::{FilterFor, QueryFilter, TableMatch},
     lookup::ComponentLookup,
+    relation::LinkComponent,
     storage::{ColumnPtr, Locator, PairIndex, Reach, Table},
 };
 use std::{
@@ -19,6 +20,7 @@ mod sealed {
     impl<A: Sealed, B: Sealed> Sealed for (A, B) {}
     impl<A: Sealed, B: Sealed, C: Sealed> Sealed for (A, B, C) {}
     impl<R, Q> Sealed for crate::join::To<R, Q> {}
+    impl<L> Sealed for crate::relation::LinksMut<L> {}
     impl<R, Q> Sealed for crate::join::From<R, Q> {}
 }
 /// Sealed component, entity, or nested tuple query data.
@@ -40,6 +42,9 @@ pub trait QueryData: sealed::Sealed {
     /// Every join inside is sound on its own (see `JoinCheck::ROW_VALID`).
     #[doc(hidden)]
     const JOINS_VALID: bool = true;
+    /// Writes a relation link component (`LinkComponent`).
+    #[doc(hidden)]
+    const WRITES_LINKS: bool = false;
     type Indices: Copy;
     type Fetch: Copy + Default;
     type Item<'w>;
@@ -172,6 +177,10 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
             assert!(
                 D::VALID && F::VALID && D::Access::VALID,
                 "invalid query: missing/ambiguous component or conflicting access"
+            );
+            assert!(
+                !D::WRITES_LINKS,
+                "relation links are read-only: relate, unrelate, or insert `R.to(target)`"
             );
             assert!(
                 D::ROW_VALID,
@@ -646,6 +655,7 @@ impl<T: 'static> QueryData for &mut T {
     type Access = Write<T>;
     type Direct = ();
     type Far = ();
+    const WRITES_LINKS: bool = <T as LinkComponent>::IS;
     type Indices = usize;
     type Fetch = ColumnPtr;
     type Item<'w> = Mut<'w, T>;
@@ -725,6 +735,7 @@ macro_rules! tuple_query {
             const SHARED_WRITE: bool = false $(|| $data::SHARED_WRITE)+;
             const JOINS: bool = false $(|| $data::JOINS)+;
             const JOINS_VALID: bool = true $(&& $data::JOINS_VALID)+;
+            const WRITES_LINKS: bool = false $(|| $data::WRITES_LINKS)+;
             type Indices = ($($data::Indices,)+); type Fetch = ($($data::Fetch,)+);
             type Item<'w> = ($($data::Item<'w>,)+); type Slice<'w> = ($($data::Slice<'w>,)+);
             fn matches(indices: &Self::Indices, present: &[bool]) -> bool { true $(&& $data::matches(&indices.$index, present))+ }

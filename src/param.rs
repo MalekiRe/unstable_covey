@@ -92,7 +92,8 @@ where
     D::Access: ValidAccess,
     D: JoinCheck,
 {
-    const VALID: bool = D::VALID && F::VALID && D::Access::VALID && D::ROW_VALID;
+    const VALID: bool =
+        D::VALID && F::VALID && D::Access::VALID && D::ROW_VALID && !D::WRITES_LINKS;
     unsafe fn fetch<'a>(
         world: *mut World<S>,
         state: &'a mut QueryState,
@@ -112,7 +113,8 @@ where
     D::Access: ValidAccess,
     D: JoinCheck,
 {
-    const VALID: bool = D::VALID && F::VALID && D::Access::VALID && D::ROW_VALID;
+    const VALID: bool =
+        D::VALID && F::VALID && D::Access::VALID && D::ROW_VALID && !D::WRITES_LINKS;
     unsafe fn fetch<'a>(
         world: *mut World<S>,
         state: &'a mut QueryState,

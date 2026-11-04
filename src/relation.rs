@@ -7,13 +7,16 @@
 //! cascades through that index.
 use std::marker::PhantomData;
 
+use crate::access::Write;
+use crate::change::{Mut, MutSlice};
 use crate::command::CommandQueue;
 use crate::dispatch::schedule;
 use crate::hook::{Batch, Hook, HookList, OnInsert, OnReplace};
 use crate::join::JoinKind;
 use crate::lookup::ComponentLookup;
 use crate::plan::FunctionSystem;
-use crate::query::QueryState;
+use crate::query::{FetchQuery, QueryData, QueryState};
+use crate::storage::{ColumnPtr, Reach, Table};
 use crate::{Commands, Entity, Query, Storage, Trigger, World};
 
 /// A relation kind. Declare one per relation; its constants pick the
@@ -214,11 +217,6 @@ impl<R: Relation> std::ops::Deref for Relates<R> {
         &self.value
     }
 }
-impl<R: Relation> std::ops::DerefMut for Relates<R> {
-    fn deref_mut(&mut self) -> &mut R {
-        &mut self.value
-    }
-}
 impl<R: Relation> Sources<R> {
     fn new() -> Self {
         Self {
@@ -247,6 +245,61 @@ where
     pub fn source(&self) -> Entity {
         self.side.entries()[0].0
     }
+}
+
+/// Link components: their lists index each other across entities, so only
+/// relating writes them; `&mut` access to one does not compile.
+#[doc(hidden)]
+pub trait LinkComponent {
+    const IS: bool;
+}
+impl<T: ?Sized> LinkComponent for T {
+    default const IS: bool = false;
+}
+impl<R: Relation> LinkComponent for Relates<R> {
+    const IS: bool = true;
+}
+impl<R: Relation> LinkComponent for Sources<R> {
+    const IS: bool = true;
+}
+
+/// `&mut L` for the relation's own hooks, past the `LinkComponent` gate.
+#[doc(hidden)]
+pub struct LinksMut<L>(PhantomData<fn() -> L>);
+impl<L: 'static> QueryData for LinksMut<L> {
+    type Access = Write<L>;
+    type Direct = ();
+    type Far = ();
+    type Indices = usize;
+    type Fetch = ColumnPtr;
+    type Item<'w> = Mut<'w, L>;
+    type Slice<'w> = MutSlice<'w, L>;
+    fn matches(index: &usize, present: &[bool]) -> bool {
+        <&mut L as QueryData>::matches(index, present)
+    }
+    fn requires(index: &usize, component: usize) -> bool {
+        <&mut L as QueryData>::requires(index, component)
+    }
+    unsafe fn fetch(reach: Reach, table: &Table, index: &usize, tick: u64) -> ColumnPtr {
+        unsafe { <&mut L as QueryData>::fetch(reach, table, index, tick) }
+    }
+    fn direct(fetch: &ColumnPtr) -> bool {
+        <&mut L as QueryData>::direct(fetch)
+    }
+    unsafe fn get<'a>(fetch: &ColumnPtr, row: usize, tick: u64) -> Mut<'a, L> {
+        unsafe { <&mut L as QueryData>::get(fetch, row, tick) }
+    }
+    unsafe fn contiguous(fetch: &ColumnPtr, len: usize) -> bool {
+        unsafe { <&mut L as QueryData>::contiguous(fetch, len) }
+    }
+    unsafe fn slice<'a>(fetch: &ColumnPtr, len: usize, tick: u64) -> MutSlice<'a, L> {
+        unsafe { <&mut L as QueryData>::slice(fetch, len, tick) }
+    }
+}
+// SAFETY: exactly `&mut L`'s access and indices.
+unsafe impl<L: 'static, S: ComponentLookup<L>> FetchQuery<S> for LinksMut<L> {
+    const VALID: bool = S::COUNT == 1;
+    const INDICES: usize = S::INDEX;
 }
 
 /// Both sides of relation `R`, by entity: the world, or a hook's queries.
@@ -282,22 +335,22 @@ impl<S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>, R: 
 {
     fn source(&mut self, entity: Entity) -> &mut SourceSide<R> {
         &mut self
-            .get_mut::<Relates<R>>(entity)
+            .links_mut::<Relates<R>>(entity)
             .unwrap()
             .into_inner()
             .side
     }
     fn target(&mut self, entity: Entity) -> &mut TargetSide<R> {
         &mut self
-            .get_mut::<Sources<R>>(entity)
+            .links_mut::<Sources<R>>(entity)
             .unwrap()
             .into_inner()
             .side
     }
 }
 struct HookLists<'q, 'a, 'b, R: Relation> {
-    sources: &'q mut Query<'a, &'static mut Relates<R>>,
-    targets: &'q mut Query<'b, &'static mut Sources<R>>,
+    sources: &'q mut Query<'a, LinksMut<Relates<R>>>,
+    targets: &'q mut Query<'b, LinksMut<Sources<R>>>,
 }
 impl<R: Relation> Lists<R> for HookLists<'_, '_, '_, R> {
     fn source(&mut self, entity: Entity) -> &mut SourceSide<R> {
@@ -343,7 +396,7 @@ impl<S: Storage> World<S> {
             self.has_hook::<OnReplace<Relates<R>>>() && self.has_hook::<OnReplace<Sources<R>>>(),
             "relate: install the relation with `.relation::<R, _>()`"
         );
-        if let Some(mut current) = self.get_mut::<Relates<R>>(source) {
+        if let Some(mut current) = self.links_mut::<Relates<R>>(source) {
             current.value = value;
             let current = self.get::<Relates<R>>(source).unwrap();
             if current.targets().any(|t| t == target) {
@@ -402,7 +455,7 @@ impl<S: Storage> World<S> {
         S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
     {
         if const { R::FRAGMENTING } {
-            let Some(mut relates) = self.get_mut::<Relates<R>>(source) else {
+            let Some(mut relates) = self.links_mut::<Relates<R>>(source) else {
                 return;
             };
             // Taken out first, so removing `Relates<R>` unlinks nothing.
@@ -427,7 +480,7 @@ impl<S: Storage> World<S> {
             }
             if !self.contains(target) {
                 // Never linked: only this side moves an entry into `index`.
-                let mut relates = self.get_mut::<Relates<R>>(source).unwrap();
+                let mut relates = self.links_mut::<Relates<R>>(source).unwrap();
                 if let Some((moved, back)) = relates.side.swap_remove(index as u32)
                     && back != PENDING
                 {
@@ -570,8 +623,8 @@ fn source_gone<
     S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
 >(
     trigger: Trigger,
-    mut sources: Query<&'static mut Relates<R>>,
-    mut targets: Query<&'static mut Sources<R>>,
+    mut sources: Query<LinksMut<Relates<R>>>,
+    mut targets: Query<LinksMut<Sources<R>>>,
     mut commands: Commands<S>,
 ) {
     let mut lists = HookLists {
@@ -599,8 +652,8 @@ fn target_gone<
     S: Storage + ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
 >(
     trigger: Trigger,
-    mut sources: Query<&'static mut Relates<R>>,
-    mut targets: Query<&'static mut Sources<R>>,
+    mut sources: Query<LinksMut<Relates<R>>>,
+    mut targets: Query<LinksMut<Sources<R>>>,
     mut commands: Commands<S>,
 ) {
     let mut lists = HookLists {
@@ -647,15 +700,15 @@ fn pending_inserted<
 /// Both cleanup hooks share this signature.
 type Cleanup<R, S> = for<'a, 'b, 'c, 'd> fn(
     Trigger<'a>,
-    Query<'b, &'static mut Relates<R>>,
-    Query<'c, &'static mut Sources<R>>,
+    Query<'b, LinksMut<Relates<R>>>,
+    Query<'c, LinksMut<Sources<R>>>,
     Commands<'d, S>,
 );
 type CleanupSystem<R, S> = FunctionSystem<
     Cleanup<R, S>,
     (
-        Query<'static, &'static mut Relates<R>>,
-        Query<'static, &'static mut Sources<R>>,
+        Query<'static, LinksMut<Relates<R>>>,
+        Query<'static, LinksMut<Sources<R>>>,
         Commands<'static, S>,
     ),
     (QueryState, QueryState, CommandQueue<S>),
