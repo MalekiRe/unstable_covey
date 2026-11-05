@@ -567,6 +567,40 @@ non-conflicting access; warm bridges allocate nothing, and an idle sync point
 costs one load. [`examples/tokio_web.rs`](examples/tokio_web.rs) fetches pages
 on tokio and inserts the responses while frames keep running.
 
+### Behaviors
+
+A behavior is async logic per entity: `impl Behavior for Slider` gives the
+future each entity holding the `Slider` marker runs, and
+`.add_plugins(behavior::<Slider, _>(Frame))` polls them at that place under
+`Frame`. Adding the marker starts the future; removing it or despawning the
+entity drops it.
+
+```rust,ignore
+impl Behavior for Slider {
+    async fn start<S: Storage>(me: Entity, cx: Cx<S>) {
+        loop {
+            let Drag(dx) = cx.on::<Drag>(me).await; // delivered to `me` only
+            cx.with(|mut q: Query<&mut Value>| q.get_mut(me).unwrap().0 += dx).unwrap();
+        }
+    }
+}
+world.deliver(slider, Drag(4.0)); // wakes exactly the futures awaiting it
+```
+
+- **Only woken futures run.** `world.deliver(entity, event)` (or `Commands`)
+  wakes what awaits `E` on that entity through `Inbox<E>`, a resource the
+  world must store; any waker a future hands out (timers, tokio) queues it
+  too and calls the app's `Wakeup` resource, so an event loop can sleep.
+  Ten thousand idle behaviors cost nothing per frame.
+- **`cx.with(|params...| ...)`** runs a closure with system parameters
+  immediately, validated at compile time like a system; its parameter state
+  persists per call site.
+- **Futures stay put**: they live in chunks with stable addresses, one
+  reusable waker each; warm deliveries and polls allocate nothing.
+- **Hidden entities freeze**: a behavior woken while its entity holds a
+  `Disabling` component waits until it is shown again.
+- Futures are owned by the app, not the world, and must be `Send`.
+
 ### Execution model
 
 - **One invocation per emit**: every system under the label runs as one chain

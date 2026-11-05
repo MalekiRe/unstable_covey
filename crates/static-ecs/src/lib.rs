@@ -9,6 +9,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod access;
+mod behavior;
 mod bridge;
 mod change;
 mod column;
@@ -38,6 +39,7 @@ mod storage;
 mod task;
 mod vocab;
 
+pub use behavior::{Behavior, BehaviorPlugin, Cx, Delivery, Inbox, Wakeup, behavior};
 pub use bridge::{AsyncWorld, Bridge, BridgeError, BridgeFn, BridgeState};
 pub use change::{Mut, MutSlice};
 pub use command::Commands;

@@ -26,7 +26,6 @@ pub struct Entity {
     slot: u32,
     generation: u32,
 }
-#[cfg(feature = "devtools")]
 impl Entity {
     /// Its slot in the world's entity index.
     pub fn index(self) -> u32 {
@@ -861,6 +860,12 @@ impl<S: Storage> World<S> {
     }
     pub fn contains(&self, entity: Entity) -> bool {
         self.location(entity).is_some()
+    }
+    /// Whether `entity` is alive but held by a `Disabling` component, so
+    /// queries that do not mention it skip the entity.
+    pub(crate) fn hidden(&self, entity: Entity) -> bool {
+        self.location(entity)
+            .is_some_and(|location| !self.tables[location.table].disabling.is_empty())
     }
     fn check_bundle<B: Bundle<S>>() {
         const {
