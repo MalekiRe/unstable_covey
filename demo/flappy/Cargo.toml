@@ -8,7 +8,7 @@ publish = false
 #   RUSTFLAGS="-C target-feature=+crt-static" cargo build --release -p flappy
 # Launch latency: cargo run --release -p flappy --bin flappy-launch
 [dependencies]
-static-ecs = { path = "../.." }
+static-ecs = { path = "../../crates/static-ecs" }
 # Pure-Rust protocol backend: no libwayland.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }

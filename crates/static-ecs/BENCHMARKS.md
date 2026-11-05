@@ -422,7 +422,7 @@ other directly, so stack depth does not grow with the number of joins.
 ## Reproduce
 
 ```sh
-cd ../ecs-asm-comparison
+cd ../ecs-asm-comparison   # next to the workspace root
 cargo build --release --bins
 python3 run_complex.py --cpus 0,1,2,3 --output results.json
 python3 run_complex.py --actors 4096 --frames 126 --warmup 0 --repeat 1 \

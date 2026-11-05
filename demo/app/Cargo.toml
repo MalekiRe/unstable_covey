@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
-static-ecs = { path = "../.." }
+static-ecs = { path = "../../crates/static-ecs" }
 demo-input = { path = "../input" }
 demo-analytics = { path = "../analytics" }
 demo-networking = { path = "../networking" }

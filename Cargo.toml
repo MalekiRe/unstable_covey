@@ -1,24 +1,6 @@
-[package]
-name = "static-ecs"
-version = "0.1.0"
-edition = "2024"
-
-[features]
-# Development tools: change reporting, provenance, history, stepping, time
-# travel, a task console, and an MCP server. Compiled out entirely when off.
-devtools = []
-
-# Only the `tokio_web` example uses it; the library has no dependencies.
-[dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time"] }
-
 [workspace]
-members = ["demo/*", "tools/*"]
+members = ["crates/*", "demo/*", "tools/*"]
 resolver = "3"
-
-[[example]]
-name = "devtools"
-required-features = ["devtools"]
 
 [profile.release]
 lto = "thin"

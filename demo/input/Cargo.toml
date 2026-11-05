@@ -5,4 +5,4 @@ edition = "2024"
 publish = false
 
 [dependencies]
-static-ecs = { path = "../.." }
+static-ecs = { path = "../../crates/static-ecs" }
