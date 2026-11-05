@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::access::{Access, Read};
+use crate::access::{Access, Read, Write};
 use crate::change::ChangeWindow;
 use crate::one_of::Shares;
 use crate::relation::{PairOf, Relates, Relation};
@@ -479,3 +479,119 @@ macro_rules! change_filter {
 }
 change_filter!(Added, added, added_summary);
 change_filter!(Changed, changed, changed_summary);
+
+/// Whether access or filter type `Self` names component `T`. Unknown types
+/// conservatively name everything.
+#[doc(hidden)]
+pub trait Names<T: 'static> {
+    const VALUE: bool;
+}
+impl<T: 'static, X> Names<T> for X {
+    default const VALUE: bool = true;
+}
+impl<T: 'static> Names<T> for () {
+    const VALUE: bool = false;
+}
+impl<T: 'static, A: Names<T>, B: Names<T>> Names<T> for (A, B) {
+    const VALUE: bool = A::VALUE || B::VALUE;
+}
+macro_rules! names_one {
+    ($($ty:ident),+) => {$(
+        impl<T: 'static, U: 'static> Names<T> for $ty<U> {
+            const VALUE: bool = <T as Same<U>>::VALUE;
+        }
+    )+};
+}
+names_one!(Read, Write, With, Without, MayHave, Added, Changed);
+impl<T: 'static, U: 'static> Names<T> for crate::access::Mentions<U> {
+    const VALUE: bool = <T as Same<U>>::VALUE;
+}
+impl<T: 'static, P> Names<T> for crate::access::Drives<P> {
+    const VALUE: bool = false;
+}
+impl<T: 'static, A: Names<T>, F: Names<T>> Names<T> for crate::access::Filtered<A, F> {
+    const VALUE: bool = A::VALUE || F::VALUE;
+}
+impl<T: 'static, A: Names<T>, B: Names<T>> Names<T> for crate::access::QueryAccess<A, B> {
+    const VALUE: bool = A::VALUE || B::VALUE;
+}
+impl<T: 'static, A: Names<T>, B: Names<T>> Names<T> for crate::access::Union<A, B> {
+    const VALUE: bool = A::VALUE || B::VALUE;
+}
+impl<T: 'static, F: Names<T>> Names<T> for Or<F> {
+    const VALUE: bool = F::VALUE;
+}
+impl<T: 'static, R: Relation> Names<T> for Related<R> {
+    const VALUE: bool = <T as Same<Relates<R>>>::VALUE || <T as Same<PairOf<R>>>::VALUE;
+}
+impl<T: 'static, R: Relation> Names<T> for Relinked<R> {
+    const VALUE: bool = <Related<R> as Names<T>>::VALUE;
+}
+
+/// Whether filter `Self` requires a `Disabling` component that query `O`
+/// (its access and filter, as a pair) never names: `O` skips every row
+/// `Self` matches, so the two never touch the same entity.
+#[doc(hidden)]
+pub trait Hides<O> {
+    const VALUE: bool;
+}
+impl<O, X> Hides<O> for X {
+    default const VALUE: bool = false;
+}
+macro_rules! hides_required {
+    ($($ty:ident),+) => {$(
+        impl<O: Names<T>, T: 'static> Hides<O> for $ty<T> {
+            const VALUE: bool = <T as crate::disabled::IsDisabling>::IS && !<O as Names<T>>::VALUE;
+        }
+    )+};
+}
+hides_required!(With, Added, Changed);
+macro_rules! hides_tuple {
+    ($($filter:ident),+) => {
+        impl<O, $($filter: Hides<O>),+> Hides<O> for ($($filter,)+) {
+            const VALUE: bool = false $(|| $filter::VALUE)+;
+        }
+        impl<O, $($filter: Hides<O>),+> Hides<O> for Or<($($filter,)+)> {
+            const VALUE: bool = true $(&& $filter::VALUE)+;
+        }
+    };
+}
+/// Filter tuples other than pairs (pairs are covered above).
+macro_rules! names_tuple {
+    ($($filter:ident),+) => {
+        impl<T: 'static, $($filter: Names<T>),+> Names<T> for ($($filter,)+) {
+            const VALUE: bool = false $(|| $filter::VALUE)+;
+        }
+    };
+}
+hides_tuple!(F0);
+names_tuple!(F0);
+hides_tuple!(F0, F1);
+hides_tuple!(F0, F1, F2);
+names_tuple!(F0, F1, F2);
+hides_tuple!(F0, F1, F2, F3);
+names_tuple!(F0, F1, F2, F3);
+hides_tuple!(F0, F1, F2, F3, F4);
+names_tuple!(F0, F1, F2, F3, F4);
+hides_tuple!(F0, F1, F2, F3, F4, F5);
+names_tuple!(F0, F1, F2, F3, F4, F5);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14);
+hides_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15);
+names_tuple!(F0, F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15);

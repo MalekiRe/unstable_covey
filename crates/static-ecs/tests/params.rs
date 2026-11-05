@@ -688,6 +688,7 @@ fn invalid_parameter_access_is_rejected_at_compile_time() {
         ("one_of_bundle", Some("E0080")),
         ("one_of_unshared_parallel", Some("E0080")),
         ("non_send_component", Some("E0277")),
+        ("default_filter_conflict", Some("E0080")),
     ] {
         std::fs::copy(
             root.join("tests/ui").join(format!("{fixture}.rs")),

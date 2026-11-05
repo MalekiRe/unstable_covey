@@ -400,6 +400,8 @@ commands its hooks queue apply after all of it.
   it, or `MayHave<T>`, which matches every row. Each disabling component needs
   its own mention. Joins skip such targets the same way, unless their inner
   query mentions the component. `World::get` and commands still see them.
+  Scheduling knows it too: `Query<&mut Hp>` and `Query<&mut Hp, With<Prefab>>`
+  never share a row, so they may run in parallel.
   `world.disable_subtree::<D, ChildOf>(root)` inserts `D` down a hierarchy
   without allocating, and `enable_subtree` removes it, leaving subtrees that
   were disabled on their own (their roots carry `DisabledRoot<D>`) disabled.

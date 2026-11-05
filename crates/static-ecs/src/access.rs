@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use crate::filter::Disjoint;
+use crate::filter::{Disjoint, Hides};
 
 pub trait Same<T: 'static>: 'static {
     const VALUE: bool;
@@ -156,13 +156,19 @@ impl<A, B, F, G> Conflict<Filtered<B, G>> for Filtered<A, F>
 where
     A: Access + Conflict<B>,
     B: Access,
-    F: Disjoint<G>,
-    G: Disjoint<F>,
+    F: Disjoint<G> + Hides<(B, G)>,
+    G: Disjoint<F> + Hides<(A, F)>,
 {
-    // Exclusive access borrows the whole world, regardless of filters.
+    // Exclusive access borrows the whole world, regardless of filters. A
+    // query that never names a `Disabling` component the other requires
+    // skips all of the other's rows: an implicit `Without`.
     const VALUE: bool = A::EXCLUSIVE
         || B::EXCLUSIVE
-        || (<A as Conflict<B>>::VALUE && !<F as Disjoint<G>>::VALUE && !<G as Disjoint<F>>::VALUE);
+        || (<A as Conflict<B>>::VALUE
+            && !<F as Disjoint<G>>::VALUE
+            && !<G as Disjoint<F>>::VALUE
+            && !<F as Hides<(B, G)>>::VALUE
+            && !<G as Hides<(A, F)>>::VALUE);
 }
 /// Mentions `T` without accessing its values (table membership only): the
 /// world stores `T`, and only exclusive access conflicts.

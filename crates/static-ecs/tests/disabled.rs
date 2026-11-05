@@ -245,3 +245,23 @@ fn subtree_toggles_through_commands_apply_after_the_frame() {
     app.emit(&Toggle);
     assert_eq!(seen!(app.world, &Hp, (), |h: &Hp| h.0).len(), 101);
 }
+
+#[test]
+fn queries_that_never_see_a_disabling_component_run_beside_ones_requiring_it() {
+    // The first query cannot see `Prefab` rows; the second sees only those.
+    let mut app = App::new()
+        .add_systems(
+            (),
+            (
+                |mut live: Query<&mut Hp>| live.iter_mut().for_each(|mut hp| hp.0 += 1),
+                |mut prefabs: Query<&mut Hp, With<Prefab>>| prefabs.iter_mut().for_each(|mut hp| hp.0 += 100),
+            )
+                .parallel(),
+        )
+        .build();
+    let live = app.world.spawn_bundle((Hp(0),));
+    let prefab = app.world.spawn_bundle((Hp(0), Prefab));
+    app.emit(&());
+    assert_eq!(app.world.get::<Hp>(live), Some(&Hp(1)));
+    assert_eq!(app.world.get::<Hp>(prefab), Some(&Hp(100)));
+}
