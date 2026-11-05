@@ -161,3 +161,87 @@ fn joins_skip_disabled_targets_unless_the_inner_query_mentions_the_component() {
     members.sort_unstable();
     assert_eq!(members, [2, 3]);
 }
+
+struct InPanel;
+impl Relation for InPanel {
+    type Kind = OneToMany;
+    const LINKED: bool = true;
+    const ACYCLIC: bool = true;
+    const ORDERED: bool = true;
+}
+#[derive(Default)]
+struct Closed;
+impl Disabling for Closed {}
+
+#[test]
+fn subtree_toggles_hide_descendants_and_keep_nested_closes() {
+    let mut app = App::new()
+        .relation::<InPanel>()
+        .register::<Hp>()
+        .register::<Closed>()
+        .register::<DisabledRoot<Closed>>()
+        .build();
+    let world = &mut app.world;
+    // panel(1) -> [row(2) -> [menu(3) -> item(4)], row(5)]; other(6)
+    let panel = world.spawn_bundle((Hp(1),));
+    let row = world.spawn_bundle((Hp(2), InPanel.to(panel)));
+    let menu = world.spawn_bundle((Hp(3), InPanel.to(row)));
+    world.spawn_bundle((Hp(4), InPanel.to(menu)));
+    world.spawn_bundle((Hp(5), InPanel.to(panel)));
+    world.spawn_bundle((Hp(6),));
+    let all = |world: &mut World<_>| seen!(world, &Hp, (), |h: &Hp| h.0);
+    let closed = |world: &mut World<_>| seen!(world, &Hp, With<Closed>, |h: &Hp| h.0);
+
+    world.disable_subtree::<Closed, InPanel>(menu);
+    assert_eq!(all(world), [1, 2, 5, 6]);
+    world.disable_subtree::<Closed, InPanel>(panel);
+    assert_eq!(all(world), [6]);
+    // Closing again, or a node inside, changes nothing visible.
+    world.disable_subtree::<Closed, InPanel>(panel);
+    world.disable_subtree::<Closed, InPanel>(row);
+    assert_eq!(closed(world), [1, 2, 3, 4, 5]);
+    // Opening `row` while `panel` is closed only drops its own mark.
+    world.enable_subtree::<Closed, InPanel>(row);
+    assert_eq!(all(world), [6]);
+    // Opening `panel` reopens everything but the menu closed on its own.
+    world.enable_subtree::<Closed, InPanel>(panel);
+    assert_eq!(all(world), [1, 2, 5, 6]);
+    world.enable_subtree::<Closed, InPanel>(menu);
+    assert_eq!(all(world), [1, 2, 3, 4, 5, 6]);
+    // Opening what is open is a no-op.
+    world.enable_subtree::<Closed, InPanel>(panel);
+    assert_eq!(all(world), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(seen!(world, &Hp, With<DisabledRoot<Closed>>, |h: &Hp| h.0), Vec::<u32>::new());
+}
+
+/// Panels: hierarchy roots, open or closed.
+type Roots<'w> = Query<'w, (Entity, Has<Closed>), (Without<Relates<InPanel>>, MayHave<Closed>)>;
+
+#[test]
+fn subtree_toggles_through_commands_apply_after_the_frame() {
+    struct Toggle;
+    impl Schedule for Toggle {}
+    let mut app = App::new()
+        .relation::<InPanel>()
+        .register::<Hp>()
+        .add_systems(Toggle, |mut commands: Commands<_>, mut roots: Roots| {
+            roots.each(|(root, closed)| {
+                if closed {
+                    commands.enable_subtree::<Closed, InPanel>(root);
+                } else {
+                    commands.disable_subtree::<Closed, InPanel>(root);
+                }
+            });
+        })
+        .register::<DisabledRoot<Closed>>()
+        .build();
+    let world = &mut app.world;
+    let root = world.spawn_bundle((Hp(1),));
+    for i in 0..100 {
+        world.spawn_bundle((Hp(10 + i), InPanel.to(root)));
+    }
+    app.emit(&Toggle);
+    assert_eq!(seen!(app.world, &Hp, (), |h: &Hp| h.0).len(), 0);
+    app.emit(&Toggle);
+    assert_eq!(seen!(app.world, &Hp, (), |h: &Hp| h.0).len(), 101);
+}

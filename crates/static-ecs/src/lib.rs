@@ -41,7 +41,7 @@ mod vocab;
 pub use bridge::{AsyncWorld, Bridge, BridgeError, BridgeFn, BridgeState};
 pub use change::{Mut, MutSlice};
 pub use command::Commands;
-pub use disabled::{Disabled, Disabling};
+pub use disabled::{Disabled, DisabledRoot, Disabling};
 pub use dispatch::{
     App, AppBuilder, Cons, Dispatch, Handle, Label, MaybeHandle, Nil, On, Placed, Plugins, Run,
     Schedule, Scheduled, schedule,
@@ -72,7 +72,7 @@ pub use task::{Task, TaskFn, task};
 pub mod prelude {
     pub use crate::{
         Added, App, AsyncWorld, BridgeError, Changed, Commands, Components, ContiguousError,
-        Disabled, Disabling, Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local,
+        Disabled, DisabledRoot, Disabling, Entity, ExecutionMode, Has, Immutable, IntoSystemConfigs, Local,
         ManyToMany, MayHave, Mut, MutSlice, NoInput, OnAdd, OnEnter, OnExit, OnInsert, OnRemove,
         OnReplace, OnTransition, OneOf, OneToMany, OneToOne, Or, Plugin, Query, Ref, Related,
         Relates, Relation, Relinked, Remote, Requires, Res, ResMut, Schedule, Single, Sources,
