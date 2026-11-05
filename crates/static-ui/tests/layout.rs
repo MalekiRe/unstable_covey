@@ -68,9 +68,10 @@ fn changing_a_node_patches_it_and_writes_only_moved_rects() {
     assert!(moved.contains(&panel) && moved.contains(&content));
     assert!(!moved.contains(&screen), "the screen kept its box");
     assert_eq!(rect(&app.world, content), layout::Rect::new(216.0, 0.0, 584.0, 600.0));
-    // Damage covers the panel's old and new boxes.
-    let damage: Vec<_> = app.world.resource_mut::<UiLayout>().unwrap().take_damage().collect();
-    assert!(damage.contains(&layout::Rect::new(0.0, 0.0, 300.0, 600.0)));
+    // Damage covers the panel's old box (and the content's new one).
+    let damage = app.world.resource_mut::<RenderList>().unwrap().take_damage();
+    let old = layout::Rect::new(0.0, 0.0, 300.0, 600.0);
+    assert!(damage.iter().any(|d| d.intersect(old) == old), "{damage:?}");
 }
 
 #[test]

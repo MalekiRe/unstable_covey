@@ -316,8 +316,18 @@ pub(crate) fn systems<S: Storage, M: Measure>() -> impl Systems<S> {
                 if world.resource::<Viewport>().is_none() {
                     world.init_resource::<Viewport>();
                 }
+                if world.resource::<crate::RenderList>().is_none() {
+                    world.init_resource::<crate::RenderList>();
+                }
+                if world.resource::<crate::ClearColor>().is_none() {
+                    world.init_resource::<crate::ClearColor>();
+                }
+                if world.resource::<crate::Redraw>().is_none() {
+                    world.init_resource::<crate::Redraw>();
+                }
             }),
         ),
         schedule(UiFrame, layout_system::<M>),
+        schedule(UiFrame, crate::render_system),
     )
 }

@@ -23,9 +23,13 @@ pub use static_ui_layout::{
 };
 
 mod flatten;
+pub mod input;
+mod render;
 mod spawn;
 
 pub use flatten::{UiLayout, layout_system};
+pub use input::{Input, Key, Modifiers, MouseButton, Redraw};
+pub use render::{ClearColor, Command, Draw, RenderList, render_system};
 pub use spawn::{El, SpawnList, SpawnTree, SpawnUi, el};
 
 /// The UI's frame: input, behaviors, layout and rendering run under it.
@@ -281,6 +285,10 @@ impl<M: Measure> Plugin for UiPlugin<M> {
         Inert,
         Viewport,
         UiLayout,
+        RenderList,
+        ClearColor,
+        Redraw,
+        static_ecs::Wakeup,
         M,
     );
     type Relations = (ChildOf,);
