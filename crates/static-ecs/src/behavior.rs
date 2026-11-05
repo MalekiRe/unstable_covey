@@ -172,7 +172,19 @@ struct Entry<F> {
     /// reused if no clone of it survives.
     waker: Option<Waker>,
     next_free: u32,
+    /// The stamp when it last yielded: events stamped since are new to it.
+    suspended_at: u64,
+    /// Mailboxes it subscribed to, released with it.
+    subscriptions: Vec<Subscription>,
 }
+/// A mailbox an instance listens on: `(Inbox<E>, entity)`, by its remover.
+#[derive(Clone, Copy, PartialEq)]
+struct Subscription {
+    unsubscribe: unsafe fn(*mut (), Entity),
+    entity: Entity,
+}
+/// Orders deliveries against instances' suspensions, process-wide.
+static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 impl<F> Entry<F> {
     fn reusable_waker(&self) -> bool {
         self.waker.as_ref().is_some_and(|waker| {
@@ -230,6 +242,8 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
                     future: None,
                     waker: None,
                     next_free: if i + 1 < CHUNK as u32 { base + i + 1 } else { NONE },
+                    suspended_at: 0,
+                    subscriptions: Vec::new(),
                 })
                 .collect();
             self.chunks.push(chunk);
@@ -239,6 +253,7 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
         let entry = self.entry(slot);
         let free = entry.next_free;
         entry.entity = entity;
+        entry.suspended_at = STAMP.load(Ordering::Relaxed);
         if !entry.reusable_waker() {
             entry.waker = Some(Waker::from(Arc::new(Control {
                 shared: Arc::downgrade(shared),
@@ -255,11 +270,16 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
         self.by_entity[index] = slot;
         slot
     }
-    /// Drop the slot's future in place and free the slot.
-    fn release(&mut self, slot: u32) {
+    /// Drop the slot's future in place, end its subscriptions, and free
+    /// the slot.
+    fn release(&mut self, slot: u32, world: *mut World<S>) {
         let free = self.free;
         let entry = self.entry(slot);
         entry.future = None;
+        for subscription in entry.subscriptions.drain(..) {
+            // SAFETY: the poll step holds the world exclusively.
+            unsafe { (subscription.unsubscribe)(world.cast(), subscription.entity) };
+        }
         entry.next_free = free;
         let index = entry.entity.index() as usize;
         self.by_entity[index] = NONE;
@@ -281,6 +301,8 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
             id: unsafe { World::world_id(world) },
             states: &raw mut self.states,
             running: Cell::new(false),
+            since: Cell::new(0),
+            subscriptions: Cell::new(ptr::null_mut()),
         };
         scope.enter(|| {
             for _ in 0..8 {
@@ -309,11 +331,17 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
                     let entry = self.entry(slot);
                     let Some(future) = entry.future.as_mut() else { continue };
                     let waker = entry.waker.as_ref().expect("a started slot has a waker");
+                    scope.since.set(entry.suspended_at);
+                    scope.subscriptions.set(&raw mut entry.subscriptions);
                     // SAFETY: chunk entries never move, and futures are
                     // dropped in place.
                     let future = unsafe { Pin::new_unchecked(future) };
-                    if future.poll(&mut Context::from_waker(waker)).is_ready() {
-                        self.entry(slot).future = None;
+                    let ready = future.poll(&mut Context::from_waker(waker)).is_ready();
+                    scope.subscriptions.set(ptr::null_mut());
+                    let entry = self.entry(slot);
+                    entry.suspended_at = STAMP.fetch_add(1, Ordering::Relaxed) + 1;
+                    if ready {
+                        entry.future = None;
                     }
                 }
                 self.runnable = runnable;
@@ -336,7 +364,7 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
             } else if let Some(slot) = self.slot_of(entity) {
                 self.frozen.retain(|&s| s != slot);
                 self.runnable.retain(|&s| s != slot);
-                self.release(slot);
+                self.release(slot, world);
             }
         }
         self.events = events;
@@ -374,6 +402,10 @@ struct PollScope {
     id: u64,
     states: *mut HashMap<TypeId, Box<dyn Any + Send>>,
     running: Cell<bool>,
+    /// The polled instance's last suspension stamp.
+    since: Cell<u64>,
+    /// The polled instance's subscriptions; null between polls.
+    subscriptions: Cell<*mut Vec<Subscription>>,
 }
 thread_local! {
     static SCOPE: Cell<*const PollScope> = const { Cell::new(ptr::null()) };
@@ -459,65 +491,112 @@ impl<S: Storage> Cx<S> {
             }
         }
     }
-    /// Resolves with the next `E` delivered to `entity` after this first
-    /// polls (see [`World::deliver`]). Dropping it stops waiting. Waiting on
-    /// an entity that is despawned never resolves. The world must store
-    /// `Inbox<E>` (checked at compile time).
+    /// Resolves with the next `E` delivered to `entity` (see
+    /// [`World::deliver`]) since this behavior last yielded: events that
+    /// arrive while it is suspended wait in `entity`'s mailbox, in order,
+    /// so a burst (say `DragStart` then `Drag` in one input batch) is not
+    /// lost while it handles the first. Awaiting subscribes this behavior
+    /// to the mailbox until it ends. Waiting on an entity that is despawned
+    /// never resolves. The world must store `Inbox<E>` (checked at compile
+    /// time).
     pub fn on<E: Clone + Send + Sync + 'static>(&self, entity: Entity) -> Delivery<S, E> {
         Delivery { id: self.id, entity, ticket: None, schema: PhantomData }
     }
 }
 
-/// Waiters for event `E`, by entity: a resource. Store it in worlds whose
-/// behaviors await `E`.
+/// Mailboxes for event `E`, by entity: a resource. Store it in worlds
+/// whose behaviors await `E`.
 pub struct Inbox<E> {
-    /// Waiters by entity index.
-    waiting: Vec<Vec<Waiting<E>>>,
+    mailboxes: Vec<Mailbox<E>>,
     tickets: u64,
 }
 impl<E> Default for Inbox<E> {
     fn default() -> Self {
-        Self { waiting: Vec::new(), tickets: 0 }
+        Self { mailboxes: Vec::new(), tickets: 0 }
     }
 }
-struct Waiting<E> {
-    entity: Entity,
-    ticket: u64,
-    waker: Waker,
-    value: Option<E>,
+/// One entity's `E`s: queued while someone subscribes, and who waits.
+struct Mailbox<E> {
+    entity: Option<Entity>,
+    /// Live behavior instances listening here.
+    subscribers: u32,
+    /// Delivered events with their stamps, oldest first (at most `QUEUE`).
+    queue: std::collections::VecDeque<(u64, E)>,
+    waiters: Vec<(u64, Waker)>,
+}
+/// Events kept per mailbox; older ones are dropped first.
+const QUEUE: usize = 32;
+impl<E> Default for Mailbox<E> {
+    fn default() -> Self {
+        Self { entity: None, subscribers: 0, queue: std::collections::VecDeque::new(), waiters: Vec::new() }
+    }
+}
+impl<E> Mailbox<E> {
+    /// Accept `entity` here, forgetting a previous entity's state.
+    fn claim(&mut self, entity: Entity) {
+        if self.entity != Some(entity) {
+            self.entity = Some(entity);
+            self.subscribers = 0;
+            self.queue.clear();
+            self.waiters.clear();
+        }
+    }
 }
 impl<E: Clone> Inbox<E> {
-    fn list(&mut self, entity: Entity) -> &mut Vec<Waiting<E>> {
+    fn mailbox(&mut self, entity: Entity) -> &mut Mailbox<E> {
         let index = entity.index() as usize;
-        if self.waiting.len() <= index {
-            self.waiting.resize_with(index + 1, Vec::new);
+        if self.mailboxes.len() <= index {
+            self.mailboxes.resize_with(index + 1, Mailbox::default);
         }
-        &mut self.waiting[index]
+        let mailbox = &mut self.mailboxes[index];
+        mailbox.claim(entity);
+        mailbox
     }
-    /// Hand `event` to everyone waiting on `entity`; returns how many.
-    pub fn deliver(&mut self, entity: Entity, event: E) -> usize {
-        let Some(list) = self.waiting.get_mut(entity.index() as usize) else { return 0 };
-        let mut woken = 0;
-        for waiting in list.iter_mut().filter(|w| w.entity == entity && w.value.is_none()) {
-            waiting.value = Some(event.clone());
-            waiting.waker.wake_by_ref();
-            woken += 1;
+    fn get(&self, entity: Entity) -> Option<&Mailbox<E>> {
+        self.mailboxes.get(entity.index() as usize).filter(|m| m.entity == Some(entity))
+    }
+    /// Queue `event` for `entity` if a behavior listens there, waking its
+    /// waiters; returns whether one did (an event nobody listens for is
+    /// dropped, and bubbling moves on).
+    pub fn deliver(&mut self, entity: Entity, event: E) -> bool {
+        let Some(mailbox) = self.mailboxes.get_mut(entity.index() as usize).filter(|m| m.entity == Some(entity)) else {
+            return false;
+        };
+        if mailbox.subscribers == 0 {
+            return false;
         }
-        woken
+        if mailbox.queue.len() == QUEUE {
+            mailbox.queue.pop_front();
+        }
+        mailbox.queue.push_back((STAMP.load(Ordering::Relaxed), event));
+        for (_, waker) in &mailbox.waiters {
+            waker.wake_by_ref();
+        }
+        true
     }
-    /// Hand `event` to everyone waiting on any entity; returns how many.
+    /// Deliver `event` to every listening entity; returns how many.
     pub fn broadcast(&mut self, event: E) -> usize {
-        let mut woken = 0;
-        for waiting in self.waiting.iter_mut().flatten().filter(|w| w.value.is_none()) {
-            waiting.value = Some(event.clone());
-            waiting.waker.wake_by_ref();
-            woken += 1;
+        let stamp = STAMP.load(Ordering::Relaxed);
+        let mut reached = 0;
+        for mailbox in self.mailboxes.iter_mut().filter(|m| m.subscribers > 0) {
+            if mailbox.queue.len() == QUEUE {
+                mailbox.queue.pop_front();
+            }
+            mailbox.queue.push_back((stamp, event.clone()));
+            for (_, waker) in &mailbox.waiters {
+                waker.wake_by_ref();
+            }
+            reached += 1;
         }
-        woken
+        reached
     }
-    /// How many futures wait on `entity`.
+    /// How many futures wait on `entity` right now.
     pub fn waiters(&self, entity: Entity) -> usize {
-        self.waiting.get(entity.index() as usize).map_or(0, |list| list.iter().filter(|w| w.entity == entity).count())
+        self.get(entity).map_or(0, |m| m.waiters.len())
+    }
+    /// Whether a behavior listens on `entity`.
+    pub fn is_listening(&self, entity: Entity) -> bool {
+        self.get(entity).is_some_and(|m| m.subscribers > 0)
     }
 }
 
@@ -530,7 +609,7 @@ pub struct Delivery<S: Storage, E: Clone + Send + Sync + 'static> {
 }
 impl<S: Storage, E: Clone + Send + Sync + 'static> Unpin for Delivery<S, E> {}
 impl<S: Storage, E: Clone + Send + Sync + 'static> Delivery<S, E> {
-    fn inbox<'a>(scope: &PollScope) -> &'a mut Inbox<E> {
+    fn inbox<'a>(world: *mut ()) -> &'a mut Inbox<E> {
         const {
             assert!(
                 <S as ComponentLookup<Inbox<E>>>::COUNT == 1,
@@ -539,42 +618,65 @@ impl<S: Storage, E: Clone + Send + Sync + 'static> Delivery<S, E> {
         };
         // SAFETY: the poll step holds the world exclusively, and `with` is
         // not running (its closure cannot await).
-        let world = unsafe { &mut *scope.world.cast::<World<S>>() };
+        let world = unsafe { &mut *world.cast::<World<S>>() };
         if world.resource::<Inbox<E>>().is_none() {
             world.init_resource::<Inbox<E>>();
         }
         world.resource_mut::<Inbox<E>>().unwrap().into_unmarked()
+    }
+    /// Drop one subscriber of `entity`'s mailbox: the instance ended.
+    unsafe fn unsubscribe(world: *mut (), entity: Entity) {
+        let inbox = Self::inbox(world);
+        if let Some(mailbox) = inbox.mailboxes.get_mut(entity.index() as usize).filter(|m| m.entity == Some(entity)) {
+            mailbox.subscribers = mailbox.subscribers.saturating_sub(1);
+            if mailbox.subscribers == 0 {
+                mailbox.queue.clear();
+            }
+        }
     }
 }
 impl<S: Storage, E: Clone + Send + Sync + 'static> Future for Delivery<S, E> {
     type Output = E;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<E> {
         let scope = PollScope::current(self.id).expect("`cx.on` was polled outside its poll step");
-        let inbox = Self::inbox(scope);
         let entity = self.entity;
+        let inbox = Self::inbox(scope.world);
+        let mailbox = inbox.mailbox(entity);
+        // Subscribe this instance, once.
+        let subscriptions = scope.subscriptions.get();
+        let subscription = Subscription { unsubscribe: Self::unsubscribe, entity };
+        // SAFETY: set by the poll step for the instance being polled.
+        if let Some(subscriptions) = unsafe { subscriptions.as_mut() }
+            && !subscriptions.contains(&subscription)
+        {
+            subscriptions.push(subscription);
+            mailbox.subscribers += 1;
+        }
+        // The oldest event new to this instance.
+        let since = scope.since.get();
+        if let Some(index) = mailbox.queue.iter().position(|&(stamp, _)| stamp >= since) {
+            let (_, event) = mailbox.queue.remove(index).unwrap();
+            if let Some(ticket) = self.ticket.take() {
+                mailbox.waiters.retain(|&(t, _)| t != ticket);
+            }
+            return Poll::Ready(event);
+        }
         match self.ticket {
             None => {
                 inbox.tickets += 1;
                 let ticket = inbox.tickets;
-                let waker = cx.waker().clone();
-                inbox.list(entity).push(Waiting { entity, ticket, waker, value: None });
+                inbox.mailbox(entity).waiters.push((ticket, cx.waker().clone()));
                 self.ticket = Some(ticket);
-                Poll::Pending
             }
             Some(ticket) => {
-                let list = inbox.list(entity);
-                let index = list.iter().position(|w| w.ticket == ticket).expect("a waiter stays registered");
-                if list[index].value.is_some() {
-                    let waiting = list.swap_remove(index);
-                    self.ticket = None;
-                    return Poll::Ready(waiting.value.unwrap());
+                if let Some((_, waker)) = mailbox.waiters.iter_mut().find(|(t, _)| *t == ticket)
+                    && !waker.will_wake(cx.waker())
+                {
+                    *waker = cx.waker().clone();
                 }
-                if !list[index].waker.will_wake(cx.waker()) {
-                    list[index].waker = cx.waker().clone();
-                }
-                Poll::Pending
             }
         }
+        Poll::Pending
     }
 }
 impl<S: Storage, E: Clone + Send + Sync + 'static> Drop for Delivery<S, E> {
@@ -582,23 +684,23 @@ impl<S: Storage, E: Clone + Send + Sync + 'static> Drop for Delivery<S, E> {
         let Some(ticket) = self.ticket else { return };
         // Outside a poll step (the app is being dropped) nothing delivers.
         let Some(scope) = PollScope::current(self.id) else { return };
-        let list = Self::inbox(scope).list(self.entity);
-        if let Some(index) = list.iter().position(|w| w.ticket == ticket) {
-            list.swap_remove(index);
+        let inbox = Self::inbox(scope.world);
+        if let Some(mailbox) = inbox.mailboxes.get_mut(self.entity.index() as usize).filter(|m| m.entity == Some(self.entity)) {
+            mailbox.waiters.retain(|&(t, _)| t != ticket);
         }
     }
 }
 
 impl<S: Storage> World<S> {
-    /// Deliver `event` to everything awaiting `E` on `entity` (see
-    /// [`Cx::on`]); returns how many waiters it woke. Nothing waiting, no
-    /// effect: events are not queued.
-    pub fn deliver<E: Clone + Send + Sync + 'static>(&mut self, entity: Entity, event: E) -> usize
+    /// Deliver `event` to `entity`'s behaviors listening for `E` (see
+    /// [`Cx::on`]); returns whether any listens. Without a listener the
+    /// event is dropped.
+    pub fn deliver<E: Clone + Send + Sync + 'static>(&mut self, entity: Entity, event: E) -> bool
     where
         S: ComponentLookup<Inbox<E>>,
     {
         self.resource_mut::<Inbox<E>>()
-            .map_or(0, |inbox| inbox.into_unmarked().deliver(entity, event))
+            .is_some_and(|inbox| inbox.into_unmarked().deliver(entity, event))
     }
 }
 impl<S: Storage> Commands<'_, S> {

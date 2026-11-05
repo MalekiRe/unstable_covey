@@ -64,8 +64,8 @@ fn a_delivery_polls_exactly_the_awaiting_behavior() {
         app.emit(&Frame);
     }
     assert_eq!(POLLS.swap(0, Relaxed), 0, "idle behaviors are not polled");
-    assert_eq!(app.world.deliver(buttons[17], Press(3)), 1);
-    assert_eq!(app.world.deliver(buttons[18], Release), 0, "nobody awaits Release");
+    assert!(app.world.deliver(buttons[17], Press(3)));
+    assert!(!app.world.deliver(buttons[18], Release), "nobody awaits Release");
     app.emit(&Frame);
     assert_eq!(POLLS.swap(0, Relaxed), 1);
     assert_eq!(app.world.get::<Count>(buttons[17]).unwrap().0, 3);
@@ -90,7 +90,7 @@ fn removing_the_marker_or_despawning_drops_the_future_and_its_waiters() {
     app.emit(&Frame);
     assert_eq!(DROPS.load(Relaxed), 2);
     assert_eq!((waiters(&app, a), waiters(&app, b)), (0, 0));
-    assert_eq!(app.world.deliver(a, Press(1)), 0);
+    assert!(!app.world.deliver(a, Press(1)));
     // Re-adding starts a fresh future.
     app.world.insert(a, Counter);
     app.emit(&Frame);
@@ -111,7 +111,7 @@ fn hidden_entities_freeze_their_behaviors_until_shown() {
     let button = app.world.spawn_bundle((Counter, Count(0)));
     app.emit(&Frame);
     app.world.insert(button, Disabled);
-    assert_eq!(app.world.deliver(button, Press(2)), 1);
+    assert!(app.world.deliver(button, Press(2)));
     POLLS.store(0, Relaxed);
     app.emit(&Frame);
     app.emit(&Frame);
@@ -252,4 +252,39 @@ fn a_behavior_may_despawn_its_own_entity() {
     app.emit(&Frame);
     assert!(!app.world.contains(entity));
     app.emit(&Frame);
+}
+
+/// Counts a press, then waits for its release.
+struct PressRelease;
+impl Behavior for PressRelease {
+    async fn start<S: Storage>(me: Entity, cx: Cx<S>) {
+        loop {
+            let Press(n) = cx.on::<Press>(me).await;
+            cx.on::<Release>(me).await;
+            cx.with(|mut q: Query<&mut Count>| q.get_mut(me).unwrap().0 += n).unwrap();
+        }
+    }
+}
+
+#[test]
+fn a_burst_delivered_while_suspended_is_handled_in_order() {
+    let mut app = App::new()
+        .add_plugins(behavior::<PressRelease, _>(Frame))
+        .register::<Count>()
+        .register::<Inbox<Press>>()
+        .register::<Inbox<Release>>()
+        .build();
+    let entity = app.world.spawn_bundle((PressRelease, Count(0)));
+    app.emit(&Frame); // waits for a press; listens for releases once it awaits one
+    app.world.deliver(entity, Press(1));
+    app.emit(&Frame);
+    // Release and the next press arrive before it runs again.
+    assert!(app.world.deliver(entity, Release));
+    assert!(app.world.deliver(entity, Press(10)));
+    assert!(app.world.deliver(entity, Release));
+    app.emit(&Frame);
+    assert_eq!(app.world.get::<Count>(entity).unwrap().0, 11);
+    // Events from before it last ran are not replayed.
+    app.emit(&Frame);
+    assert_eq!(app.world.get::<Count>(entity).unwrap().0, 11);
 }

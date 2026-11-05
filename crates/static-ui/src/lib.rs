@@ -24,11 +24,16 @@ pub use static_ui_layout::{
 
 mod flatten;
 pub mod input;
+mod interact;
 mod render;
 mod spawn;
 
 pub use flatten::{UiLayout, layout_system};
 pub use input::{Input, Key, Modifiers, MouseButton, Redraw};
+pub use interact::{
+    Click, Drag, DragEnd, DragStart, Focus, FocusIn, FocusOut, Focusable, InputPlugin, Interaction, KeyPress, Pointer,
+    PointerEnter, PointerLeave, Press, Release, TextInput, Wheel, bubble, hit_test, DRAG_THRESHOLD,
+};
 pub use render::{ClearColor, Command, Draw, RenderList, render_system};
 pub use spawn::{El, SpawnList, SpawnTree, SpawnUi, el};
 

@@ -796,7 +796,7 @@ impl Tree {
     }
     /// Roots in paint order from the last layout: floating elements and
     /// the main tree (element 0, at z 0), stably sorted by `z`.
-    pub fn roots(&self) -> impl Iterator<Item = u32> + '_ {
+    pub fn roots(&self) -> impl DoubleEndedIterator<Item = u32> + '_ {
         self.paint.iter().map(|root| root.element)
     }
     /// How many times a size distribution made no progress and was cut

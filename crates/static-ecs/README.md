@@ -593,10 +593,16 @@ world.deliver(slider, Drag(4.0)); // wakes exactly the futures awaiting it
 ```
 
 - **Only woken futures run.** `world.deliver(entity, event)` (or `Commands`)
-  wakes what awaits `E` on that entity through `Inbox<E>`, a resource the
-  world must store; any waker a future hands out (timers, tokio) queues it
-  too and calls the app's `Wakeup` resource, so an event loop can sleep.
-  Ten thousand idle behaviors cost nothing per frame.
+  puts `event` in `entity`'s mailbox in `Inbox<E>` (a resource the world must
+  store) if a behavior listens there, and wakes it; any waker a future hands
+  out (timers, tokio) queues it too and calls the app's `Wakeup` resource, so
+  an event loop can sleep. Ten thousand idle behaviors cost nothing per
+  frame.
+- **No event is lost to timing.** A behavior listens on a mailbox from its
+  first `cx.on::<E>(entity)` until it ends; events arriving while it is
+  suspended wait there in order, so `on::<DragStart>` followed by
+  `on::<Drag>` still sees a `Drag` delivered in the same batch. Events from
+  before it last ran are not replayed.
 - **`cx.with(|params...| ...)`** runs a closure with system parameters
   immediately, validated at compile time like a system; its parameter state
   persists per call site.
