@@ -22,12 +22,14 @@ pub use static_ui_layout::{
     TextConfig, Vec2, Wrap,
 };
 
+pub mod behave;
 mod flatten;
 pub mod input;
 mod interact;
 mod render;
 mod spawn;
 
+pub use behave::{Either, FrameTick, InScope, Scope, Timers, UiUpdate, animate, scoped, select, select_all, sleep};
 pub use flatten::{UiLayout, layout_system};
 pub use input::{Input, Key, Modifiers, MouseButton, Redraw};
 pub use interact::{
@@ -294,9 +296,12 @@ impl<M: Measure> Plugin for UiPlugin<M> {
         ClearColor,
         Redraw,
         static_ecs::Wakeup,
+        Timers,
+        static_ecs::Inbox<FrameTick>,
+        behave::ScopeRoot,
         M,
     );
-    type Relations = (ChildOf,);
+    type Relations = (ChildOf, InScope);
     fn systems<S: Storage>(self) -> impl Systems<S> {
         flatten::systems::<S, M>()
     }

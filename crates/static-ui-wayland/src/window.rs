@@ -13,7 +13,7 @@ use static_ecs::prelude::*;
 use static_ecs::{Dispatch as Handles, Wakeup};
 use static_ui::input::{key_from_evdev, key_text};
 use static_ui::layout::Rect;
-use static_ui::{ClearColor, Input, Key, Modifiers, MouseButton, Redraw, RenderList, UiFrame, UiLayout, Viewport};
+use static_ui::{ClearColor, Input, Key, Modifiers, MouseButton, Redraw, RenderList, UiFrame, UiLayout, UiUpdate, Viewport};
 use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_buffer::{self, WlBuffer};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
@@ -160,7 +160,7 @@ impl Drop for Buffers {
 /// the run). The app needs `UiPlugin<Fonts>`.
 pub fn run<S: Storage, L>(app: &mut App<S, L>, options: WindowOptions) -> Stats
 where
-    L: Handles<Input, World<S>> + Handles<UiFrame, World<S>>,
+    L: Handles<Input, World<S>> + Handles<UiUpdate, World<S>> + Handles<UiFrame, World<S>>,
 {
     let launched = now_ns();
     let started = Instant::now();
@@ -250,6 +250,7 @@ where
         for event in state.input.drain(..) {
             app.emit(&event);
         }
+        app.emit(&UiUpdate);
         app.emit(&UiFrame);
         stats.frames += 1;
         let damage = app.world.resource_mut::<RenderList>().map(|mut list| list.take_damage()).unwrap_or_default();

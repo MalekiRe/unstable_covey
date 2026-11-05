@@ -598,11 +598,12 @@ world.deliver(slider, Drag(4.0)); // wakes exactly the futures awaiting it
   out (timers, tokio) queues it too and calls the app's `Wakeup` resource, so
   an event loop can sleep. Ten thousand idle behaviors cost nothing per
   frame.
-- **No event is lost to timing.** A behavior listens on a mailbox from its
-  first `cx.on::<E>(entity)` until it ends; events arriving while it is
-  suspended wait there in order, so `on::<DragStart>` followed by
-  `on::<Drag>` still sees a `Drag` delivered in the same batch. Events from
-  before it last ran are not replayed.
+- **No event is lost to timing.** Events for an entity running behaviors
+  wait in its mailboxes while they are suspended, in order, so
+  `on::<DragStart>` followed by `on::<Drag>` still sees a `Drag` delivered in
+  the same batch. `deliver` reports an event taken only if a behavior has
+  awaited its type there (bubbling moves on otherwise). Events from before a
+  behavior last ran are not replayed.
 - **`cx.with(|params...| ...)`** runs a closure with system parameters
   immediately, validated at compile time like a system; its parameter state
   persists per call site.

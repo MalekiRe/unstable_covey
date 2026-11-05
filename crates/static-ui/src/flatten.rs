@@ -284,6 +284,28 @@ fn structure_changed(_: Trigger, ui: Option<ResMut<UiLayout>>) {
 }
 type StructureHook = for<'a, 'b> fn(Trigger<'a>, Option<ResMut<'b, UiLayout>>);
 
+/// Insert the core's resources if missing (they cannot be inserted at
+/// `build` by a plugin).
+fn init<S: Storage, M: Measure>(world: &mut World<S>) {
+    if world.resource::<UiLayout>().is_some() {
+        return;
+    }
+    world.init_resource::<UiLayout>();
+    if world.resource::<M>().is_none() {
+        world.init_resource::<M>();
+    }
+    if world.resource::<Viewport>().is_none() {
+        world.init_resource::<Viewport>();
+    }
+    world.init_resource::<crate::RenderList>();
+    if world.resource::<crate::ClearColor>().is_none() {
+        world.init_resource::<crate::ClearColor>();
+    }
+    world.init_resource::<crate::Redraw>();
+    world.init_resource::<crate::Timers>();
+    world.init_resource::<static_ecs::Inbox<crate::FrameTick>>();
+}
+
 /// The core's systems: structure hooks, resource setup, layout.
 pub(crate) fn systems<S: Storage, M: Measure>() -> impl Systems<S> {
     let hook = structure_changed as StructureHook;
@@ -304,30 +326,11 @@ pub(crate) fn systems<S: Storage, M: Measure>() -> impl Systems<S> {
             schedule(OnInsert::<Clip>::new(), hook),
             schedule(OnRemove::<Clip>::new(), hook),
         ),
-        schedule(
-            UiFrame,
-            exclusive(|world: &mut World<S>| {
-                if world.resource::<UiLayout>().is_none() {
-                    world.init_resource::<UiLayout>();
-                }
-                if world.resource::<M>().is_none() {
-                    world.init_resource::<M>();
-                }
-                if world.resource::<Viewport>().is_none() {
-                    world.init_resource::<Viewport>();
-                }
-                if world.resource::<crate::RenderList>().is_none() {
-                    world.init_resource::<crate::RenderList>();
-                }
-                if world.resource::<crate::ClearColor>().is_none() {
-                    world.init_resource::<crate::ClearColor>();
-                }
-                if world.resource::<crate::Redraw>().is_none() {
-                    world.init_resource::<crate::Redraw>();
-                }
-            }),
-        ),
+        schedule(crate::UiUpdate, exclusive(init::<S, M>)),
+        schedule(UiFrame, exclusive(init::<S, M>)),
+        schedule(crate::UiUpdate, crate::behave::frame_start),
         schedule(UiFrame, layout_system::<M>),
         schedule(UiFrame, crate::render_system),
+        schedule(UiFrame, crate::behave::frame_end),
     )
 }

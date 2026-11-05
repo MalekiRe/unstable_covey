@@ -40,7 +40,7 @@ mod storage;
 mod task;
 mod vocab;
 
-pub use behavior::{Behavior, BehaviorPlugin, Cx, Delivery, Inbox, Wakeup, behavior};
+pub use behavior::{Behavior, BehaviorPlugin, Behaving, Cx, Delivery, Inbox, Wakeup, behavior};
 pub use bridge::{AsyncWorld, Bridge, BridgeError, BridgeFn, BridgeState};
 pub use change::{Mut, MutSlice};
 pub use command::Commands;

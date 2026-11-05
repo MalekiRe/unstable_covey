@@ -74,6 +74,40 @@ pub trait Behavior: Send + Sync + 'static {
     fn start<S: Storage>(me: Entity, cx: Cx<S>) -> impl Future<Output = ()> + Send;
 }
 
+/// Entities with a running behavior instance: a resource the poll steps
+/// keep. Events for such an entity wait in its mailboxes even for types its
+/// behaviors have not awaited yet, so one that awaits `DragStart` and then
+/// `Drag` sees a `Drag` that arrived with the `DragStart`.
+#[derive(Default)]
+pub struct Behaving {
+    /// (entity, instances) by entity index.
+    counts: Vec<(Option<Entity>, u32)>,
+}
+impl Behaving {
+    /// Whether `entity` runs a behavior.
+    pub fn has(&self, entity: Entity) -> bool {
+        self.counts.get(entity.index() as usize).is_some_and(|&(e, n)| e == Some(entity) && n > 0)
+    }
+    fn add(&mut self, entity: Entity) {
+        let index = entity.index() as usize;
+        if self.counts.len() <= index {
+            self.counts.resize(index + 1, (None, 0));
+        }
+        let slot = &mut self.counts[index];
+        if slot.0 != Some(entity) {
+            *slot = (Some(entity), 0);
+        }
+        slot.1 += 1;
+    }
+    fn remove(&mut self, entity: Entity) {
+        if let Some(slot) = self.counts.get_mut(entity.index() as usize)
+            && slot.0 == Some(entity)
+        {
+            slot.1 = slot.1.saturating_sub(1);
+        }
+    }
+}
+
 /// Called whenever a behavior is woken, from any thread: the app's event
 /// loop wakes up (e.g. writes an eventfd) and emits the polling label.
 /// Insert it as a resource; behaviors pick it up when they next run.
@@ -88,7 +122,7 @@ pub fn behavior<B: Behavior, E: Schedule<Route = Emitted, In = NoInput>>(label: 
 pub struct BehaviorPlugin<B, E>(E, PhantomData<fn() -> B>);
 
 impl<B: Behavior, E: Schedule<Route = Emitted, In = NoInput>> Plugin for BehaviorPlugin<B, E> {
-    type Components = (B, Wakeup);
+    type Components = (B, Wakeup, Behaving);
     fn systems<S: Storage>(self) -> impl Systems<S> {
         let shared = Arc::new(Shared::default());
         let (added, removed) = (shared.clone(), shared.clone());
@@ -276,6 +310,10 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
         let free = self.free;
         let entry = self.entry(slot);
         entry.future = None;
+        // SAFETY: the poll step holds the world exclusively.
+        if let Some(behaving) = unsafe { (*world).resource_mut::<Behaving>() } {
+            behaving.into_unmarked().remove(entry.entity);
+        }
         for subscription in entry.subscriptions.drain(..) {
             // SAFETY: the poll step holds the world exclusively.
             unsafe { (subscription.unsubscribe)(world.cast(), subscription.entity) };
@@ -358,6 +396,13 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
                     continue;
                 }
                 let slot = self.allocate(entity, shared);
+                // SAFETY: as above.
+                unsafe {
+                    if (*world).resource::<Behaving>().is_none() {
+                        (*world).init_resource::<Behaving>();
+                    }
+                    (*world).resource_mut::<Behaving>().unwrap().into_unmarked().add(entity);
+                }
                 let future = (self.start)(entity, Cx { id, schema: PhantomData });
                 self.entry(slot).future = Some(future);
                 self.runnable.push(slot);
@@ -444,6 +489,11 @@ impl<S> Copy for Cx<S> {}
 impl<S: Storage> Cx<S> {
     fn scope(&self) -> &PollScope {
         PollScope::current(self.id).expect("a behavior's context was used outside its poll step")
+    }
+    /// Whether this thread is in its app's poll step (so `with` works):
+    /// false while the app itself is being dropped.
+    pub fn is_polling(&self) -> bool {
+        PollScope::current(self.id).is_some()
     }
     /// Run `function` now with system parameters (`Query`, `Single`, `Res`,
     /// `Commands`, `Local`, ...) or `&mut World<S>` alone. Parameter state
@@ -559,12 +609,16 @@ impl<E: Clone> Inbox<E> {
     /// waiters; returns whether one did (an event nobody listens for is
     /// dropped, and bubbling moves on).
     pub fn deliver(&mut self, entity: Entity, event: E) -> bool {
-        let Some(mailbox) = self.mailboxes.get_mut(entity.index() as usize).filter(|m| m.entity == Some(entity)) else {
-            return false;
-        };
-        if mailbox.subscribers == 0 {
+        self.deliver_or_keep(entity, event, false)
+    }
+    /// As `deliver`; with `keep`, an entity running behaviors that do not
+    /// listen for `E` yet still gets it queued (but it is not "taken").
+    fn deliver_or_keep(&mut self, entity: Entity, event: E, keep: bool) -> bool {
+        let subscribed = self.get(entity).is_some_and(|m| m.subscribers > 0);
+        if !subscribed && !keep {
             return false;
         }
+        let mailbox = self.mailbox(entity);
         if mailbox.queue.len() == QUEUE {
             mailbox.queue.pop_front();
         }
@@ -572,7 +626,7 @@ impl<E: Clone> Inbox<E> {
         for (_, waker) in &mailbox.waiters {
             waker.wake_by_ref();
         }
-        true
+        subscribed
     }
     /// Deliver `event` to every listening entity; returns how many.
     pub fn broadcast(&mut self, event: E) -> usize {
@@ -589,6 +643,27 @@ impl<E: Clone> Inbox<E> {
             reached += 1;
         }
         reached
+    }
+    /// Deliver `event` only to entities with a future waiting right now: for
+    /// "it is now" events (frame ticks) that must not queue up.
+    pub fn deliver_to_waiting(&mut self, event: E) -> usize {
+        let stamp = STAMP.load(Ordering::Relaxed);
+        let mut reached = 0;
+        for mailbox in self.mailboxes.iter_mut().filter(|m| m.subscribers > 0 && !m.waiters.is_empty()) {
+            if mailbox.queue.len() == QUEUE {
+                mailbox.queue.pop_front();
+            }
+            mailbox.queue.push_back((stamp, event.clone()));
+            for (_, waker) in &mailbox.waiters {
+                waker.wake_by_ref();
+            }
+            reached += 1;
+        }
+        reached
+    }
+    /// Whether any future waits for `E` anywhere.
+    pub fn any_waiting(&self) -> bool {
+        self.mailboxes.iter().any(|m| m.subscribers > 0 && !m.waiters.is_empty())
     }
     /// How many futures wait on `entity` right now.
     pub fn waiters(&self, entity: Entity) -> usize {
@@ -693,14 +768,19 @@ impl<S: Storage, E: Clone + Send + Sync + 'static> Drop for Delivery<S, E> {
 
 impl<S: Storage> World<S> {
     /// Deliver `event` to `entity`'s behaviors listening for `E` (see
-    /// [`Cx::on`]); returns whether any listens. Without a listener the
-    /// event is dropped.
+    /// [`Cx::on`]); returns whether any listens. If `entity` runs behaviors
+    /// that have not awaited `E` yet, it waits in their mailbox (but counts
+    /// as not taken); otherwise it is dropped.
     pub fn deliver<E: Clone + Send + Sync + 'static>(&mut self, entity: Entity, event: E) -> bool
     where
         S: ComponentLookup<Inbox<E>>,
     {
+        let keep = self.optional_resource::<Behaving>().is_some_and(|b| b.has(entity));
+        if keep && self.resource::<Inbox<E>>().is_none() {
+            self.init_resource::<Inbox<E>>();
+        }
         self.resource_mut::<Inbox<E>>()
-            .is_some_and(|inbox| inbox.into_unmarked().deliver(entity, event))
+            .is_some_and(|inbox| inbox.into_unmarked().deliver_or_keep(entity, event, keep))
     }
 }
 impl<S: Storage> Commands<'_, S> {

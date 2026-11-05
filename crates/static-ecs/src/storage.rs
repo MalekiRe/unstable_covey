@@ -1626,6 +1626,21 @@ impl<S: Storage> World<S> {
     {
         self.get_mut(self.resources?)
     }
+    /// Resource `T` if this world stores the type at all and holds one:
+    /// for code generic over worlds that may lack it.
+    pub(crate) fn optional_resource<T: 'static>(&self) -> Option<&T>
+    where
+        S: ComponentLookup<T>,
+    {
+        if S::COUNT != 1 {
+            return None;
+        }
+        // SAFETY: the world is live and borrowed; the cell holds a `T`.
+        unsafe {
+            let (column, row) = Self::resource_cell::<T>(self)?;
+            Some(&*column.value::<T>(row))
+        }
+    }
     /// Resource `T`'s column and row, for system parameters.
     /// # Safety
     /// `world` is live; no structural change runs.

@@ -288,3 +288,23 @@ fn a_burst_delivered_while_suspended_is_handled_in_order() {
     app.emit(&Frame);
     assert_eq!(app.world.get::<Count>(entity).unwrap().0, 11);
 }
+
+#[test]
+fn events_for_a_running_behavior_wait_even_before_it_first_awaits_their_type() {
+    let mut app = App::new()
+        .add_plugins(behavior::<PressRelease, _>(Frame))
+        .register::<Count>()
+        .register::<Inbox<Press>>()
+        .register::<Inbox<Release>>()
+        .build();
+    let entity = app.world.spawn_bundle((PressRelease, Count(0)));
+    app.emit(&Frame); // awaits a press; has never awaited a release
+    assert!(app.world.deliver(entity, Press(5)), "taken: it awaits presses");
+    assert!(!app.world.deliver(entity, Release), "kept, but not taken: nobody awaits releases yet");
+    app.emit(&Frame);
+    assert_eq!(app.world.get::<Count>(entity).unwrap().0, 5);
+    // An entity without behaviors keeps nothing.
+    let plain = app.world.spawn_bundle((Count(0),));
+    assert!(!app.world.deliver(plain, Release));
+    assert_eq!(app.world.resource::<Inbox<Release>>().unwrap().waiters(plain), 0);
+}
