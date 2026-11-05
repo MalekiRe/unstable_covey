@@ -28,8 +28,9 @@ pub mod input;
 mod interact;
 mod render;
 mod spawn;
+pub mod widgets;
 
-pub use behave::{Either, FrameTick, InScope, Scope, Timers, UiUpdate, animate, scoped, select, select_all, sleep};
+pub use behave::{Either, FrameTick, InScope, Scope, Timers, UiClock, UiUpdate, animate, scoped, select, select_all, sleep};
 pub use flatten::{UiLayout, layout_system};
 pub use input::{Input, Key, Modifiers, MouseButton, Redraw};
 pub use interact::{
@@ -297,6 +298,7 @@ impl<M: Measure> Plugin for UiPlugin<M> {
         Redraw,
         static_ecs::Wakeup,
         Timers,
+        UiClock,
         static_ecs::Inbox<FrameTick>,
         behave::ScopeRoot,
         M,

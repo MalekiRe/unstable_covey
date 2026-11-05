@@ -108,7 +108,7 @@ type NodeData = (
 );
 type Nodes<'w> = Query<'w, NodeData>;
 type Roots<'w> = Query<'w, Entity, (Or<(With<Node>, With<Text>)>, Without<Relates<ChildOf>>)>;
-type ChangedNodes<'w> = Query<'w, Entity, Or<(Changed<Node>, Changed<Scroll>, Changed<AspectRatio>)>>;
+type ChangedNodes<'w> = Query<'w, Entity, Or<(Changed<Node>, Changed<Scroll>, Or<(Changed<AspectRatio>, Changed<Floating>)>)>>;
 
 fn config(
     node: Option<&Node>,
@@ -234,15 +234,22 @@ pub fn layout_system<M: Measure>(
         ui.damage(layout::Rect::new(0.0, 0.0, viewport.width, viewport.height));
         dirty = true;
     }
-    if ui.structure_dirty || relinked.iter_mut().next().is_some() {
-        ui.structure_dirty = false;
-        ui.rebuild(&mut nodes, &mut roots);
-        dirty = true;
-    } else {
+    if !ui.structure_dirty && relinked.iter_mut().next().is_none() {
         changed_nodes.each(|entity| {
             let Some(element) = ui.element(entity) else { return };
             if let Some((node, _, floating, clip, scroll, aspect, _)) = nodes.get_mut(entity) {
-                *ui.tree.config_mut(element) = config(node, floating, clip, scroll, aspect);
+                let config = config(node, floating, clip, scroll, aspect);
+                let before = ui.tree.config(element).floating.attach_to;
+                if std::mem::discriminant(&before) != std::mem::discriminant(&config.floating.attach_to) {
+                    // Attached elsewhere: flatten again.
+                    ui.structure_dirty = true;
+                    return;
+                }
+                *ui.tree.config_mut(element) = config;
+                if let Some(Floating { attach: Attach::To(target), .. }) = floating {
+                    let target = ui.element(*target);
+                    ui.tree.set_attached(element, target);
+                }
                 dirty = true;
             }
         });
@@ -256,6 +263,11 @@ pub fn layout_system<M: Measure>(
                 dirty = true;
             }
         });
+    }
+    if ui.structure_dirty || relinked.iter_mut().next().is_some() {
+        ui.structure_dirty = false;
+        ui.rebuild(&mut nodes, &mut roots);
+        dirty = true;
     }
     if !dirty {
         return;
@@ -321,7 +333,9 @@ pub(crate) fn systems<S: Storage, M: Measure>() -> impl Systems<S> {
             schedule(OnRemove::<Template>::new(), hook),
             schedule(OnAdd::<Disabled>::new(), hook),
             schedule(OnRemove::<Disabled>::new(), hook),
-            schedule(OnInsert::<Floating>::new(), hook),
+            // A floating element is a root: adding or removing it changes the
+            // structure; changing it is patched in place.
+            schedule(OnAdd::<Floating>::new(), hook),
             schedule(OnRemove::<Floating>::new(), hook),
             schedule(OnInsert::<Clip>::new(), hook),
             schedule(OnRemove::<Clip>::new(), hook),

@@ -137,6 +137,28 @@ pub async fn animate<S: Storage>(cx: Cx<S>, me: Entity, duration: Duration, ease
     }
 }
 
+/// The UI's time: the system clock, or a manual one tests advance.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum UiClock {
+    #[default]
+    System,
+    Manual(Instant),
+}
+impl UiClock {
+    pub fn now(self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            Self::Manual(now) => now,
+        }
+    }
+    /// Move a manual clock forward (a system clock moves by itself).
+    pub fn advance(&mut self, by: Duration) {
+        if let Self::Manual(now) = self {
+            *now += by;
+        }
+    }
+}
+
 /// Pending timers: a resource. The frame loop wakes at the earliest.
 #[derive(Default)]
 pub struct Timers {
@@ -158,24 +180,29 @@ impl Timers {
 /// Resolves once `duration` has passed (checked each `UiUpdate`; the window
 /// loop sleeps until the earliest timer).
 pub fn sleep<S: Storage>(cx: Cx<S>, duration: Duration) -> Sleep<S> {
-    Sleep { cx, deadline: Instant::now() + duration, id: None }
+    Sleep { cx, duration, deadline: None, id: None }
 }
 /// The future [`sleep`] returns.
 pub struct Sleep<S: Storage> {
     cx: Cx<S>,
-    deadline: Instant,
+    duration: Duration,
+    /// Set on the first poll, from the UI clock.
+    deadline: Option<Instant>,
     id: Option<u64>,
 }
 impl<S: Storage> Future for Sleep<S> {
     type Output = ();
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
-        if Instant::now() >= self.deadline {
+        let now = self.cx.with(|clock: Option<Res<UiClock>>| clock.map_or(Instant::now(), |c| c.now())).unwrap_or_else(|_| Instant::now());
+        let duration = self.duration;
+        let deadline = *self.deadline.get_or_insert(now + duration);
+        if now >= deadline {
             if let Some(id) = self.id.take() {
                 let _ = self.cx.with(move |mut timers: ResMut<Timers>| timers.entries.retain(|e| e.1 != id));
             }
             return Poll::Ready(());
         }
-        let (deadline, waker, known) = (self.deadline, context.waker().clone(), self.id);
+        let (waker, known) = (context.waker().clone(), self.id);
         let id = self
             .cx
             .with(move |mut timers: ResMut<Timers>| match known {
@@ -203,8 +230,8 @@ impl<S: Storage> Drop for Sleep<S> {
 }
 
 /// `UiUpdate`, first: fire due timers and tick animations.
-pub fn frame_start(mut timers: ResMut<Timers>, mut ticks: ResMut<Inbox<FrameTick>>) {
-    let now = Instant::now();
+pub fn frame_start(clock: Option<Res<UiClock>>, mut timers: ResMut<Timers>, mut ticks: ResMut<Inbox<FrameTick>>) {
+    let now = clock.map_or(Instant::now(), |c| c.now());
     timers.entries.retain(|(deadline, _, waker)| {
         let due = *deadline <= now;
         if due {

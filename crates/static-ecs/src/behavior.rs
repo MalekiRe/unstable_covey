@@ -210,15 +210,21 @@ struct Entry<F> {
     suspended_at: u64,
     /// Mailboxes it subscribed to, released with it.
     subscriptions: Vec<Subscription>,
+    /// Unique among all instances, for taking each event once.
+    instance: u64,
 }
-/// A mailbox an instance listens on: `(Inbox<E>, entity)`, by its remover.
-#[derive(Clone, Copy, PartialEq)]
+/// A mailbox an instance listens on: `(Inbox<E>, entity)`, with its
+/// remover.
+#[derive(Clone, Copy)]
 struct Subscription {
-    unsubscribe: unsafe fn(*mut (), Entity),
+    inbox: TypeId,
     entity: Entity,
+    unsubscribe: unsafe fn(*mut (), Entity),
 }
 /// Orders deliveries against instances' suspensions, process-wide.
 static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Behavior instance ids, process-wide.
+static INSTANCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 impl<F> Entry<F> {
     fn reusable_waker(&self) -> bool {
         self.waker.as_ref().is_some_and(|waker| {
@@ -278,6 +284,7 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
                     next_free: if i + 1 < CHUNK as u32 { base + i + 1 } else { NONE },
                     suspended_at: 0,
                     subscriptions: Vec::new(),
+                    instance: 0,
                 })
                 .collect();
             self.chunks.push(chunk);
@@ -288,6 +295,7 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
         let free = entry.next_free;
         entry.entity = entity;
         entry.suspended_at = STAMP.load(Ordering::Relaxed);
+        entry.instance = INSTANCES.fetch_add(1, Ordering::Relaxed);
         if !entry.reusable_waker() {
             entry.waker = Some(Waker::from(Arc::new(Control {
                 shared: Arc::downgrade(shared),
@@ -340,6 +348,7 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
             states: &raw mut self.states,
             running: Cell::new(false),
             since: Cell::new(0),
+            instance: Cell::new(0),
             subscriptions: Cell::new(ptr::null_mut()),
         };
         scope.enter(|| {
@@ -370,6 +379,7 @@ impl<S: Storage, F: Future<Output = ()>> Slab<S, F> {
                     let Some(future) = entry.future.as_mut() else { continue };
                     let waker = entry.waker.as_ref().expect("a started slot has a waker");
                     scope.since.set(entry.suspended_at);
+                    scope.instance.set(entry.instance);
                     scope.subscriptions.set(&raw mut entry.subscriptions);
                     // SAFETY: chunk entries never move, and futures are
                     // dropped in place.
@@ -449,6 +459,8 @@ struct PollScope {
     running: Cell<bool>,
     /// The polled instance's last suspension stamp.
     since: Cell<u64>,
+    /// The polled instance's id.
+    instance: Cell<u64>,
     /// The polled instance's subscriptions; null between polls.
     subscriptions: Cell<*mut Vec<Subscription>>,
 }
@@ -570,12 +582,32 @@ struct Mailbox<E> {
     entity: Option<Entity>,
     /// Live behavior instances listening here.
     subscribers: u32,
-    /// Delivered events with their stamps, oldest first (at most `QUEUE`).
-    queue: std::collections::VecDeque<(u64, E)>,
+    /// Delivered events, oldest first (at most `QUEUE`).
+    queue: std::collections::VecDeque<Queued<E>>,
     waiters: Vec<(u64, Waker)>,
 }
 /// Events kept per mailbox; older ones are dropped first.
 const QUEUE: usize = 32;
+/// Distinct instances that can take one event (more listeners on one
+/// entity's mailbox share the rest).
+const TAKERS: usize = 4;
+/// A delivered event: each listening instance takes it once.
+struct Queued<E> {
+    stamp: u64,
+    event: E,
+    /// Listening instances when delivered.
+    listeners: u32,
+    takers: [u64; TAKERS],
+    taken: u32,
+}
+impl<E> Queued<E> {
+    fn new(stamp: u64, event: E, listeners: u32) -> Self {
+        Self { stamp, event, listeners, takers: [0; TAKERS], taken: 0 }
+    }
+    fn taken_by(&self, instance: u64) -> bool {
+        self.takers[..(self.taken as usize).min(TAKERS)].contains(&instance)
+    }
+}
 impl<E> Default for Mailbox<E> {
     fn default() -> Self {
         Self { entity: None, subscribers: 0, queue: std::collections::VecDeque::new(), waiters: Vec::new() }
@@ -622,7 +654,8 @@ impl<E: Clone> Inbox<E> {
         if mailbox.queue.len() == QUEUE {
             mailbox.queue.pop_front();
         }
-        mailbox.queue.push_back((STAMP.load(Ordering::Relaxed), event));
+        let listeners = mailbox.subscribers.max(1);
+        mailbox.queue.push_back(Queued::new(STAMP.load(Ordering::Relaxed), event, listeners));
         for (_, waker) in &mailbox.waiters {
             waker.wake_by_ref();
         }
@@ -636,7 +669,7 @@ impl<E: Clone> Inbox<E> {
             if mailbox.queue.len() == QUEUE {
                 mailbox.queue.pop_front();
             }
-            mailbox.queue.push_back((stamp, event.clone()));
+            mailbox.queue.push_back(Queued::new(stamp, event.clone(), mailbox.subscribers));
             for (_, waker) in &mailbox.waiters {
                 waker.wake_by_ref();
             }
@@ -653,7 +686,7 @@ impl<E: Clone> Inbox<E> {
             if mailbox.queue.len() == QUEUE {
                 mailbox.queue.pop_front();
             }
-            mailbox.queue.push_back((stamp, event.clone()));
+            mailbox.queue.push_back(Queued::new(stamp, event.clone(), mailbox.subscribers));
             for (_, waker) in &mailbox.waiters {
                 waker.wake_by_ref();
             }
@@ -719,18 +752,27 @@ impl<S: Storage, E: Clone + Send + Sync + 'static> Future for Delivery<S, E> {
         let mailbox = inbox.mailbox(entity);
         // Subscribe this instance, once.
         let subscriptions = scope.subscriptions.get();
-        let subscription = Subscription { unsubscribe: Self::unsubscribe, entity };
+        let subscription = Subscription { inbox: TypeId::of::<E>(), entity, unsubscribe: Self::unsubscribe };
         // SAFETY: set by the poll step for the instance being polled.
         if let Some(subscriptions) = unsafe { subscriptions.as_mut() }
-            && !subscriptions.contains(&subscription)
+            && !subscriptions.iter().any(|s| s.inbox == subscription.inbox && s.entity == entity)
         {
             subscriptions.push(subscription);
             mailbox.subscribers += 1;
         }
-        // The oldest event new to this instance.
-        let since = scope.since.get();
-        if let Some(index) = mailbox.queue.iter().position(|&(stamp, _)| stamp >= since) {
-            let (_, event) = mailbox.queue.remove(index).unwrap();
+        // The oldest event new to this instance and not yet taken by it.
+        let (since, instance) = (scope.since.get(), scope.instance.get());
+        if let Some(index) = mailbox.queue.iter().position(|q| q.stamp >= since && !q.taken_by(instance)) {
+            let queued = &mut mailbox.queue[index];
+            if (queued.taken as usize) < TAKERS {
+                queued.takers[queued.taken as usize] = instance;
+            }
+            queued.taken += 1;
+            let event = if queued.taken >= queued.listeners {
+                mailbox.queue.remove(index).unwrap().event
+            } else {
+                queued.event.clone()
+            };
             if let Some(ticket) = self.ticket.take() {
                 mailbox.waiters.retain(|&(t, _)| t != ticket);
             }

@@ -286,14 +286,20 @@ pub fn handle<S: Storage>(world: &mut World<S>, input: &Input) {
             pointer.hit_tests += 1;
             let hit = hit_test(world, position);
             if hit != pointer.hovered {
-                if let Some(old) = pointer.hovered {
-                    world.deliver(old, PointerLeave);
+                let interactive = hit.and_then(|h| nearest::<S, Interaction>(world, h));
+                // Enter and leave reach both the element under the pointer
+                // and the interactive one around it (a button, not its
+                // label), each once.
+                let distinct = |a: Option<Entity>, b: Option<Entity>| [a, b.filter(|&b| Some(b) != a)];
+                let old = distinct(pointer.hovered, pointer.hovered_interactive);
+                let new = distinct(hit, interactive);
+                for entity in old.into_iter().flatten().filter(|&e| !new.contains(&Some(e))) {
+                    world.deliver(entity, PointerLeave);
                 }
-                if let Some(new) = hit {
-                    world.deliver(new, PointerEnter);
+                for entity in new.into_iter().flatten().filter(|&e| !old.contains(&Some(e))) {
+                    world.deliver(entity, PointerEnter);
                 }
                 pointer.hovered = hit;
-                let interactive = hit.and_then(|h| nearest::<S, Interaction>(world, h));
                 if interactive != pointer.hovered_interactive {
                     set_interaction(world, pointer.hovered_interactive, |i| i.hovered = false);
                     set_interaction(world, interactive, |i| i.hovered = true);
@@ -324,10 +330,14 @@ pub fn handle<S: Storage>(world: &mut World<S>, input: &Input) {
             }
         }
         Input::PointerLeft => {
-            if let Some(old) = pointer.hovered.take() {
+            let (hovered, interactive) = (pointer.hovered.take(), pointer.hovered_interactive.take());
+            if let Some(old) = hovered {
                 world.deliver(old, PointerLeave);
             }
-            set_interaction(world, pointer.hovered_interactive.take(), |i| i.hovered = false);
+            if let Some(old) = interactive.filter(|&i| Some(i) != hovered) {
+                world.deliver(old, PointerLeave);
+            }
+            set_interaction(world, interactive, |i| i.hovered = false);
             pointer.position = None;
         }
         Input::Button { button, pressed: true } => {
@@ -345,11 +355,12 @@ pub fn handle<S: Storage>(world: &mut World<S>, input: &Input) {
             set_focus(world, focusable);
         }
         Input::Button { button, pressed: false } => {
-            let Some((_, target, pressed_button, interactive)) = pointer.press.take() else { return };
+            // Only the button that pressed releases the press.
+            let Some((_, target, pressed_button, interactive)) = pointer.press else { return };
             if pressed_button != button {
-                pointer.press = Some((Vec2::default(), target, pressed_button, interactive));
                 return;
             }
+            pointer.press = None;
             set_interaction(world, interactive, |i| i.pressed = false);
             let position = pointer.position.unwrap_or_default();
             match pointer.drag.take() {

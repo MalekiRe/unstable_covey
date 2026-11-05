@@ -81,12 +81,13 @@ fn animations_request_frames_until_they_reach_exactly_one() {
         .add_plugins((UiPlugin::<Monospace>::default(), behavior::<Fade, _>(UiUpdate)))
         .register::<Progress>()
         .build();
+    app.world.insert_resource(UiClock::Manual(std::time::Instant::now()));
     let entity = app.world.spawn_bundle((Fade, Progress::default()));
     frame(&mut app);
     assert!(app.world.resource::<Redraw>().unwrap().animating);
     let mut frames = 0;
     while app.world.resource::<Redraw>().unwrap().animating {
-        std::thread::sleep(Duration::from_millis(4));
+        app.world.resource_mut::<UiClock>().unwrap().advance(Duration::from_millis(7));
         frame(&mut app);
         frames += 1;
         assert!(frames < 1000);
@@ -118,13 +119,16 @@ fn timers_set_the_deadline_and_resume_after_it() {
         .add_plugins((UiPlugin::<Monospace>::default(), behavior::<Alarm, _>(UiUpdate)))
         .register::<Rang>()
         .build();
+    let start = std::time::Instant::now();
+    app.world.insert_resource(UiClock::Manual(start));
     let entity = app.world.spawn_bundle((Alarm, Rang::default()));
     frame(&mut app);
     let deadline = app.world.resource::<Redraw>().unwrap().deadline.expect("a timer is pending");
-    assert!(!app.world.get::<Rang>(entity).unwrap().0);
+    assert_eq!(deadline, start + Duration::from_millis(20));
+    app.world.resource_mut::<UiClock>().unwrap().advance(Duration::from_millis(19));
     frame(&mut app);
     assert!(!app.world.get::<Rang>(entity).unwrap().0, "not before the deadline");
-    std::thread::sleep(deadline.saturating_duration_since(std::time::Instant::now()) + Duration::from_millis(1));
+    app.world.resource_mut::<UiClock>().unwrap().advance(Duration::from_millis(1));
     frame(&mut app);
     assert!(app.world.get::<Rang>(entity).unwrap().0);
     assert_eq!(app.world.resource::<Redraw>().unwrap().deadline, None);

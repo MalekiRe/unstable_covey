@@ -308,3 +308,33 @@ fn events_for_a_running_behavior_wait_even_before_it_first_awaits_their_type() {
     assert!(!app.world.deliver(plain, Release));
     assert_eq!(app.world.resource::<Inbox<Release>>().unwrap().waiters(plain), 0);
 }
+
+/// Counts presses into `Count` too, beside `Counter` on the same entity.
+struct Echo;
+impl Behavior for Echo {
+    async fn start<S: Storage>(me: Entity, cx: Cx<S>) {
+        loop {
+            let Press(n) = cx.on::<Press>(me).await;
+            cx.with(|mut q: Query<&mut Count>| q.get_mut(me).unwrap().0 += 100 * n).unwrap();
+        }
+    }
+}
+
+#[test]
+fn every_behavior_listening_on_an_entity_takes_each_event_once() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut app = App::new()
+        .add_plugins((behavior::<Counter, _>(Frame), behavior::<Echo, _>(Frame)))
+        .register::<Count>()
+        .register::<Inbox<Press>>()
+        .build();
+    let entity = app.world.spawn_bundle((Counter, Echo, Count(0)));
+    app.emit(&Frame);
+    app.world.deliver(entity, Press(1));
+    app.emit(&Frame);
+    app.emit(&Frame);
+    assert_eq!(app.world.get::<Count>(entity).unwrap().0, 101);
+    app.world.deliver(entity, Press(2));
+    app.emit(&Frame);
+    assert_eq!(app.world.get::<Count>(entity).unwrap().0, 303);
+}
