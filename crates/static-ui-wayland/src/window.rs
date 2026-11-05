@@ -49,6 +49,13 @@ pub struct WindowOptions {
     pub max_frames: Option<u64>,
     /// Close after this long.
     pub run_for: Option<std::time::Duration>,
+    /// CLOCK_MONOTONIC nanoseconds the launch began at (a launcher's
+    /// timestamp before spawning), for `Stats::first_commit_ns`; default:
+    /// when `run` starts.
+    pub launched_ns: Option<u64>,
+    /// Receive pointer and keyboard input (off: the window is transparent
+    /// to the pointer, e.g. to measure an idle window on a busy desktop).
+    pub input: bool,
 }
 impl Default for WindowOptions {
     fn default() -> Self {
@@ -59,6 +66,8 @@ impl Default for WindowOptions {
             height: 600,
             max_frames: None,
             run_for: None,
+            launched_ns: None,
+            input: true,
         }
     }
 }
@@ -68,6 +77,9 @@ impl Default for WindowOptions {
 pub struct Stats {
     /// Returns from `poll`.
     pub wakeups: u64,
+    /// When each wakeup and commit happened, since `run` began.
+    pub wakeups_at: Vec<std::time::Duration>,
+    pub commits_at: Vec<std::time::Duration>,
     /// `UiFrame` emits, and why: input, a frame callback or buffer
     /// release, a behavior's wakeup, a timer.
     pub frames: u64,
@@ -79,9 +91,13 @@ pub struct Stats {
     pub commits: u64,
     /// Pixels rastered over the run.
     pub pixels: u64,
-    /// For commits that followed input: input received to pixels on screen,
-    /// in nanoseconds, from `wp_presentation` (CLOCK_MONOTONIC).
+    /// For commits that followed input or a behavior's wakeup: input (or
+    /// wakeup) received to pixels on screen, in nanoseconds, from
+    /// `wp_presentation` (CLOCK_MONOTONIC).
     pub input_to_present_ns: Vec<u64>,
+    /// For the same commits: input (or wakeup) to the commit leaving this
+    /// process, in nanoseconds: our share of the latency.
+    pub input_to_commit_ns: Vec<u64>,
     /// Time from launch to the first frame being committed, in nanoseconds.
     pub first_commit_ns: u64,
 }
@@ -99,6 +115,8 @@ struct State {
     size: Option<(u32, u32)>,
     busy: [bool; BUFFERS],
     frame_done: bool,
+    /// A buffer came back.
+    released: bool,
     keyboard: Option<WlKeyboard>,
     pointer: Option<WlPointer>,
     modifiers: Modifiers,
@@ -162,7 +180,7 @@ pub fn run<S: Storage, L>(app: &mut App<S, L>, options: WindowOptions) -> Stats
 where
     L: Handles<Input, World<S>> + Handles<UiUpdate, World<S>> + Handles<UiFrame, World<S>>,
 {
-    let launched = now_ns();
+    let launched = options.launched_ns.unwrap_or_else(now_ns);
     let started = Instant::now();
     let conn = Connection::connect_to_env().expect("no Wayland display");
     let (globals, mut queue) = registry_queue_init::<State>(&conn).expect("registry");
@@ -177,6 +195,11 @@ where
     let toplevel = xdg.get_toplevel(&qh, ());
     toplevel.set_title(options.title.clone());
     toplevel.set_app_id(options.app_id.clone());
+    if !options.input {
+        let region = compositor.create_region(&qh, ());
+        surface.set_input_region(Some(&region));
+        region.destroy();
+    }
     surface.commit();
     conn.flush().expect("flush");
 
@@ -193,14 +216,61 @@ where
     let mut state = State { running: true, ..State::default() };
     let mut stats = Stats::default();
     let mut atlas = Atlas::default();
-    let mut buffers: Option<Buffers> = None;
-    let mut woken = true;
+    // The first frame is laid out and drawn while the compositor answers
+    // the new window (at the size we asked for); it is committed once the
+    // window is configured, unless the size came back different.
+    let mut buffers = Some(Buffers::new(&shm, &qh, options.width as usize, options.height as usize));
+    app.emit(&UiUpdate);
+    app.emit(&UiFrame);
+    stats.frames += 1;
+    let mut predrawn = {
+        let damage = app.world.resource_mut::<RenderList>().map(|mut list| list.take_damage()).unwrap_or_default();
+        let buffers = buffers.as_mut().unwrap();
+        let (w, h) = (buffers.width, buffers.height);
+        let whole = [Rect::new(0.0, 0.0, w as f32, h as f32)];
+        let world = &app.world;
+        let (Some(list), Some(ui), Some(fonts)) = (world.resource::<RenderList>(), world.resource::<UiLayout>(), world.resource::<Fonts>()) else {
+            panic!("the app needs `UiPlugin<Fonts>`");
+        };
+        let clear = world.resource::<ClearColor>().copied().unwrap_or_default();
+        let mut canvas = Canvas { pixels: buffers.frame(0), width: w, height: h, stride: w, touched: 0 };
+        stats.pixels += paint(&mut canvas, list, ui, fonts, &mut atlas, clear.0, &whole).pixels;
+        buffers.pending[0].clear();
+        // The other buffer still needs everything, and this frame's damage.
+        buffers.pending[1].extend_from_slice(&damage);
+        true
+    };
+    let mut woken = false;
+    // Damage is queued but both buffers were busy.
+    let mut waiting_for_buffer = false;
     let mut feedbacks = Vec::new();
     while state.running {
         queue.dispatch_pending(&mut state).expect("dispatch");
+        if predrawn && state.configured {
+            predrawn = false;
+            let size = state.size.filter(|&(w, h)| w > 0 && h > 0).unwrap_or((options.width, options.height));
+            let buffers = buffers.as_mut().unwrap();
+            if size == (buffers.width as u32, buffers.height as u32) {
+                surface.attach(Some(&buffers.buffers[0]), 0, 0);
+                surface.damage_buffer(0, 0, buffers.width as i32, buffers.height as i32);
+                surface.commit();
+                conn.flush().expect("flush");
+                state.busy[0] = true;
+                stats.commits += 1;
+                stats.commits_at.push(started.elapsed());
+                stats.first_commit_ns = now_ns() - launched;
+                if options.max_frames.is_some_and(|max| stats.commits >= max) {
+                    break;
+                }
+                continue;
+            }
+            // Resized before the first frame: draw again at the new size.
+            woken = true;
+        }
         let deadline = app.world.resource::<Redraw>().and_then(|r| r.deadline);
         let due = deadline.is_some_and(|d| d <= Instant::now());
-        let has_work = state.configured && (woken || due || state.frame_done || !state.input.is_empty() || buffers.is_none());
+        let freed = std::mem::take(&mut state.released) && waiting_for_buffer;
+        let has_work = state.configured && (woken || due || freed || state.frame_done || !state.input.is_empty() || buffers.is_none());
         if !has_work {
             conn.flush().expect("flush");
             let Some(guard) = queue.prepare_read() else { continue };
@@ -217,6 +287,7 @@ where
                 Err(e) => panic!("poll: {e}"),
             }
             stats.wakeups += 1;
+            stats.wakeups_at.push(started.elapsed());
             let (socket, eventfd) = (fds[0].revents(), fds[1].revents());
             if socket.contains(PollFlags::IN) {
                 let _ = guard.read();
@@ -227,6 +298,7 @@ where
                 let mut count = [0u8; 8];
                 let _ = rustix::io::read(&*wake, &mut count);
                 woken = true;
+                state.input_at.get_or_insert_with(now_ns);
             }
             if options.run_for.is_some_and(|limit| started.elapsed() >= limit) {
                 break;
@@ -259,7 +331,10 @@ where
             pending.extend_from_slice(&damage);
         }
         let animating = app.world.resource::<Redraw>().is_some_and(|r| r.animating);
-        let free = (0..BUFFERS).find(|&i| !state.busy[i] && !buffers.pending[i].is_empty());
+        // Draw when something changed (now, or while no buffer was free).
+        let changed = !damage.is_empty() || waiting_for_buffer;
+        let free = (0..BUFFERS).find(|&i| changed && !state.busy[i] && !buffers.pending[i].is_empty());
+        waiting_for_buffer = changed && free.is_none();
         if let Some(index) = free {
             let regions = merge_all(std::mem::take(&mut buffers.pending[index]));
             let (w, h) = (buffers.width, buffers.height);
@@ -282,15 +357,19 @@ where
                 surface.frame(&qh, ());
             }
             surface.commit();
+            if let Some(at) = input_at {
+                conn.flush().expect("flush");
+                stats.input_to_commit_ns.push(now_ns().saturating_sub(at));
+            }
             state.busy[index] = true;
             stats.commits += 1;
+            stats.commits_at.push(started.elapsed());
             if stats.commits == 1 {
                 conn.flush().expect("flush");
                 stats.first_commit_ns = now_ns() - launched;
             }
-        } else if animating || buffers.pending.iter().any(|p| !p.is_empty()) {
-            // Nothing free, or nothing to draw this time: come back on the
-            // next frame (a release also wakes the loop).
+        } else if animating {
+            // Nothing to draw this time, but more is coming.
             surface.frame(&qh, ());
             surface.commit();
         }
@@ -330,6 +409,7 @@ impl Dispatch<WlRegistry, GlobalListContents> for State {
     fn event(_: &mut Self, _: &WlRegistry, _: <WlRegistry as wayland_client::Proxy>::Event, _: &GlobalListContents, _: &Connection, _: &QueueHandle<Self>) {}
 }
 delegate_noop!(State: WlCompositor);
+delegate_noop!(State: wayland_client::protocol::wl_region::WlRegion);
 delegate_noop!(State: WlShmPool);
 delegate_noop!(State: ignore WlShm);
 delegate_noop!(State: ignore WlSurface);
@@ -364,8 +444,7 @@ impl Dispatch<WlBuffer, usize> for State {
     fn event(state: &mut Self, _: &WlBuffer, event: wl_buffer::Event, index: &usize, _: &Connection, _: &QueueHandle<Self>) {
         if let wl_buffer::Event::Release = event {
             state.busy[*index] = false;
-            // A buffer came back with damage still queued for it.
-            state.frame_done = true;
+            state.released = true;
         }
     }
 }

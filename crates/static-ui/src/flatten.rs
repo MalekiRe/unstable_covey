@@ -26,6 +26,10 @@ pub struct UiLayout {
     runs: u64,
     rebuilds: u64,
     layout_time: std::time::Duration,
+    pass_time: std::time::Duration,
+    /// Each element's box united with its descendants' (floating ones
+    /// excluded): hit testing skips subtrees that cannot contain a point.
+    bounds: Vec<layout::Rect>,
     damage: Vec<layout::Rect>,
     /// Flattening work list: `Some(entity)` opens, `None` closes.
     stack: Vec<Option<Entity>>,
@@ -45,6 +49,8 @@ impl Default for UiLayout {
             runs: 0,
             rebuilds: 0,
             layout_time: std::time::Duration::ZERO,
+            pass_time: std::time::Duration::ZERO,
+            bounds: Vec::new(),
             damage: Vec::new(),
             stack: Vec::new(),
             roots: Vec::new(),
@@ -64,6 +70,15 @@ impl UiLayout {
     /// How long the last layout took (flattening, passes, write-back).
     pub fn layout_time(&self) -> std::time::Duration {
         self.layout_time
+    }
+    /// How long Clay's passes took in the last layout.
+    pub fn pass_time(&self) -> std::time::Duration {
+        self.pass_time
+    }
+    /// `element`'s box united with its descendants' boxes, from the last
+    /// layout (floating descendants, being roots, are not included).
+    pub fn subtree_bounds(&self, element: u32) -> layout::Rect {
+        self.bounds.get(element as usize).copied().unwrap_or_default()
     }
     /// The flattened tree, with its last layout.
     pub fn tree(&self) -> &Tree {
@@ -280,7 +295,9 @@ pub fn layout_system<M: Measure>(
         return;
     }
     ui.runs += 1;
+    let passes = std::time::Instant::now();
     ui.tree.layout(&mut ui.cache, |text, config| measure.measure(text, config));
+    ui.pass_time = passes.elapsed();
     for i in 0..ui.entities.len() {
         let entity = ui.entities[i];
         let new = ui.tree.rect(i as u32 + 1);
@@ -292,6 +309,17 @@ pub fn layout_system<M: Measure>(
             ui.damage(old);
             ui.damage(new);
         }
+    }
+    // Children follow their parent in the flattened order: unite bottom-up.
+    let n = ui.tree.len();
+    ui.bounds.clear();
+    ui.bounds.extend((0..n as u32).map(|e| ui.tree.rect(e)));
+    for element in (0..n as u32).rev() {
+        let mut bounds = ui.bounds[element as usize];
+        for &child in ui.tree.children(element) {
+            bounds = bounds.union(ui.bounds[child as usize]);
+        }
+        ui.bounds[element as usize] = bounds;
     }
     ui.layout_time = started.elapsed();
 }

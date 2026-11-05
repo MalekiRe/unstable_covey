@@ -19,7 +19,45 @@ Sources this combines:
 - static-ecs: compile-time access, inlined systems, relations, hooks,
   in-schedule async tasks, and (as of `1f0428f`) default query filters.
 
-Code below marked **SPECULATIVE** is the target API, not code that exists.
+## Status: implemented
+
+Every phase below is implemented; measurements against the budgets are in
+[UI_BENCHMARKS.md](UI_BENCHMARKS.md). Code marked **SPECULATIVE** was the
+target API; where the implementation differs, this list says how:
+
+- **Crates**: `crates/static-ui-layout` (Clay port), `crates/static-ui`
+  (components, flattening, input, behaviors helpers, widgets, transitions,
+  debug overlay), `crates/static-ui-wayland` (fonts, CPU raster, window
+  loop), `crates/static-ui-clay-oracle` (clay.h differential test, layout
+  benchmark). The ECS work (phase 0) is in `crates/static-ecs`.
+- **Phase 0.1**: worlds reject non-`Send + Sync` components at compile time
+  (`Storage: Send + Sync` kept; the markers carry `T`'s auto traits).
+- **Behaviors** (0.4, 5): `impl Behavior for Slider { async fn start<S:
+  Storage>(me: Entity, cx: Cx<S>) }`, registered with
+  `behavior::<Slider, _>(UiUpdate)`; futures return `()`. Events go to
+  per-entity mailboxes: while an entity runs behaviors, events for it wait
+  in order until they are awaited (a `DragStart` and the `Drag` in the same
+  input batch are both seen), each listening behavior takes an event once,
+  and an event counts as taken (stopping bubbling) only where a behavior has
+  awaited its type. Awaiting an entity that is despawned never resolves.
+- **Frame pipeline** (9): input is emitted as `Input` labels, then
+  `UiUpdate` (behaviors, timers, transitions, app logic), then `UiFrame`
+  (layout, render list), so behaviors' changes are laid out in the same
+  wakeup.
+- **Layout** (5, phase 1): the port mirrors Clay's element array (in
+  declaration order) rather than a breadth-first struct-of-arrays; it
+  matches clay.h exactly except where Clay loops forever, and lets a
+  floating element attach to an element declared after it. Relayout
+  boundaries (5.3 v2) were not needed: whole-tree passes meet the budgets.
+- **Damage and buffers** (6): damage is merged rectangles; each of the two
+  buffers accumulates what changed since it was last drawn. `Overlay` is
+  drawn as a translucent rectangle after the element's children.
+- **Fonts** (6): ttf-parser and our own rasterizer, chosen over fontdue by
+  size (39.7 KB against 68.4 KB) at nearly identical coverage.
+- **Hit testing** (7): subtrees are pruned by their bounds, computed after
+  each layout; no grid was needed.
+- **Time**: a `UiClock` resource (system or manual) drives timers,
+  animations and transitions, so tests advance time instead of sleeping.
 
 ---
 

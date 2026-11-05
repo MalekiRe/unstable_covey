@@ -7,7 +7,7 @@ use crate::hook::{Event, Hook, HookList};
 use crate::lookup::ComponentLookup;
 use crate::plan::{ExecutionMode, Input, NoInput, Ref, Shape, run_now};
 use crate::plugin::{
-    ComponentList, InstallRelation, Instantiate, InstantiateHooks, Pending, Plugin, RelationList,
+    ComponentList, DeclarationList, InstallRelation, Instantiate, InstantiateHooks, Pending, Plugin, RelationList,
 };
 use crate::state::State;
 use crate::vocab::{Declaration, Insert, Uses};
@@ -520,18 +520,24 @@ pub trait Plugins<C, L, K> {
 /// The plugin's components and relations now; its systems at `build`.
 impl<P: Plugin, C, L, K> Plugins<C, L, K> for P
 where
-    P::Components: ComponentList<C>,
-    P::Relations: RelationList<<P::Components as ComponentList<C>>::Out, K>,
+    P::Storage: DeclarationList<C>,
+    P::Components: ComponentList<<P::Storage as DeclarationList<C>>::Out>,
+    P::Relations: RelationList<<P::Components as ComponentList<<P::Storage as DeclarationList<C>>::Out>>::Out, K>,
 {
-    type Components =
-        <P::Relations as RelationList<<P::Components as ComponentList<C>>::Out, K>>::Components;
+    type Components = <P::Relations as RelationList<
+        <P::Components as ComponentList<<P::Storage as DeclarationList<C>>::Out>>::Out,
+        K,
+    >>::Components;
     type Listeners = Cons<Pending<P>, L>;
-    type Hooks = <P::Relations as RelationList<<P::Components as ComponentList<C>>::Out, K>>::Hooks;
+    type Hooks = <P::Relations as RelationList<
+        <P::Components as ComponentList<<P::Storage as DeclarationList<C>>::Out>>::Out,
+        K,
+    >>::Hooks;
     fn add_to(self, listeners: L, hooks: K) -> (Self::Listeners, Self::Hooks) {
-        let hooks =
-            <P::Relations as RelationList<<P::Components as ComponentList<C>>::Out, K>>::install(
-                hooks,
-            );
+        let hooks = <P::Relations as RelationList<
+            <P::Components as ComponentList<<P::Storage as DeclarationList<C>>::Out>>::Out,
+            K,
+        >>::install(hooks);
         (Cons(Pending(self), listeners), hooks)
     }
 }

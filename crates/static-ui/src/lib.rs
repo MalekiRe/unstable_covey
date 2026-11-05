@@ -308,6 +308,21 @@ impl<M: Measure> Plugin for UiPlugin<M> {
         M,
     );
     type Relations = (ChildOf, InScope);
+    // Change summaries: an unchanged column is skipped with one load, so an
+    // unchanged frame does not scan every node.
+    type Storage = (
+        Components<Node, true>,
+        Components<Text, true>,
+        Components<Rect, true>,
+        Components<Background, true>,
+        Components<Border, true>,
+        Components<Radius, true>,
+        Components<Overlay, true>,
+        Components<Scroll, true>,
+        Components<Floating, true>,
+        Components<AspectRatio, true>,
+        Components<Relates<ChildOf>, true>,
+    );
     fn systems<S: Storage>(self) -> impl Systems<S> {
         flatten::systems::<S, M>()
     }

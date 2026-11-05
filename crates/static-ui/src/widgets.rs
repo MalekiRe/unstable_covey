@@ -20,7 +20,7 @@ use std::task::Poll;
 use std::time::Duration;
 
 use static_ecs::prelude::*;
-use static_ecs::{Behaving, Behavior, Cx, Inbox, Wakeup, behavior};
+use static_ecs::{Behaving, Behavior, Components, Cx, Inbox, Wakeup, behavior};
 use static_ui_layout::Vec2;
 
 use crate::behave::{self, Scope, UiUpdate, select, select_all, sleep};
@@ -604,6 +604,7 @@ impl<M: Measure> Plugin for ControlsPlugin<M> {
         Inbox<FocusOut>,
     );
     type Relations = (ChildOf,);
+    type Storage = (Components<TextValue, true>, Components<Cursor, true>);
     fn systems<S: Storage>(self) -> impl Systems<S> {
         (
             behavior::<Button, _>(UiUpdate).systems::<S>(),
@@ -927,6 +928,7 @@ impl Plugin for ContainersPlugin {
         Inbox<KeyPress>,
     );
     type Relations = (ChildOf,);
+    type Storage = (Components<VirtualList, true>, Components<RowIndex, true>);
     fn systems<S: Storage>(self) -> impl Systems<S> {
         (
             behavior::<Tabs, _>(UiUpdate).systems::<S>(),

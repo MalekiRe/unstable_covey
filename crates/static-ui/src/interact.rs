@@ -3,7 +3,7 @@
 //! delivered to the hit entity and bubbled up `ChildOf` until something
 //! awaits them, scroll containers, drag, and keyboard focus.
 use static_ecs::prelude::*;
-use static_ecs::Inbox;
+use static_ecs::{Components, Inbox};
 use static_ui_layout::{PointerCapture, Rect as Box2, Vec2};
 
 use crate::input::{Input, Key, Modifiers, MouseButton};
@@ -139,6 +139,7 @@ impl Plugin for InputPlugin {
         Inbox<FocusOut>,
     );
     type Relations = (ChildOf,);
+    type Storage = (Components<Interaction, true>,);
     fn systems<S: Storage>(self) -> impl Systems<S> {
         // Any `Input` value names the label.
         schedule(Input::PointerLeft, exclusive(|input: &Input, world: &mut World<S>| handle(world, input)))
@@ -168,6 +169,10 @@ pub fn hit_test<S: Storage>(world: &World<S>, point: Vec2) -> Option<Entity> {
     None
 }
 fn hit_in<S: Storage>(world: &World<S>, ui: &UiLayout, element: u32, point: Vec2, clip: Box2) -> Option<Entity> {
+    // Nothing in this subtree reaches the point.
+    if !ui.subtree_bounds(element).contains(point) {
+        return None;
+    }
     let tree = ui.tree();
     let rect = tree.rect(element);
     let inside = rect.contains(point) && clip.contains(point);

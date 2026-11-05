@@ -1,0 +1,17 @@
+# The settings-list UI of `examples/ui_bench.rs`, in Bevy UI, for
+# UI_BENCHMARKS.md. Not part of the workspace (it builds all of Bevy).
+#   cargo run --release -- --layout 10000
+[package]
+name = "bevy-ui-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+bevy = { version = "=0.19.1", default-features = false, features = ["ui"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

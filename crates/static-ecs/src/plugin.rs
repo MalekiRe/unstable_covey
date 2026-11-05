@@ -53,6 +53,12 @@ pub trait Plugin: Sized {
     /// Relations the plugin uses (a tuple of up to 16), installed once
     /// however many plugins and apps name them: `(ChildOf,)`.
     type Relations = ();
+    /// Storage choices for components the plugin names, applied before
+    /// `Components`: a tuple (up to 16) of declarations such as
+    /// `Components<Node, true>` (change summaries, so an unchanged column
+    /// is skipped with one load) or `Sparse<Hovered>`. A component the app
+    /// already stores keeps its storage.
+    type Storage = ();
     /// The plugin's systems, for the app's final world `S`: anything
     /// `schedule(...)` or `task(...)` returns, or a tuple of those (up to 16,
     /// nested freely), registered in order where the plugin was added. They
@@ -180,6 +186,32 @@ component_list!(
     A, B, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, T0, T1, T2, T3, T4, T5, T6, T7, T8, T9, T10,
     T11, T12, T13, T14, T15
 );
+
+/// `C` extended with a tuple of storage declarations.
+#[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a tuple of storage declarations",
+    note = "a plugin's `Storage` lists declarations: `type Storage = (Components<Pos, true>, Sparse<Hovered>);`"
+)]
+pub trait DeclarationList<C> {
+    type Out: Storage;
+}
+impl<C: Storage> DeclarationList<C> for () {
+    type Out = C;
+}
+macro_rules! declaration_list {
+    ($a:ident $(, $t:ident)*) => {
+        impl<C: Insert<$a>, $a: crate::vocab::Declaration, $($t: crate::vocab::Declaration),*> DeclarationList<C> for ($a, $($t,)*)
+        where
+            ($($t,)*): DeclarationList<<C as Insert<$a>>::Out>,
+        {
+            type Out = <($($t,)*) as DeclarationList<<C as Insert<$a>>::Out>>::Out;
+        }
+        declaration_list!($($t),*);
+    };
+    () => {};
+}
+declaration_list!(A, B, D, E, F, G, H, I, J, K, L, M, N, O, P, Q);
 
 /// Relation `R` installed in a builder: its components now, its hooks at
 /// `build`, for the final world.

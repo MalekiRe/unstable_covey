@@ -131,3 +131,26 @@ fn plugins_build_systems_of_every_kind_for_the_app_world() {
         ["hp added x1", "hp added x1", "child alive: false"].repeat(3)
     );
 }
+
+#[test]
+fn plugins_choose_storage_for_their_components() {
+    struct Hot(u32);
+    struct Cold(u32);
+    struct Flag;
+    struct Tuned;
+    impl Plugin for Tuned {
+        type Components = (Hot, Cold, Flag);
+        type Storage = (Components<Hot, true>, Sparse<Flag>);
+        fn systems<S: Storage>(self) -> impl Systems<S> {
+            schedule((), |mut q: Query<&mut Hot, Changed<Cold>>| q.iter_mut().for_each(|mut h| h.0 += 1))
+        }
+    }
+    fn storage<S: Storage + Stores<Hot> + Stores<Cold> + Stores<Flag>>(_: &World<S>) -> [bool; 3] {
+        [<S as Stores<Hot>>::SUMMARY, <S as Stores<Cold>>::SUMMARY, <S as Stores<Flag>>::SPARSE]
+    }
+    let mut app = App::new().add_plugins(Tuned).build();
+    assert_eq!(storage(&app.world), [true, false, true]);
+    let e = app.world.spawn_bundle((Hot(0), Cold(0), Flag));
+    app.emit(&());
+    assert_eq!(app.world.get::<Hot>(e).unwrap().0, 1);
+}
