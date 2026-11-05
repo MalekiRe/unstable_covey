@@ -1,5 +1,7 @@
 //! Hot paths of tasks allocate nothing once warm: an idle task's visit, and a
-//! bridge through reusable state.
+//! bridge through reusable state. Devtools record every tick and frame, so
+//! they allocate by design.
+#![cfg(not(feature = "devtools"))]
 use static_ecs::prelude::*;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

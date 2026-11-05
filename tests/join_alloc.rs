@@ -1,5 +1,7 @@
 //! Joins allocate nothing once warm: every join shape, both storages, the
 //! closure and lending forms, and `cascade` through its reused order buffer.
+//! Devtools record every tick and frame, so they allocate by design.
+#![cfg(not(feature = "devtools"))]
 use static_ecs::prelude::*;
 use static_ecs::{From, To};
 use std::alloc::{GlobalAlloc, Layout, System};

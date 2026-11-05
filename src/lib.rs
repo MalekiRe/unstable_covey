@@ -5,6 +5,7 @@
     associated_type_defaults,
     impl_trait_in_assoc_type
 )]
+#![cfg_attr(feature = "devtools", feature(type_info, const_cmp, const_trait_impl))]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod access;
@@ -12,6 +13,8 @@ mod bridge;
 mod change;
 mod column;
 mod command;
+#[cfg(feature = "devtools")]
+pub mod devtools;
 mod disabled;
 mod dispatch;
 mod executor;

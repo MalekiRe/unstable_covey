@@ -40,6 +40,7 @@ pub trait Schedule: Sized + 'static {
 #[doc(hidden)]
 pub trait Route {
     type Place<E: Schedule, P: Shape<Output = (), In = E::In>>;
+    #[cfg_attr(feature = "devtools", track_caller)]
     fn place<E: Schedule, P: Shape<Output = (), In = E::In>>(systems: P) -> Self::Place<E, P>;
 }
 /// Fired by `App::emit`: systems join the app's frame.
@@ -51,6 +52,8 @@ impl Route for Emitted {
         On {
             handler: Run(systems),
             marker: PhantomData,
+            #[cfg(feature = "devtools")]
+            location: std::panic::Location::caller(),
         }
     }
 }
@@ -100,6 +103,7 @@ impl<E: Schedule, A, B, C, F: FnOnce(A, B, C) -> E> Label<E, fn(A, B, C)> for F 
 /// An installable registration, e.g. returned by a plugin:
 /// `.add_plugins(schedule(Click, count_clicks))` equals
 /// `.add_systems(Click, count_clicks)`.
+#[cfg_attr(feature = "devtools", track_caller)]
 pub fn schedule<E, X, LM, P, M>(_: X, systems: P) -> Placed<E, P::Systems>
 where
     E: Schedule,
@@ -117,6 +121,9 @@ pub struct Cons<H, T>(pub(crate) H, pub(crate) T);
 pub struct On<E: 'static, H> {
     handler: H,
     marker: PhantomData<fn(E)>,
+    /// Where it was registered.
+    #[cfg(feature = "devtools")]
+    location: &'static std::panic::Location<'static>,
 }
 
 pub trait Handle<E, S> {
@@ -148,6 +155,14 @@ pub trait Handle<E, S> {
     ) -> Tail<S, R>
     where
         S: Send + Sync + SystemWorld;
+    /// Present the handler's systems to a devtools traversal.
+    #[cfg(feature = "devtools")]
+    #[doc(hidden)]
+    fn inspect(&mut self, _visitor: &mut dyn crate::devtools::Visitor<S>)
+    where
+        S: SystemWorld,
+    {
+    }
 }
 
 pub struct Run<P>(P);
@@ -199,6 +214,10 @@ impl<E: Schedule, S: SystemWorld, P: System<S, Output = (), In = E::In>> Handle<
             assert!(P::VALID, "invalid system access");
         }
         unsafe { P::enter::<R, Within<Path>, K>(context, flow) }
+    }
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>) {
+        self.0.inspect(visitor);
     }
 }
 
@@ -573,15 +592,47 @@ plugin_tuples!(P0 1 P1 2 P2 3 P3 4 P4 5 P5 6 P6 7 P7 8 P8 9 P9 10 P10 11 P11 12 
 #[doc(hidden)]
 pub trait Fits<W> {
     const VALID: bool;
+    /// Present every registration, in dispatch order, to a devtools traversal.
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, _visitor: &mut dyn crate::devtools::Visitor<W>)
+    where
+        W: SystemWorld,
+    {
+    }
 }
 impl<W> Fits<W> for Nil {
     const VALID: bool = true;
 }
 impl<W, H: Fits<W>, T: Fits<W>> Fits<W> for Cons<H, T> {
     const VALID: bool = H::VALID && T::VALID;
+    /// The tail holds earlier registrations, which dispatch first.
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<W>)
+    where
+        W: SystemWorld,
+    {
+        self.1.inspect(visitor);
+        self.0.inspect(visitor);
+    }
 }
 impl<W, E: 'static, H: Handle<E, W>> Fits<W> for On<E, H> {
     const VALID: bool = H::VALID;
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<W>)
+    where
+        W: SystemWorld,
+    {
+        let registration = crate::devtools::Registration {
+            label: std::any::TypeId::of::<E>(),
+            name: std::any::type_name::<E>(),
+            location: self.location,
+            hook: false,
+        };
+        if visitor.registration(&registration) {
+            self.handler.inspect(visitor);
+        }
+        visitor.end_registration();
+    }
 }
 
 /// Composes plugins, systems, and hooks; `build` creates a world storing
@@ -593,6 +644,9 @@ pub struct AppBuilder<C = (), L = Nil, K = Nil, R = Nil> {
     resources: R,
     execution_mode: ExecutionMode,
     components: PhantomData<fn() -> C>,
+    /// Registration calls, for devtools' "why is this in my world".
+    #[cfg(feature = "devtools")]
+    registered: Vec<crate::devtools::Registered>,
 }
 
 impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
@@ -602,6 +656,7 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
     }
     /// Add a plugin or a tuple of plugins (up to 16, nested freely), applied
     /// left to right: `.add_plugins((Physics, Net { stats: &mut stats }))`.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn add_plugins<P: Plugins<C, L, K>>(
         self,
         plugins: P,
@@ -613,6 +668,8 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<P>(self.registered, "add_plugins"),
         }
     }
     /// Register systems under label `E`. Each takes `E`'s input first (none for
@@ -636,6 +693,7 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
     /// App::new().add_systems(Damage, |_: Query<&u32>| {});
     /// ```
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn add_systems<E: Schedule, X: Label<E, LM>, LM, P: IntoSystems<E::In, M>, M>(
         self,
         label: X,
@@ -656,12 +714,15 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: self.registered,
         }
     }
     /// Install relation `R`: its components `Relates<R>`/`Sources<R>` and the
     /// hooks keeping them consistent. Installing it again, here or from a
     /// plugin's `Relations`, changes nothing.
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn relation<Rel: InstallRelation<C, K>>(
         self,
     ) -> AppBuilder<
@@ -676,6 +737,8 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<Rel>(self.registered, "relation"),
         }
     }
     /// Store `T` even though no system queries it, e.g. a tag that is only
@@ -688,6 +751,7 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
     /// let entity = app.world.spawn();
     /// app.world.insert(entity, Tag); // never used or registered
     /// ```
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn register<T: 'static>(self) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K, R>
     where
         C: Insert<Components<T>>,
@@ -698,6 +762,8 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<T>(self.registered, "register"),
         }
     }
     /// Choose a component's storage: `Sparse<T>`, or `Components<T, true>` for
@@ -711,6 +777,7 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
     ///     .storage::<Sparse<Tag>>() // too late: Tag is already dense
     ///     .build();
     /// ```
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn storage<D: Declaration>(self) -> AppBuilder<<C as Insert<D>>::Out, L, K, R>
     where
         C: Insert<D>,
@@ -729,11 +796,14 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: self.resources,
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<D::Component>(self.registered, "storage"),
         }
     }
     /// Insert resource `T` at `build`, after hooks are installed, so its
     /// `OnAdd`/`OnInsert` hooks run; resources apply in the order given.
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn insert_resource<T: Send + 'static>(
         self,
         value: T,
@@ -747,10 +817,13 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: Cons(InsertResource(value), self.resources),
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<T>(self.registered, "insert_resource"),
         }
     }
     /// Insert `T::default()` at `build` unless an earlier insert provided `T`.
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn init_resource<T: Default + Send + 'static>(
         self,
     ) -> AppBuilder<<C as Insert<Components<T>>>::Out, L, K, Cons<InitResource<T>, R>>
@@ -763,11 +836,14 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: Cons(InitResource(PhantomData), self.resources),
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<T>(self.registered, "init_resource"),
         }
     }
     /// Enter `state` at `build`, after hooks are installed, so its `OnEnter`
     /// hooks and substates run.
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn init_state<T: State>(
         self,
         state: T,
@@ -781,12 +857,15 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: Cons(InitState(state), self.resources),
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<T>(self.registered, "init_state"),
         }
     }
     /// Substate group of `Sub`: entered as `Sub::default()` after parent state
     /// `P` is entered, exited before `P` exits. Setting a state of the group
     /// while `P` is inactive is ignored (a debug panic).
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn add_sub_state<P: State, Sub: State + Default>(
         self,
     ) -> AppBuilder<
@@ -805,11 +884,14 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: Cons(SubState(PhantomData), self.resources),
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<Sub>(self.registered, "add_sub_state"),
         }
     }
     /// Computed state group of `X`: whenever parent state `P` is entered,
     /// `compute(&p)` enters its result (if any); exited before `P` exits.
     #[allow(clippy::type_complexity)]
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn add_computed_state<P: State, X: State>(
         self,
         compute: fn(&P) -> Option<X>,
@@ -829,6 +911,8 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
             resources: Cons(ComputedState(compute), self.resources),
             execution_mode: self.execution_mode,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: crate::devtools::noted::<X>(self.registered, "add_computed_state"),
         }
     }
     /// Create the world, which owns the hooks. Plugins build their systems
@@ -856,11 +940,21 @@ impl<C: Storage, L, K, R: Setup<C>> AppBuilder<C, L, K, R> {
         }
         self.resources.link(&mut world);
         self.resources.apply(&mut world);
-        App {
+        #[cfg_attr(not(feature = "devtools"), expect(unused_mut))]
+        let mut app = App {
             world,
             listeners,
             execution_mode: self.execution_mode,
-        }
+            #[cfg(feature = "devtools")]
+            stepping: Default::default(),
+            #[cfg(feature = "devtools")]
+            snapshots: Default::default(),
+            #[cfg(feature = "devtools")]
+            registered: self.registered,
+        };
+        #[cfg(feature = "devtools")]
+        crate::devtools::step::register(&mut app);
+        app
     }
 }
 /// A builder's setup for the built world, oldest first: every state link,
@@ -928,8 +1022,17 @@ fn is_empty<S: Storage, K: HookList<S>>(_: &K) -> bool {
 /// A built app: a world with its inferred component set `S`, and every handler.
 pub struct App<S: Storage, L = Nil> {
     pub world: World<S>,
-    listeners: L,
-    execution_mode: ExecutionMode,
+    pub(crate) listeners: L,
+    pub(crate) execution_mode: ExecutionMode,
+    /// Position of a devtools step pass.
+    #[cfg(feature = "devtools")]
+    pub(crate) stepping: crate::devtools::step::Stepping,
+    /// Automatic devtools snapshots.
+    #[cfg(feature = "devtools")]
+    pub(crate) snapshots: crate::devtools::snapshot::Snapshots<S>,
+    /// The builder's registration calls.
+    #[cfg(feature = "devtools")]
+    pub(crate) registered: Vec<crate::devtools::Registered>,
 }
 
 impl App<()> {
@@ -942,6 +1045,8 @@ impl App<()> {
             resources: Nil,
             execution_mode: ExecutionMode::Parallel,
             components: PhantomData,
+            #[cfg(feature = "devtools")]
+            registered: Vec::new(),
         }
     }
 }
@@ -958,6 +1063,8 @@ impl<S: Storage, L> App<S, L> {
         E::In: FromEvent<E>,
         L: Dispatch<E, World<S>>,
     {
+        #[cfg(feature = "devtools")]
+        crate::devtools::emitted::<E>();
         let input = <E::In as FromEvent<E>>::of(event);
         let input = (&raw const input).cast();
         // SAFETY: `input` is `E`'s input and outlives the frame.
@@ -970,5 +1077,9 @@ impl<S: Storage, L> App<S, L> {
         self.listeners
             .defer(unsafe { &mut *<World<S> as SystemWorld>::queue(&mut self.world) });
         self.world.flush();
+        #[cfg(feature = "devtools")]
+        self.world.record_frame(std::any::type_name::<E>());
+        #[cfg(feature = "devtools")]
+        self.snapshots.after_frame(&self.world);
     }
 }

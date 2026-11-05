@@ -115,8 +115,12 @@ impl Deref for Trigger<'_> {
 pub struct Hook<E, P> {
     systems: P,
     event: PhantomData<fn(E)>,
+    /// Where it was registered.
+    #[cfg(feature = "devtools")]
+    location: &'static std::panic::Location<'static>,
 }
 impl<E, P: Shape<Output = ()>> Hook<E, P> {
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub(crate) fn new(systems: P) -> Self {
         const {
             assert!(
@@ -127,6 +131,8 @@ impl<E, P: Shape<Output = ()>> Hook<E, P> {
         Self {
             systems,
             event: PhantomData,
+            #[cfg(feature = "devtools")]
+            location: std::panic::Location::caller(),
         }
     }
 }
@@ -146,6 +152,11 @@ pub trait HookList<S: Storage> {
     fn register<Root: HookList<S>>(table: &mut [[Option<Entry<S>>; KINDS]]);
     /// Fragmenting relations as (pair id, linked).
     fn relations(_: &mut Vec<(usize, bool)>) {}
+    /// Present every hook, in firing order, to a devtools traversal.
+    /// # Safety
+    /// `this` is a live hook list, exclusively borrowed.
+    #[cfg(feature = "devtools")]
+    unsafe fn inspect(_this: *mut Self, _visitor: &mut dyn crate::devtools::Visitor<World<S>>) {}
 }
 impl<S: Storage> HookList<S> for Nil {
     const VALID: bool = true;
@@ -173,6 +184,13 @@ impl<S: Storage, A: HookList<S>, B: HookList<S>> HookList<S> for Cons<A, B> {
         B::relations(relations);
         A::relations(relations);
     }
+    #[cfg(feature = "devtools")]
+    unsafe fn inspect(this: *mut Self, visitor: &mut dyn crate::devtools::Visitor<World<S>>) {
+        unsafe {
+            B::inspect(Cons::right(this), visitor);
+            A::inspect(Cons::left(this), visitor);
+        }
+    }
 }
 impl<S, E, P> HookList<S> for Hook<E, P>
 where
@@ -197,6 +215,20 @@ where
         }
         table[<S as ComponentLookup<E::Component>>::INDEX][E::Kind::INDEX] =
             Some(every::<S, Root, Canonical<E>>);
+    }
+    #[cfg(feature = "devtools")]
+    unsafe fn inspect(this: *mut Self, visitor: &mut dyn crate::devtools::Visitor<World<S>>) {
+        let this = unsafe { &mut *this };
+        let registration = crate::devtools::Registration {
+            label: std::any::TypeId::of::<E>(),
+            name: std::any::type_name::<E>(),
+            location: this.location,
+            hook: true,
+        };
+        if visitor.registration(&registration) {
+            this.systems.inspect(visitor);
+        }
+        visitor.end_registration();
     }
 }
 /// Run a hook serially on the world's clock, then move its commands to the
@@ -227,6 +259,9 @@ pub(crate) struct HookTable<S: Storage> {
     hooked: Box<[usize]>,
     /// Fragmenting relations as (pair id, linked), for despawn cascades.
     relations: Box<[(usize, bool)]>,
+    /// The hook list's devtools traversal.
+    #[cfg(feature = "devtools")]
+    inspect: unsafe fn(NonNull<u8>, &mut dyn crate::devtools::Visitor<World<S>>),
 }
 // The hook list is Send + Sync (checked where it is installed).
 unsafe impl<S: Storage> Send for HookTable<S> {}
@@ -235,6 +270,13 @@ impl<S: Storage> HookTable<S> {
     pub(crate) fn new<H: HookList<S> + Send + Sync + 'static>(hooks: H) -> Self {
         unsafe fn drop_hooks<H>(hooks: NonNull<u8>) {
             drop(unsafe { Box::from_raw(hooks.cast::<H>().as_ptr()) });
+        }
+        #[cfg(feature = "devtools")]
+        unsafe fn inspect_hooks<S: Storage, H: HookList<S>>(
+            hooks: NonNull<u8>,
+            visitor: &mut dyn crate::devtools::Visitor<World<S>>,
+        ) {
+            unsafe { H::inspect(hooks.cast::<H>().as_ptr(), visitor) };
         }
         let mut entries = vec![[None; KINDS]; S::LEN].into_boxed_slice();
         H::register::<H>(&mut entries);
@@ -249,6 +291,8 @@ impl<S: Storage> HookTable<S> {
             entries,
             hooked,
             relations: relations.into(),
+            #[cfg(feature = "devtools")]
+            inspect: inspect_hooks::<S, H>,
         }
     }
     /// The runner for kind `K` of component `index`, if any hook listens.
@@ -261,6 +305,13 @@ impl<S: Storage> HookTable<S> {
     }
     pub(crate) fn relations(&self) -> &[(usize, bool)] {
         &self.relations
+    }
+    /// Present every hook to a devtools traversal.
+    /// # Safety
+    /// No hook is running.
+    #[cfg(feature = "devtools")]
+    pub(crate) unsafe fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<World<S>>) {
+        unsafe { (self.inspect)(self.hooks, visitor) };
     }
 }
 impl<S: Storage> Drop for HookTable<S> {

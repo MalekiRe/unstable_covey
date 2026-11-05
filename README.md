@@ -574,6 +574,75 @@ on tokio and inserts the responses while frames keep running.
 - **Panics** cancel unpublished work; `emit` resumes the first panic after
   every published branch finished. The pool stays usable.
 
+## Devtools
+
+Built for agents (and people) debugging a running app. Enable the `devtools`
+feature; without it none of this exists, and the generated code is
+instruction-for-instruction what it was (checked on every example binary).
+
+- **Change reporting**: every change tick is unique and remembers who issued
+  it: a system, the commands a system queued (with the queuing line), a
+  direct `World` call (with its file:line), a task, or a devtools edit.
+  `world.changes_since(tick)` lists live rows with their writers.
+- **History**: each `emit` records the values that changed (described
+  through `Debug`, or through compile-time reflection of their fields when
+  there is none) and every structural event. `world.timeline(entity)`
+  replays an entity's life, despawn included; `world.history()` answers
+  questions over frames: `value_at`, `first`, `when` (runs of frames where a
+  condition held), and response checks (whenever A, then B within N frames).
+  Conditions are text: `x < 3 && y > 0`, `== Idle`.
+- **Provenance**: `world.explain(entity, "Hp", depth)` says which system
+  wrote a value, what that system reads on the same entity, and who wrote
+  those, frame by frame back.
+- **"Why" questions**: `app.why_not(system, entity)` names, per query, the
+  missing component, the rejecting filter, the unmentioned `Disabling`
+  component, or the change window; `app.why_component("Wings")` lists the
+  systems using it, the components requiring it, and the builder calls that
+  stored it; `app.why_order(a, b)` names the chain, parallel group, graph, or
+  registration order between two systems.
+- **Stepping**: `app.step(&Update)` runs one system, run condition, or task
+  of the label's pass at a time, reporting what it changed; the pass applies
+  its commands when it ends, as `emit` would.
+- **Time travel**: `app.set_auto_snapshots(every, keep)` snapshots the world
+  (components that are `Clone`, or have no drop glue); `app.rewind(frame)`
+  restores one; `app.fork()` and `app.in_fork(&mut fork, |app| …)` run ahead
+  in a copy with the app's own systems; `world.diff(other)` compares.
+- **Task console**: `app.tasks()` shows each task's state, the label its
+  bridge waits for, polls, wakes, and how long it has been idle.
+- **Edits**: `world.set_field(entity, "Armor", "value", "7")` writes a scalar
+  field in place, like a debugger: only inside plain structs, never
+  `Immutable` components.
+- **Assembly per system**: from a binary built with
+  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only` (code generation unchanged),
+  `devtools::asm::system(binary, "game::integrate")` (or `file.rs:LINE` for a
+  closure) collects every instruction whose inline chain passes through the
+  system, and `asm::diff(before, after, …)` diffs two builds.
+
+### MCP server
+
+All of the above is served to agents over the Model Context Protocol, on the
+app's own thread between frames:
+
+```rust,ignore
+let mut tools = static_ecs::devtools::mcp::Session::unix("/tmp/game.sock")?;
+tools.label("Update", Update); // agents may emit and step it
+loop {
+    tools.pump(&mut app); // serves requests; blocks while an agent pauses
+    app.emit(&Update);
+}
+```
+
+Point the agent at `static-ecs-mcp /tmp/game.sock` (the
+[`tools/mcp-bridge`](tools/mcp-bridge) crate relays stdio to the socket), or
+use `Session::stdio()` when the app does not print. `Session::serve` hands
+the loop to the agent instead. Tools disclose progressively: `overview` first,
+then `systems`, `entities`, `entity`, `changes`, `explain`, `timeline`,
+`history`, `why_not`, `why_component`, `why_order`, `tasks`, `step`, `emit`,
+`pause`/`resume`, `snapshot`/`rewind`, `what_if` (edits run in one fork, not
+in another, and the two are diffed), `set`, and `asm`. Lists page with
+`offset`/`limit` and say how to go deeper; entities are `12v0`, systems `#3`.
+[`examples/devtools.rs`](examples/devtools.rs) is a complete session.
+
 ## Tradeoffs
 
 - **Nightly only**, on incomplete language features.

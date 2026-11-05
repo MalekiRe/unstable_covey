@@ -103,9 +103,15 @@ impl ChangeWindow {
 /// Issue the tick after `latest`. Ticks stay below 2^63 so a frame's flow can
 /// pack its executed bit beside the clock.
 #[inline]
+#[cfg(not(feature = "devtools"))]
 pub(crate) fn next(latest: u64) -> u64 {
     assert!(latest < u64::MAX >> 1, "world change clock exhausted");
     latest + 1
+}
+/// With devtools, ticks are unique process-wide and remember their writer.
+#[cfg(feature = "devtools")]
+pub(crate) fn next(latest: u64) -> u64 {
+    crate::devtools::issue(latest)
 }
 
 /// Change ticks form a Lamport clock: systems receive the clock along their

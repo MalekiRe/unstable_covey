@@ -26,6 +26,17 @@ pub struct Entity {
     slot: u32,
     generation: u32,
 }
+#[cfg(feature = "devtools")]
+impl Entity {
+    /// Its slot in the world's entity index.
+    pub fn index(self) -> u32 {
+        self.slot
+    }
+    /// How often its slot was reused before it.
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
+}
 /// Reserves entities from a frame without structural access.
 pub(crate) struct Reserve<'a> {
     world: u64,
@@ -89,6 +100,10 @@ pub trait Storage: sealed::Sealed + Default + Send + Sync + 'static {
     const POINTS: usize = 0;
     #[doc(hidden)]
     fn describe(output: &mut Vec<Info>);
+    /// Each component's transitive requirements in world `W`, in index order.
+    #[cfg(feature = "devtools")]
+    #[doc(hidden)]
+    fn requirements<W: Storage>(_output: &mut Vec<Vec<usize>>) {}
 }
 impl Storage for () {
     const LEN: usize = 0;
@@ -102,6 +117,12 @@ macro_rules! schema {
             const HAS_SPARSE: bool = $sparse;
             fn describe(output: &mut Vec<Info>) {
                 output.push(Info::of::<T>($sparse, SUMMARY));
+            }
+            #[cfg(feature = "devtools")]
+            fn requirements<W: Storage>(output: &mut Vec<Vec<usize>>) {
+                let mut required = Vec::new();
+                <T as crate::require::MaybeRequires<W>>::collect(&mut required);
+                output.push(required.iter().map(|r| r.index).collect());
             }
         }
     };
@@ -122,11 +143,17 @@ impl<A: Storage, B: Storage> Storage for (A, B) {
         A::describe(output);
         B::describe(output);
     }
+    #[cfg(feature = "devtools")]
+    fn requirements<W: Storage>(output: &mut Vec<Vec<usize>>) {
+        A::requirements::<W>(output);
+        B::requirements::<W>(output);
+    }
 }
 
 /// Multi-component transitions, keyed by source table and a bundle's
 /// compile-time key. Open addressing; entries verify their exact index list.
 #[derive(Default)]
+#[cfg_attr(feature = "devtools", derive(Clone))]
 struct Transitions {
     slots: Box<[Option<Transition>]>,
     len: usize,
@@ -340,6 +367,7 @@ struct Location {
     table: usize,
     row: usize,
 }
+#[cfg_attr(feature = "devtools", derive(Clone, Copy))]
 struct Slot {
     generation: u32,
     location: Option<Location>,
@@ -432,6 +460,7 @@ struct Archetype {
 /// Inserting a resolving bundle from one archetype: its destination, the
 /// required components it lacks there (written as `Default`), and the
 /// components sharing a `OneOf` group with what it adds (removed).
+#[cfg_attr(feature = "devtools", derive(Clone))]
 struct InsertMove {
     key: u64,
     indices: &'static [usize],
@@ -447,7 +476,7 @@ pub struct World<S: Storage> {
     free_count: usize,
     pub(crate) tables: Vec<Table>,
     pub(crate) component_tables: Vec<Vec<usize>>,
-    info: Vec<Info>,
+    pub(crate) info: Vec<Info>,
     dense: Vec<Store>,
     /// Each dense store's pairs: entities with different targets never share rows.
     dense_targets: Vec<Pairs>,
@@ -465,7 +494,7 @@ pub struct World<S: Storage> {
     /// Commands from hooks and finished systems, applied by `flush`.
     queue: CommandQueue<S>,
     pub(crate) flushing: bool,
-    hooks: Option<HookTable<S>>,
+    pub(crate) hooks: Option<HookTable<S>>,
     /// Request queues of the schema's sync points; dropping closes them.
     pub(crate) points: Points<S>,
     /// The entity holding every resource, made by the first insert.
@@ -473,6 +502,9 @@ pub struct World<S: Storage> {
     /// Substates and computed states, in registration order.
     pub(crate) state_links: Vec<crate::state::Link<S>>,
     schema: PhantomData<S>,
+    /// Recorded history, for devtools.
+    #[cfg(feature = "devtools")]
+    pub(crate) devtools: crate::devtools::history::Recorder,
 }
 impl<S: Storage> Default for World<S> {
     fn default() -> Self {
@@ -511,6 +543,8 @@ impl<S: Storage> World<S> {
             resources: None,
             state_links: Vec::new(),
             schema: PhantomData,
+            #[cfg(feature = "devtools")]
+            devtools: Default::default(),
         };
         world.add_table(vec![false; S::LEN], Box::new([]), false);
         world
@@ -806,7 +840,7 @@ impl<S: Storage> World<S> {
         let (table, row) = self.locator().find(entity)?;
         Some(Location { table, row })
     }
-    fn locator(&self) -> Locator<'_> {
+    pub(crate) fn locator(&self) -> Locator<'_> {
         Locator {
             world: self.id,
             slots: &self.locations,
@@ -1192,7 +1226,10 @@ impl<S: Storage> World<S> {
         self.dying.pop();
     }
     /// Spawn directly into the bundle's archetype; no declaration needed.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn spawn_bundle<B: Bundle<S>>(&mut self, bundle: B) -> Entity {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::world_call();
         Self::check_insert::<B>();
         self.flush_reserved();
         let (table, entry) = self.adding::<B>(0);
@@ -1228,10 +1265,13 @@ impl<S: Storage> World<S> {
     }
     /// One destination, reservation, and timestamp per batch. A panicking iterator
     /// leaves its completed prefix live; unknown-length iterators grow amortized.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn spawn_batch<I: IntoIterator>(&mut self, bundles: I) -> Vec<Entity>
     where
         I::Item: Bundle<S>,
     {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::world_call();
         Self::check_insert::<I::Item>();
         self.flush_reserved();
         let mut bundles = bundles.into_iter();
@@ -1294,8 +1334,13 @@ impl<S: Storage> World<S> {
         }
         self.locations[entity.slot as usize].location = Some(Location { table, row });
         self.refresh_len(table);
+        #[cfg(feature = "devtools")]
+        self.devtools.moved(entity, None, Some(table), self.clock);
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn spawn(&mut self) -> Entity {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::world_call();
         self.flush_reserved();
         self.reserve_slots(1);
         self.reserve_rows(0, 1, true);
@@ -1311,6 +1356,8 @@ impl<S: Storage> World<S> {
         self.dense[dense].entities.push(entity);
         self.locations[entity.slot as usize].location = Some(Location { table: 0, row });
         self.refresh_len(0);
+        #[cfg(feature = "devtools")]
+        self.devtools.moved(entity, None, Some(0), self.clock);
         entity
     }
     fn physical_row(&self, location: Location) -> usize {
@@ -1390,6 +1437,9 @@ impl<S: Storage> World<S> {
             self.detach_sparse(location);
             self.archetypes[destination].sparse.entities.push(entity);
         }
+        #[cfg(feature = "devtools")]
+        self.devtools
+            .moved(entity, Some(location.table), Some(destination), self.clock);
         self.locations[entity.slot as usize].location = Some(Location {
             table: destination,
             row,
@@ -1399,7 +1449,10 @@ impl<S: Storage> World<S> {
     }
     /// Replace/insert every bundle component with at most one dense migration.
     /// Returns the previous values, one Option per tuple member.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn insert_bundle<B: Bundle<S>>(&mut self, entity: Entity, bundle: B) -> B::Replaced {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::world_call();
         Self::check_insert::<B>();
         let location = self
             .location(entity)
@@ -1445,7 +1498,10 @@ impl<S: Storage> World<S> {
         replaced
     }
     /// Remove all present members with one transition; absent members return None.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn remove_bundle<B: Bundle<S>>(&mut self, entity: Entity) -> B::Replaced {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::world_call();
         Self::check_bundle::<B>();
         let Some(location) = self.location(entity) else {
             return B::Replaced::init();
@@ -1460,12 +1516,14 @@ impl<S: Storage> World<S> {
         self.settle();
         removed
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn insert<T: 'static>(&mut self, entity: Entity, value: T) -> Option<T>
     where
         S: ComponentLookup<T>,
     {
         self.insert_bundle(entity, (value,)).0
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn remove<T: 'static>(&mut self, entity: Entity) -> Option<T>
     where
         S: ComponentLookup<T>,
@@ -1503,11 +1561,14 @@ impl<S: Storage> World<S> {
         self.dense[dense].entities.push(entity);
         self.locations[entity.slot as usize].location = Some(Location { table, row });
         self.refresh_len(table);
+        #[cfg(feature = "devtools")]
+        self.devtools.moved(entity, None, Some(table), self.clock);
         self.resources = Some(entity);
         entity
     }
     /// Insert or replace resource `T`, returning the previous value. Its
     /// hooks run as for any component.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn insert_resource<T: 'static>(&mut self, value: T) -> Option<T>
     where
         S: ComponentLookup<T>,
@@ -1517,6 +1578,7 @@ impl<S: Storage> World<S> {
         self.insert(entity, value)
     }
     /// Insert `T::default()` unless resource `T` exists.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn init_resource<T: Default + 'static>(&mut self)
     where
         S: ComponentLookup<T>,
@@ -1525,6 +1587,7 @@ impl<S: Storage> World<S> {
             self.insert_resource(T::default());
         }
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn remove_resource<T: 'static>(&mut self) -> Option<T>
     where
         S: ComponentLookup<T>,
@@ -1538,6 +1601,7 @@ impl<S: Storage> World<S> {
     {
         self.get(self.resources?)
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn resource_mut<T: 'static>(&mut self) -> Option<Mut<'_, T>>
     where
         S: ComponentLookup<T>,
@@ -1574,6 +1638,7 @@ impl<S: Storage> World<S> {
         }
         Some(unsafe { &*table.columns[S::INDEX].value::<T>(location.row) })
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn get_mut<T: 'static>(&mut self, entity: Entity) -> Option<Mut<'_, T>>
     where
         S: ComponentLookup<T>,
@@ -1587,6 +1652,7 @@ impl<S: Storage> World<S> {
         self.links_mut(entity)
     }
     /// `get_mut` past the link gate, for relating.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub(crate) fn links_mut<T: 'static>(&mut self, entity: Entity) -> Option<Mut<'_, T>>
     where
         S: ComponentLookup<T>,
@@ -1601,6 +1667,8 @@ impl<S: Storage> World<S> {
         if !self.tables[location.table].present[S::INDEX] {
             return None;
         }
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::world_call();
         let tick = self.change_tick();
         let column = self.tables[location.table].columns[S::INDEX];
         Some(unsafe {
@@ -1612,7 +1680,10 @@ impl<S: Storage> World<S> {
             )
         })
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn despawn(&mut self, entity: Entity) -> bool {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::world_call();
         if self.location(entity).is_none() {
             return false;
         }
@@ -1621,6 +1692,9 @@ impl<S: Storage> World<S> {
         let location = self.location(entity).unwrap();
         self.fire_present::<Replace>(entity, location.table);
         self.fire_present::<Remove>(entity, location.table);
+        #[cfg(feature = "devtools")]
+        self.devtools
+            .moved(entity, Some(location.table), None, self.clock);
         let dense = self.archetypes[location.table].dense;
         let physical = self.physical_row(location);
         unsafe { self.dense[dense].prepare_drop(physical) };
@@ -1665,6 +1739,125 @@ impl<S: Storage> World<S> {
     }
     pub(crate) fn latest_tick(&self) -> u64 {
         self.clock
+    }
+    /// The identity query caches are keyed by: the world's id, plus (with
+    /// devtools) how many times its contents were replaced wholesale.
+    #[inline]
+    pub(crate) unsafe fn cache_id(world: *mut Self) -> u64 {
+        #[cfg(not(feature = "devtools"))]
+        return unsafe { (*world).id };
+        #[cfg(feature = "devtools")]
+        return unsafe { (*world).id ^ (*world).devtools.epoch.rotate_left(32) };
+    }
+}
+#[cfg(feature = "devtools")]
+impl<S: Storage> World<S> {
+    /// The live entity at `index` with `generation`, if any.
+    pub fn entity_at(&self, index: u32, generation: u32) -> Option<Entity> {
+        let entity = Entity {
+            world: self.id,
+            slot: index,
+            generation,
+        };
+        self.contains(entity).then_some(entity)
+    }
+    /// A deep copy without hooks or remote handles, sharing this world's id
+    /// (so entities stay valid in it). Every row must be clonable: types
+    /// that are `Clone`, or have no drop glue (copied bitwise).
+    pub(crate) fn duplicate(&self) -> Result<World<S>, &'static str> {
+        assert!(
+            self.queue.is_empty() && !self.flushing,
+            "snapshot with commands pending: flush first"
+        );
+        let dense = self
+            .dense
+            .iter()
+            .map(Store::duplicate)
+            .collect::<Result<Vec<_>, _>>()?;
+        let archetypes = self
+            .archetypes
+            .iter()
+            .map(|a| {
+                Ok(Archetype {
+                    dense: a.dense,
+                    sparse: a.sparse.duplicate()?,
+                    rows: a.rows.clone(),
+                    components: a.components.clone(),
+                    transitions: a.transitions.clone(),
+                    inserts: a.inserts.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, &'static str>>()?;
+        let tables = self
+            .tables
+            .iter()
+            .map(|t| Table {
+                present: t.present.clone(),
+                targets: t.targets.clone(),
+                resource: t.resource,
+                disabling: t.disabling.clone(),
+                entities: Entities {
+                    pointer: std::ptr::NonNull::dangling().as_ptr(),
+                    len: 0,
+                },
+                columns: Columns {
+                    map: t.columns.map.clone(),
+                    values: vec![ColumnPtr::default(); t.columns.values.len()],
+                },
+            })
+            .collect();
+        let mut copy = World {
+            id: self.id,
+            locations: self.locations.clone(),
+            free: self.free,
+            free_count: self.free_count,
+            tables,
+            component_tables: self.component_tables.clone(),
+            info: self.info.clone(),
+            dense,
+            dense_targets: self.dense_targets.clone(),
+            archetypes,
+            bundles: self.bundles.clone(),
+            pairs: self.pairs.clone(),
+            pair_moves: self.pair_moves.clone(),
+            dying: self.dying.clone(),
+            clock: self.clock,
+            reserved: AtomicU32::new(self.reserved.load(Ordering::Relaxed)),
+            queue: CommandQueue::default(),
+            flushing: false,
+            hooks: None,
+            points: Points::new(),
+            resources: self.resources,
+            state_links: self.state_links.clone(),
+            schema: PhantomData,
+            devtools: self.devtools.clone(),
+        };
+        for table in 0..copy.tables.len() {
+            copy.refresh(table);
+        }
+        Ok(copy)
+    }
+    /// Replace this world's contents with `other`'s, keeping this world's
+    /// hooks, remote handles, and history. Query caches start over.
+    pub(crate) fn replace_contents(&mut self, mut other: World<S>) {
+        self.flush();
+        std::mem::swap(&mut self.hooks, &mut other.hooks);
+        std::mem::swap(&mut self.points, &mut other.points);
+        std::mem::swap(&mut self.devtools, &mut other.devtools);
+        let epoch = self.devtools.epoch + 1;
+        *self = other;
+        self.devtools.epoch = epoch;
+    }
+    /// Swap whole contents with `other` (a fork), hooks and remote handles
+    /// staying here. Both worlds' query caches start over.
+    pub(crate) fn swap_contents(&mut self, other: &mut World<S>) {
+        self.flush();
+        std::mem::swap(self, other);
+        std::mem::swap(&mut self.hooks, &mut other.hooks);
+        std::mem::swap(&mut self.points, &mut other.points);
+        let epoch = self.devtools.epoch.max(other.devtools.epoch) + 1;
+        self.devtools.epoch = epoch;
+        other.devtools.epoch = epoch + 1;
     }
 }
 impl<S: Storage> SystemWorld for World<S> {

@@ -452,7 +452,10 @@ where
             scope.id, this.world.id,
             "a task awaited another world's bridge"
         );
+        #[cfg(not(feature = "devtools"))]
         let label = TypeId::of::<E>();
+        #[cfg(feature = "devtools")]
+        let label = crate::devtools::name_label::<E>();
         // A site runs once per visit: a loop around a bridge runs once per
         // emit, while a chain of different bridges completes in one.
         if scope.label != label || !scope.first_run(site::<F>()) {

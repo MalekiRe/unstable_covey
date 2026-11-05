@@ -24,27 +24,68 @@ pub struct Drives<P>(PhantomData<fn() -> P>);
 pub trait Access {
     const WRITES: bool;
     const EXCLUSIVE: bool = false;
+    /// The components this access touches, for devtools.
+    #[cfg(feature = "devtools")]
+    #[doc(hidden)]
+    fn touches(_joined: bool, _out: &mut Vec<crate::devtools::Touch>) {}
+}
+#[cfg(feature = "devtools")]
+fn touch<T: ?Sized>(
+    kind: crate::devtools::TouchKind,
+    joined: bool,
+    out: &mut Vec<crate::devtools::Touch>,
+) {
+    out.push(crate::devtools::Touch {
+        component: std::any::type_name::<T>(),
+        kind,
+        joined,
+    });
 }
 impl Access for () {
     const WRITES: bool = false;
 }
 impl<T> Access for Read<T> {
     const WRITES: bool = false;
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        touch::<T>(crate::devtools::TouchKind::Read, joined, out);
+    }
 }
 impl<T> Access for Write<T> {
     const WRITES: bool = true;
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        touch::<T>(crate::devtools::TouchKind::Write, joined, out);
+    }
 }
 impl Access for Exclusive {
     const WRITES: bool = true;
     const EXCLUSIVE: bool = true;
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        out.push(crate::devtools::Touch {
+            component: "the whole world",
+            kind: crate::devtools::TouchKind::Exclusive,
+            joined,
+        });
+    }
 }
 impl<A: Access, B: Access> Access for (A, B) {
     const WRITES: bool = A::WRITES || B::WRITES;
     const EXCLUSIVE: bool = A::EXCLUSIVE || B::EXCLUSIVE;
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        A::touches(joined, out);
+        B::touches(joined, out);
+    }
 }
 impl<A: Access, F> Access for Filtered<A, F> {
     const WRITES: bool = A::WRITES;
     const EXCLUSIVE: bool = A::EXCLUSIVE;
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        A::touches(joined, out);
+    }
 }
 impl<P> Access for Drives<P> {
     const WRITES: bool = false;
@@ -128,6 +169,10 @@ where
 pub struct Mentions<T>(PhantomData<fn() -> T>);
 impl<T: 'static> Access for Mentions<T> {
     const WRITES: bool = false;
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        touch::<T>(crate::devtools::TouchKind::Mention, joined, out);
+    }
 }
 impl<T> ValidAccess for Mentions<T> {
     const VALID: bool = true;
@@ -181,6 +226,12 @@ pub struct Union<A, B>(PhantomData<fn() -> (A, B)>);
 impl<A: Access, B: Access> Access for Union<A, B> {
     const WRITES: bool = A::WRITES || B::WRITES;
     const EXCLUSIVE: bool = A::EXCLUSIVE || B::EXCLUSIVE;
+    /// The second half reaches other entities through joins.
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        A::touches(joined, out);
+        B::touches(true, out);
+    }
 }
 impl<A: ValidAccess, B: ValidAccess> ValidAccess for Union<A, B> {
     const VALID: bool = A::VALID && B::VALID;
@@ -203,6 +254,11 @@ where
 pub struct QueryAccess<A, B>(PhantomData<fn() -> (A, B)>);
 impl<A: Access, B: Access> Access for QueryAccess<A, B> {
     const WRITES: bool = A::WRITES || B::WRITES;
+    #[cfg(feature = "devtools")]
+    fn touches(joined: bool, out: &mut Vec<crate::devtools::Touch>) {
+        A::touches(joined, out);
+        B::touches(joined, out);
+    }
 }
 impl<A: ValidAccess, B> ValidAccess for QueryAccess<A, B> {
     const VALID: bool = A::VALID;

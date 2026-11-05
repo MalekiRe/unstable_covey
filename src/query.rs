@@ -1,7 +1,7 @@
 use crate::{
     Entity, Storage, World,
     access::{Access, Conflict, Mentions, Read, Union, ValidAccess, Write},
-    change::{ChangeWindow, Mut, MutSlice, SystemWorld},
+    change::{ChangeWindow, Mut, MutSlice},
     filter::{FilterFor, QueryFilter, TableMatch},
     immutable::IsImmutable,
     init::Init,
@@ -220,6 +220,102 @@ fn admits<D: QueryData, F: QueryFilter>(
 pub(crate) fn reveals<Q: QueryData>(indices: &Q::Indices, table: &Table) -> bool {
     Q::matches(indices, &table.present) && table.shown(|component| Q::mentions(indices, component))
 }
+#[cfg(feature = "devtools")]
+impl<D: QueryData, F: QueryFilter> Query<'_, D, F> {
+    /// Why `entity` is not a row of this query in `window`; `None` if it is.
+    /// # Safety
+    /// The world is live and nothing runs.
+    pub(crate) unsafe fn why_not<S: Storage>(
+        world: *mut World<S>,
+        entity: Entity,
+        window: ChangeWindow,
+    ) -> Option<String>
+    where
+        D: FetchQuery<S>,
+        F: FilterFor<S>,
+    {
+        use crate::devtools::value::{short_name, short_type};
+        let world = unsafe { &*world };
+        let name = |i: usize| short_name(world.info[i].name);
+        let query = short_type(std::any::type_name::<Self>());
+        let Some((index, row)) = world.locator().find(entity) else {
+            return Some(format!("{query}: the entity is not alive"));
+        };
+        let table = &world.tables[index];
+        if table.resource {
+            return Some(format!(
+                "{query}: it holds the resources, which no query sees"
+            ));
+        }
+        let (indices, filter) = (D::INDICES, F::STATE);
+        let mut reasons = Vec::new();
+        for (i, &present) in table.present.iter().enumerate() {
+            if D::requires(&indices, i) && !present {
+                reasons.push(format!("lacks `{}`", name(i)));
+            }
+        }
+        if reasons.is_empty() && !D::matches(&indices, &table.present) {
+            reasons.push("its components do not match the query data".to_string());
+        }
+        if !F::matches(&filter, &table.present) {
+            let mut why = Vec::new();
+            for (i, &present) in table.present.iter().enumerate() {
+                if F::requires(&filter, i) && !present {
+                    why.push(format!("lacks `{}`", name(i)));
+                } else if F::mentions(&filter, i) && !F::requires(&filter, i) && present {
+                    why.push(format!("has `{}`", name(i)));
+                }
+            }
+            reasons.push(format!(
+                "filter `{}` rejects it ({})",
+                short_type(std::any::type_name::<F>()),
+                if why.is_empty() {
+                    "no alternative matches".to_string()
+                } else {
+                    why.join(", ")
+                }
+            ));
+        }
+        for &component in table.disabling.iter() {
+            if !D::mentions(&indices, component) && !F::mentions(&filter, component) {
+                reasons.push(format!(
+                    "has `{0}`, a Disabling component the query does not mention (add `MayHave<{0}>`)",
+                    name(component)
+                ));
+            }
+        }
+        if reasons.is_empty() {
+            // SAFETY: filters read only tick metadata of a live row.
+            let matched = unsafe {
+                match F::classify(&filter, table, window) {
+                    TableMatch::None => false,
+                    TableMatch::Maybe => F::row(&filter, table, row, window),
+                    TableMatch::All => true,
+                }
+            };
+            if !matched {
+                let ticks: Vec<String> = (0..S::LEN)
+                    .filter(|&i| F::mentions(&filter, i) && table.present[i])
+                    .map(|i| {
+                        let column = table.columns[i];
+                        // SAFETY: the row is live and holds column `i`.
+                        let (added, changed) =
+                            unsafe { (*column.added(row), *column.changed(row)) };
+                        format!("`{}` added at {added}, changed at {changed}", name(i))
+                    })
+                    .collect();
+                reasons.push(format!(
+                    "row filter `{}` rejects it: the system sees ticks in ({}, {}], and {}",
+                    short_type(std::any::type_name::<F>()),
+                    window.last,
+                    window.now,
+                    ticks.join(", ")
+                ));
+            }
+        }
+        (!reasons.is_empty()).then(|| format!("{query}: {}", reasons.join("; ")))
+    }
+}
 #[derive(Clone)]
 enum Tables<'a> {
     All(slice::Iter<'a, Table>),
@@ -304,7 +400,7 @@ impl<'w, D: QueryData, F: QueryFilter> Query<'w, D, F> {
         F: FilterFor<S>,
     {
         let mut query = unsafe { Self::from_world(world, window) };
-        let id = unsafe { World::<S>::world_id(world) };
+        let id = unsafe { World::<S>::cache_id(world) };
         let component_tables = unsafe { &(*world).component_tables };
         let state = state.0.get_or_insert_with(|| {
             Box::new(MatchingTables {

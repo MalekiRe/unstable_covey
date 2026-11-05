@@ -38,7 +38,22 @@ impl<S: Storage> Default for CommandQueue<S> {
     }
 }
 impl<S: Storage> CommandQueue<S> {
+    #[cfg(not(feature = "devtools"))]
+    #[inline(always)]
     fn push<C: FnOnce(&mut World<S>) + Send + 'static>(&mut self, command: C) {
+        self.enqueue(command);
+    }
+    /// Apply under the writer that queued it, located where it was queued.
+    #[cfg(feature = "devtools")]
+    #[track_caller]
+    fn push<C: FnOnce(&mut World<S>) + Send + 'static>(&mut self, command: C) {
+        let writer = crate::devtools::commands_writer(std::panic::Location::caller());
+        self.enqueue(move |world: &mut World<S>| {
+            let _writing = crate::devtools::writing(writer);
+            command(world)
+        });
+    }
+    fn enqueue<C: FnOnce(&mut World<S>) + Send + 'static>(&mut self, command: C) {
         unsafe fn apply<S: Storage, C: FnOnce(&mut World<S>)>(
             value: *mut MaybeUninit<u8>,
             world: Option<&mut World<S>>,
@@ -131,12 +146,14 @@ pub struct Commands<'a, S: Storage> {
 }
 impl<S: Storage> Commands<'_, S> {
     /// Spawn a bundle. The entity is reserved now and live once applied.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn spawn<B: Bundle<S> + Send + 'static>(&mut self, bundle: B) -> Entity {
         let entity = self.reserve.entity();
         self.queue
             .push(move |world: &mut World<S>| world.spawn_reserved(entity, bundle));
         entity
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn insert<B: Bundle<S> + Send + 'static>(&mut self, entity: Entity, bundle: B) {
         self.queue.push(move |world: &mut World<S>| {
             if world.contains(entity) {
@@ -144,16 +161,19 @@ impl<S: Storage> Commands<'_, S> {
             }
         });
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn remove<B: Bundle<S> + 'static>(&mut self, entity: Entity) {
         self.queue.push(move |world: &mut World<S>| {
             world.remove_bundle::<B>(entity);
         });
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn despawn(&mut self, entity: Entity) {
         self.queue.push(move |world: &mut World<S>| {
             world.despawn(entity);
         });
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn insert_resource<T: Send + 'static>(&mut self, value: T)
     where
         S: ComponentLookup<T>,
@@ -162,6 +182,7 @@ impl<S: Storage> Commands<'_, S> {
             world.insert_resource(value);
         });
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn remove_resource<T: 'static>(&mut self)
     where
         S: ComponentLookup<T>,
@@ -170,15 +191,18 @@ impl<S: Storage> Commands<'_, S> {
             world.remove_resource::<T>();
         });
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn set_state<T: State>(&mut self, state: T) {
         self.queue
             .push(move |world: &mut World<S>| world.set_state(state));
     }
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn clear_state<G: 'static>(&mut self) {
         self.queue
             .push(move |world: &mut World<S>| world.clear_state::<G>());
     }
     /// Any deferred change with exclusive world access.
+    #[cfg_attr(feature = "devtools", track_caller)]
     pub fn queue(&mut self, command: impl FnOnce(&mut World<S>) + Send + 'static) {
         self.queue.push(command);
     }

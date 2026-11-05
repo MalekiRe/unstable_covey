@@ -101,6 +101,17 @@ pub trait System<S>: Shape {
         S: SystemWorld,
     {
     }
+    /// Present this system's tree to a devtools traversal. Systems without
+    /// their own view are one opaque leaf.
+    #[cfg(feature = "devtools")]
+    #[doc(hidden)]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>)
+    where
+        S: SystemWorld,
+        Self: Sized,
+    {
+        visitor.leaf(&mut crate::devtools::step::Opaque(self));
+    }
 
     /// Run once with `input` against an exclusive world, then apply its
     /// commands. Systems without input take `NoInput`.
@@ -215,6 +226,9 @@ pub struct FunctionSystem<F, P, L, R, K = NoInput> {
     last_run: u64,
     last_world: u64,
     marker: Marker<P, R, K>,
+    /// Registry id, assigned at `build`.
+    #[cfg(feature = "devtools")]
+    id: u32,
 }
 /// Parameter, output, and input types, without owning any of them.
 type Marker<P, R, K> = PhantomData<fn() -> (P, R, K)>;
@@ -227,6 +241,8 @@ impl<F, P, L: Init, R, K> FunctionSystem<F, P, L, R, K> {
             last_run: 0,
             last_world: u64::MAX,
             marker: PhantomData,
+            #[cfg(feature = "devtools")]
+            id: 0,
         }
     }
 }
@@ -251,6 +267,8 @@ pub(crate) use accesses;
 /// Fetch every parameter, then call; shared by both function forms.
 macro_rules! invoke {
     ($this:ident, $world:ident, $clock:ident, |$args:ident| $call:expr; $($p:ident $i:tt),*) => {{
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::writing(crate::devtools::step::system_writer($this.id));
         let world_id = unsafe { S::world_id($world) };
         // Lamport clock: writers issue the next tick on their own path.
         let now = if Self::Access::WRITES { crate::change::next(*$clock) } else { *$clock };
@@ -264,6 +282,41 @@ macro_rules! invoke {
         *$clock = window.now;
         Some(result)
     }};
+}
+/// A function system's devtools view; shared by both function forms.
+#[cfg(feature = "devtools")]
+macro_rules! function_leaf {
+    ($($p:ident $i:tt),*) => {
+        fn id(&self) -> u32 {
+            self.id
+        }
+        fn set_id(&mut self, id: u32) {
+            self.id = id;
+        }
+        fn name(&self) -> &'static str {
+            std::any::type_name::<F>()
+        }
+        fn exclusive(&self) -> bool {
+            false
+        }
+        fn touches(&self, out: &mut Vec<crate::devtools::Touch>) {
+            <<Self as Shape>::Access as Access>::touches(false, out);
+        }
+        unsafe fn run(&mut self, input: *const (), world: *mut S, clock: &mut u64) -> bool {
+            unsafe { System::run_unchecked(self, input, world, clock) }.is_some()
+        }
+        unsafe fn defer(&mut self, world: *mut S) {
+            <Self as System<S>>::defer(self, unsafe { &mut *S::queue(world) });
+        }
+        unsafe fn explain(&mut self, _world: *mut S, _entity: crate::Entity, _out: &mut Vec<String>) {
+            // The window the next run would use: rows changed since the last.
+            let _window = ChangeWindow {
+                last: if unsafe { S::world_id(_world) } == self.last_world { self.last_run } else { 0 },
+                now: unsafe { S::clock(_world) },
+            };
+            $(unsafe { $p::explain(_world, &mut self.local.$i, _entity, _window, _out) };)*
+        }
+    };
 }
 macro_rules! function {
     ($($p:ident $i:tt),*) => {
@@ -298,6 +351,17 @@ macro_rules! function {
             fn defer(&mut self, _queue: &mut S::Queue) {
                 $($p::defer(&mut self.local.$i, _queue);)*
             }
+            #[cfg(feature = "devtools")]
+            fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>) {
+                visitor.leaf(self);
+            }
+        }
+        #[cfg(feature = "devtools")]
+        impl<S: SystemWorld, F, R, $($p: Param<S>),*> crate::devtools::Leaf<S>
+            for FunctionSystem<F, ($($p,)*), ($($p::State,)*), R, NoInput>
+        where F: for<'a> FnMut($($p::Item<'a>),*) -> R,
+              accesses!($($p),*): ValidAccess {
+            function_leaf!($($p $i),*);
         }
         impl<S: SystemWorld, K: Takes, F, R, $($p: Param<S>),*> System<S>
             for FunctionSystem<F, ($($p,)*), ($($p::State,)*), R, K>
@@ -312,6 +376,17 @@ macro_rules! function {
             fn defer(&mut self, _queue: &mut S::Queue) {
                 $($p::defer(&mut self.local.$i, _queue);)*
             }
+            #[cfg(feature = "devtools")]
+            fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>) {
+                visitor.leaf(self);
+            }
+        }
+        #[cfg(feature = "devtools")]
+        impl<S: SystemWorld, K: Takes, F, R, $($p: Param<S>),*> crate::devtools::Leaf<S>
+            for FunctionSystem<F, ($($p,)*), ($($p::State,)*), R, K>
+        where F: for<'a> FnMut(K::Item<'a>, $($p::Item<'a>),*) -> R,
+              accesses!($($p),*): ValidAccess {
+            function_leaf!($($p $i),*);
         }
     };
 }
@@ -414,6 +489,16 @@ impl<S, A: System<S, Output = ()>, B: System<S, Output = (), In = A::In>> System
         self.0.defer(queue);
         self.1.defer(queue);
     }
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>)
+    where
+        S: SystemWorld,
+    {
+        visitor.group(crate::devtools::Group::Sequence);
+        self.0.inspect(visitor);
+        self.1.inspect(visitor);
+        visitor.end_group();
+    }
 }
 
 /// A's continuation: arrive at the join if B was published, else run B here.
@@ -509,6 +594,16 @@ where
         self.0.defer(queue);
         self.1.defer(queue);
     }
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>)
+    where
+        S: SystemWorld,
+    {
+        visitor.group(crate::devtools::Group::Parallel);
+        self.0.inspect(visitor);
+        self.1.inspect(visitor);
+        visitor.end_group();
+    }
 }
 
 impl<P: Shape<Output = ()>, C: Shape<Output = bool, In = P::In>> Shape for Conditional<P, C> {
@@ -567,14 +662,40 @@ impl<S, P: System<S, Output = ()>, C: System<S, Output = bool, In = P::In>> Syst
         self.1.defer(queue);
         self.0.defer(queue);
     }
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>)
+    where
+        S: SystemWorld,
+    {
+        visitor.group(crate::devtools::Group::Condition);
+        self.1.inspect(visitor);
+        visitor.end_group();
+        if visitor.guard(&mut crate::devtools::step::Condition(&mut self.1)) {
+            self.0.inspect(visitor);
+        }
+    }
 }
 
 /// Exclusive world access, for structural changes. Name the world as `World<_>`
 /// in the app body; a plugin can be generic over it (`World<S>` with `S: Stores<T>`).
 /// Under a schedule with input, the input comes first: `|hit: &Damage, world|`.
-pub struct ExclusiveSystem<F, K = NoInput>(F, PhantomData<fn() -> K>);
+pub struct ExclusiveSystem<F, K = NoInput>(
+    F,
+    PhantomData<fn() -> K>,
+    /// Registry id, assigned at `build`.
+    #[cfg(feature = "devtools")]
+    u32,
+);
 pub fn exclusive<F>(function: F) -> ExclusiveSystem<F> {
-    ExclusiveSystem(function, PhantomData)
+    ExclusiveSystem::new(function)
+}
+impl<F, K> ExclusiveSystem<F, K> {
+    fn new(function: F) -> Self {
+        #[cfg(not(feature = "devtools"))]
+        return ExclusiveSystem(function, PhantomData);
+        #[cfg(feature = "devtools")]
+        return ExclusiveSystem(function, PhantomData, 0);
+    }
 }
 impl<F, K> sealed::Sealed for ExclusiveSystem<F, K> {}
 impl<F, K: Input> Shape for ExclusiveSystem<F, K> {
@@ -596,8 +717,14 @@ unsafe fn exclusively<S: SystemWorld>(world: *mut S, clock: &mut u64, body: impl
 impl<S: SystemWorld, F: FnMut(&mut S)> System<S> for ExclusiveSystem<F, NoInput> {
     const VALID: bool = true;
     unsafe fn run_unchecked(&mut self, _: *const (), world: *mut S, clock: &mut u64) -> Option<()> {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::writing(crate::devtools::step::system_writer(self.2));
         unsafe { exclusively(world, clock, &mut self.0) };
         Some(())
+    }
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>) {
+        visitor.leaf(self);
     }
 }
 impl<S: SystemWorld, K: Takes, F: for<'a> FnMut(K::Item<'a>, &mut S)> System<S>
@@ -610,10 +737,42 @@ impl<S: SystemWorld, K: Takes, F: for<'a> FnMut(K::Item<'a>, &mut S)> System<S>
         world: *mut S,
         clock: &mut u64,
     ) -> Option<()> {
+        #[cfg(feature = "devtools")]
+        let _writing = crate::devtools::writing(crate::devtools::step::system_writer(self.2));
         let input = unsafe { read::<K>(input) };
         unsafe { exclusively(world, clock, |world| (self.0)(input, world)) };
         Some(())
     }
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>) {
+        visitor.leaf(self);
+    }
+}
+#[cfg(feature = "devtools")]
+impl<S: SystemWorld, F, K: Input> crate::devtools::Leaf<S> for ExclusiveSystem<F, K>
+where
+    Self: System<S>,
+{
+    fn id(&self) -> u32 {
+        self.2
+    }
+    fn set_id(&mut self, id: u32) {
+        self.2 = id;
+    }
+    fn name(&self) -> &'static str {
+        std::any::type_name::<F>()
+    }
+    fn exclusive(&self) -> bool {
+        true
+    }
+    fn touches(&self, out: &mut Vec<crate::devtools::Touch>) {
+        <Exclusive as Access>::touches(false, out);
+    }
+    unsafe fn run(&mut self, input: *const (), world: *mut S, clock: &mut u64) -> bool {
+        unsafe { self.run_unchecked(input, world, clock) }.is_some()
+    }
+    unsafe fn defer(&mut self, _: *mut S) {}
+    unsafe fn explain(&mut self, _: *mut S, _: crate::Entity, _: &mut Vec<String>) {}
 }
 
 pub struct FunctionMarker<M>(PhantomData<M>);
@@ -644,7 +803,7 @@ where
 impl<K: Input, F> IntoSystems<K, Ready> for ExclusiveSystem<F> {
     type Systems = ExclusiveSystem<F, K>;
     fn into_systems(self) -> Self::Systems {
-        ExclusiveSystem(self.0, PhantomData)
+        ExclusiveSystem::new(self.0)
     }
 }
 

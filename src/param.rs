@@ -58,6 +58,19 @@ pub unsafe trait Param<S: SystemWorld>: ParamShape {
     /// Move deferred work recorded in this parameter's state to the world's
     /// queue, after the system ran.
     fn defer(_state: &mut Self::State, _queue: &mut S::Queue) {}
+    /// If `entity` is not this parameter's row, why (queries only).
+    /// # Safety
+    /// The world is live and nothing runs.
+    #[cfg(feature = "devtools")]
+    #[doc(hidden)]
+    unsafe fn explain(
+        _world: *mut S,
+        _state: &mut Self::State,
+        _entity: crate::Entity,
+        _window: ChangeWindow,
+        _out: &mut Vec<String>,
+    ) {
+    }
 }
 impl<T: Default + 'static> ParamShape for Local<'_, T> {
     type Access = ();
@@ -111,6 +124,16 @@ where
     ) -> Option<Self::Item<'a>> {
         Some(unsafe { Query::from_cached(world, state, window) })
     }
+    #[cfg(feature = "devtools")]
+    unsafe fn explain(
+        world: *mut World<S>,
+        _: &mut QueryState,
+        entity: crate::Entity,
+        window: ChangeWindow,
+        out: &mut Vec<String>,
+    ) {
+        out.extend(unsafe { Query::<D, F>::why_not(world, entity, window) });
+    }
 }
 impl<D: QueryData, F: QueryFilter> ParamShape for Single<'_, D, F> {
     type Access = Union<Filtered<QueryAccess<D::Access, F::Access>, F>, (D::Direct, D::Far)>;
@@ -131,6 +154,16 @@ where
         window: ChangeWindow,
     ) -> Option<Self::Item<'a>> {
         unsafe { Query::<D, F>::from_cached(world, state, window) }.single()
+    }
+    #[cfg(feature = "devtools")]
+    unsafe fn explain(
+        world: *mut World<S>,
+        _: &mut QueryState,
+        entity: crate::Entity,
+        window: ChangeWindow,
+        out: &mut Vec<String>,
+    ) {
+        out.extend(unsafe { Query::<D, F>::why_not(world, entity, window) });
     }
 }
 impl<S: Storage> ParamShape for Commands<'_, S> {

@@ -543,6 +543,13 @@ pub trait Nodes<S>: NodeList {
     fn defer(&mut self, queue: &mut <S as SystemWorld>::Queue)
     where
         S: SystemWorld;
+    /// Every node's system with its rank (serial stage), for devtools.
+    #[cfg(feature = "devtools")]
+    fn collect<'a, G: Spec<S>, I: Index>(
+        &'a mut self,
+        out: &mut Vec<(usize, &'a mut dyn crate::devtools::step::Inspect<S>)>,
+    ) where
+        S: SystemWorld;
 }
 impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     const VALID: bool = F::VALID;
@@ -649,6 +656,15 @@ impl<S, L, F: System<S, Output = ()>, D> Nodes<S> for Entry<L, F, D> {
     {
         self.system.defer(queue);
     }
+    #[cfg(feature = "devtools")]
+    fn collect<'a, G: Spec<S>, I: Index>(
+        &'a mut self,
+        out: &mut Vec<(usize, &'a mut dyn crate::devtools::step::Inspect<S>)>,
+    ) where
+        S: SystemWorld,
+    {
+        out.push((G::TOPOLOGY.rank[I::VALUE], &mut self.system));
+    }
 }
 impl<S, A: Nodes<S>, B: Nodes<S> + NodeList<In = A::In>> Nodes<S> for Pair<A, B> {
     const VALID: bool = A::VALID && B::VALID;
@@ -738,6 +754,16 @@ impl<S, A: Nodes<S>, B: Nodes<S> + NodeList<In = A::In>> Nodes<S> for Pair<A, B>
     {
         self.0.defer(queue);
         self.1.defer(queue);
+    }
+    #[cfg(feature = "devtools")]
+    fn collect<'a, G: Spec<S>, I: Index>(
+        &'a mut self,
+        out: &mut Vec<(usize, &'a mut dyn crate::devtools::step::Inspect<S>)>,
+    ) where
+        S: SystemWorld,
+    {
+        self.0.collect::<G, I>(out);
+        self.1.collect::<G, Offset<I, A>>(out);
     }
 }
 
@@ -831,5 +857,20 @@ impl<S: Send + Sync, N: Nodes<S> + BuildRows<N> + Send> System<S> for ReadyGraph
         S: SystemWorld,
     {
         self.nodes.defer(queue);
+    }
+    /// Nodes in the serial order: by rank, then declaration.
+    #[cfg(feature = "devtools")]
+    fn inspect(&mut self, visitor: &mut dyn crate::devtools::Visitor<S>)
+    where
+        S: SystemWorld,
+    {
+        let mut nodes = Vec::new();
+        self.nodes.collect::<Self, Zero>(&mut nodes);
+        nodes.sort_by_key(|&(rank, _)| rank);
+        visitor.group(crate::devtools::Group::Graph);
+        for (_, node) in nodes {
+            node.inspect(visitor);
+        }
+        visitor.end_group();
     }
 }

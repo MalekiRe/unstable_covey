@@ -15,6 +15,20 @@ pub struct Info {
     pub groups: fn(&mut Vec<std::any::TypeId>),
     /// Queries skip rows holding it unless they mention it.
     pub disabling: bool,
+    /// Describe a value at a pointer, for devtools.
+    #[cfg(feature = "devtools")]
+    pub describe: unsafe fn(*const u8) -> crate::devtools::Value,
+    /// Clone a value into uninitialized memory, if the type is `Clone`.
+    #[cfg(feature = "devtools")]
+    pub clone: Option<unsafe fn(*const u8, *mut u8)>,
+    /// Write a scalar field by path, for devtools edits.
+    #[cfg(feature = "devtools")]
+    pub edit: unsafe fn(*mut u8, &str, &str) -> Result<crate::devtools::Value, String>,
+    /// The field paths `edit` accepts.
+    #[cfg(feature = "devtools")]
+    pub editable: fn() -> Vec<String>,
+    #[cfg(feature = "devtools")]
+    pub immutable: bool,
 }
 impl Info {
     pub fn of<T: 'static>(sparse: bool, summary: bool) -> Self {
@@ -29,6 +43,16 @@ impl Info {
             name: std::any::type_name::<T>(),
             groups: <T as crate::one_of::MaybeOneOf>::groups,
             disabling: <T as crate::disabled::IsDisabling>::IS,
+            #[cfg(feature = "devtools")]
+            describe: <T as crate::devtools::value::Describe>::describe,
+            #[cfg(feature = "devtools")]
+            clone: <T as crate::devtools::snapshot::CloneFn>::clone_fn(),
+            #[cfg(feature = "devtools")]
+            edit: crate::devtools::value::edit::<T>,
+            #[cfg(feature = "devtools")]
+            editable: crate::devtools::value::editable::<T>,
+            #[cfg(feature = "devtools")]
+            immutable: <T as crate::immutable::IsImmutable>::IS,
         }
     }
     fn allocation(self, capacity: usize) -> Layout {
@@ -266,6 +290,54 @@ impl Store {
         for column in finish.0.by_ref() {
             unsafe { (column.info.drop)(column.data.add(row * column.info.layout.size()), 1) };
         }
+    }
+}
+#[cfg(feature = "devtools")]
+impl Store {
+    /// A deep copy, values cloned through each type's `Info::clone`. Fails
+    /// on the first column holding rows of a type that cannot be cloned.
+    pub fn duplicate(&self) -> Result<Self, &'static str> {
+        let len = self.entities.len();
+        if len > 0
+            && let Some(column) = self.columns.iter().find(|c| c.info.clone.is_none())
+        {
+            return Err(column.info.name);
+        }
+        let mut copy = Store {
+            entities: Vec::new(),
+            indices: self.indices.clone(),
+            columns: self.columns.iter().map(|c| Column::new(c.info)).collect(),
+            capacity: 0,
+            archetypes: Vec::new(),
+        };
+        copy.reserve(self.capacity.max(len));
+        for (from, to) in self.columns.iter().zip(&copy.columns) {
+            let size = from.info.layout.size();
+            let clone = from.info.clone;
+            for row in 0..len {
+                // SAFETY: rows below `len` are live; the copy has capacity
+                // for them. A panicking clone leaves the copy's length 0, so
+                // its partly written rows leak rather than drop.
+                unsafe {
+                    if let Some(clone) = clone {
+                        clone(from.data.add(row * size), to.data.add(row * size));
+                    }
+                    to.added.add(row).write(*from.added.add(row));
+                    to.changed.add(row).write(*from.changed.add(row));
+                }
+            }
+            if let (Some(source), Some(target)) = (&from.summary, &to.summary) {
+                target
+                    .added
+                    .store(source.added.load(Ordering::Relaxed), Ordering::Relaxed);
+                target
+                    .changed
+                    .store(source.changed.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+        copy.entities.extend_from_slice(&self.entities);
+        copy.archetypes = self.archetypes.clone();
+        Ok(copy)
     }
 }
 impl Drop for Store {

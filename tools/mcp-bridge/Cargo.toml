@@ -1,0 +1,8 @@
+[package]
+name = "static-ecs-mcp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Std only: relays an MCP client's stdio to an app's devtools socket.
+[dependencies]
