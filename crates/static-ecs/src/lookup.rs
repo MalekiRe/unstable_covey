@@ -18,13 +18,13 @@ unsafe impl<T: 'static, S: Storage> ComponentLookup<T> for S {
     default const SUMMARY: bool = false;
 }
 // SAFETY: each declaration identifies exactly its own component type.
-unsafe impl<T: 'static, const SUMMARY: bool> ComponentLookup<T> for Components<T, SUMMARY> {
+unsafe impl<T: Send + Sync + 'static, const SUMMARY: bool> ComponentLookup<T> for Components<T, SUMMARY> {
     const COUNT: usize = 1;
     const INDEX: usize = 0;
     const SPARSE: bool = false;
     const SUMMARY: bool = SUMMARY;
 }
-unsafe impl<T: 'static, const SUMMARY: bool> ComponentLookup<T> for Sparse<T, SUMMARY> {
+unsafe impl<T: Send + Sync + 'static, const SUMMARY: bool> ComponentLookup<T> for Sparse<T, SUMMARY> {
     const COUNT: usize = 1;
     const INDEX: usize = 0;
     const SPARSE: bool = true;

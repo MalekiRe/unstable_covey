@@ -1031,3 +1031,115 @@ fn spawning_toward_a_target_despawned_in_the_same_flush_links_nothing() {
         assert_eq!(world.targets::<InSquad>(ship).count(), 0);
     }
 }
+
+struct Ordered;
+impl Relation for Ordered {
+    type Kind = ManyToMany;
+    const ORDERED: bool = true;
+}
+
+#[test]
+fn ordered_relations_keep_both_sides_in_order_through_random_edits() {
+    let mut app = App::new().relation::<Ordered>().register::<Name>().build();
+    let world = &mut app.world;
+    let mut alive: Vec<Entity> = (0..24).map(|i| world.spawn_bundle((Name(i),))).collect();
+    // Model: each source's targets and each target's sources, in order.
+    let mut targets = std::collections::HashMap::<Entity, Vec<Entity>>::new();
+    let mut sources = std::collections::HashMap::<Entity, Vec<Entity>>::new();
+    let mut seed = 0x2545f4914f6cdd1d_u64;
+    let mut next = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % n as u64) as usize
+    };
+    let steps = if cfg!(miri) { 150 } else { 4000 };
+    for step in 0..steps {
+        let (a, b) = (alive[next(alive.len())], alive[next(alive.len())]);
+        match next(12) {
+            0..=3 => {
+                world.relate(a, Ordered, b);
+                if !targets.entry(a).or_default().contains(&b) {
+                    targets.get_mut(&a).unwrap().push(b);
+                    sources.entry(b).or_default().push(a);
+                }
+            }
+            4..=6 => {
+                let position = next(6);
+                world.relate_at(a, Ordered, b, position);
+                if !targets.entry(a).or_default().contains(&b) {
+                    targets.get_mut(&a).unwrap().push(b);
+                }
+                let list = sources.entry(b).or_default();
+                list.retain(|&s| s != a);
+                list.insert(position.min(list.len()), a);
+            }
+            7..=9 => {
+                let existed = targets.get(&a).is_some_and(|t| t.contains(&b));
+                assert_eq!(world.unrelate::<Ordered>(a, b), existed, "step {step}");
+                if existed {
+                    targets.get_mut(&a).unwrap().retain(|&t| t != b);
+                    sources.get_mut(&b).unwrap().retain(|&s| s != a);
+                }
+            }
+            _ if alive.len() > 8 => {
+                world.despawn(a);
+                alive.retain(|&e| e != a);
+                for (_, list) in Iterator::chain(targets.iter_mut(), sources.iter_mut()) {
+                    list.retain(|&e| e != a);
+                }
+                targets.remove(&a);
+                sources.remove(&a);
+            }
+            _ => {}
+        }
+        for &e in &alive {
+            let empty = Vec::new();
+            assert_eq!(
+                world.targets::<Ordered>(e).collect::<Vec<_>>(),
+                *targets.get(&e).unwrap_or(&empty),
+                "targets of {e:?}, step {step}"
+            );
+            assert_eq!(
+                world.sources::<Ordered>(e).collect::<Vec<_>>(),
+                *sources.get(&e).unwrap_or(&empty),
+                "sources of {e:?}, step {step}"
+            );
+        }
+    }
+}
+
+struct Child;
+impl Relation for Child {
+    type Kind = OneToMany;
+    const LINKED: bool = true;
+    const ORDERED: bool = true;
+    const ACYCLIC: bool = true;
+}
+
+#[test]
+fn ordered_children_survive_removal_reparenting_and_reordering_in_joins() {
+    use static_ecs::From;
+    let mut app = App::new().relation::<Child>().register::<Name>().build();
+    let world = &mut app.world;
+    let (root, other) = (world.spawn_bundle((Name(100),)), world.spawn_bundle((Name(200),)));
+    let kids: Vec<Entity> = (0..5).map(|i| world.spawn_bundle((Name(i), Child.to(root)))).collect();
+    let names = |world: &mut World<_>, parent| {
+        world.query::<From<Child, &Name>>().get_mut(parent).unwrap().map(|n| n.0).collect::<Vec<_>>()
+    };
+    assert_eq!(names(world, root), [0, 1, 2, 3, 4]);
+    world.despawn(kids[1]);
+    assert_eq!(names(world, root), [0, 2, 3, 4]);
+    world.relate_at(kids[4], Child, root, 0);
+    assert_eq!(names(world, root), [4, 0, 2, 3]);
+    world.relate_at(kids[4], Child, root, 99);
+    assert_eq!(names(world, root), [0, 2, 3, 4]);
+    world.relate_at(kids[2], Child, other, 0);
+    assert_eq!(names(world, root), [0, 3, 4]);
+    assert_eq!(names(world, other), [2]);
+    world.relate_at(kids[0], Child, root, 2);
+    assert_eq!(names(world, root), [3, 4, 0]);
+    world.despawn(root);
+    assert!(kids.iter().all(|&k| k == kids[2] || !world.contains(k)));
+    assert!(world.contains(kids[2]));
+}

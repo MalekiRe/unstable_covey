@@ -13,12 +13,12 @@ pub trait Declaration: Storage {
     const SPARSE: bool;
     const SUMMARY: bool;
 }
-impl<T: 'static, const SUMMARY: bool> Declaration for Components<T, SUMMARY> {
+impl<T: Send + Sync + 'static, const SUMMARY: bool> Declaration for Components<T, SUMMARY> {
     type Component = T;
     const SPARSE: bool = false;
     const SUMMARY: bool = SUMMARY;
 }
-impl<T: 'static, const SUMMARY: bool> Declaration for Sparse<T, SUMMARY> {
+impl<T: Send + Sync + 'static, const SUMMARY: bool> Declaration for Sparse<T, SUMMARY> {
     type Component = T;
     const SPARSE: bool = true;
     const SUMMARY: bool = SUMMARY;
@@ -48,6 +48,10 @@ impl<A, B> Choose<A, B> for If<false> {
 /// `Self` already stores the component. New components append, so existing
 /// indices never change.
 #[doc(hidden)]
+#[diagnostic::on_unimplemented(
+    message = "the world cannot store `{D}`",
+    note = "components and resources must be `Send + Sync`: worlds run parallel systems on worker threads"
+)]
 pub trait Insert<D> {
     type Out: Storage;
 }

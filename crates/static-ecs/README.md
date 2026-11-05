@@ -303,7 +303,9 @@ assert!(world.despawn(entity));
 ```
 
 Entities are generational handles; tables hold dense columns. Tuple bundles of
-1–16 components need no declaration.
+1–16 components need no declaration. Components and resources must be
+`Send + Sync`, since parallel branches run on worker threads; storing an `Rc`
+does not compile.
 
 ### Component behavior
 
@@ -509,9 +511,10 @@ assert_eq!(stations.get_mut(station).unwrap().count(), 2);
 | `From<R, Q>` | `Option` | iterator | iterator |
 
 `ACYCLIC` refuses edges that would close a cycle, `LINKED` despawns sources
-with their target, and `FRAGMENTING` makes the target part of the table key so
-one target's sources are contiguous. Links are `Immutable`, so `&mut` access
-cannot corrupt the edge index.
+with their target, `ORDERED` keeps link lists in insertion order (with
+`relate_at` to place a source among its siblings), and `FRAGMENTING` makes the
+target part of the table key so one target's sources are contiguous. Links are
+`Immutable`, so `&mut` access cannot corrupt the edge index.
 
 ### Async tasks and remote bridges
 

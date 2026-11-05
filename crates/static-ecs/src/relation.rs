@@ -6,6 +6,7 @@
 //! move, sources come from the world's pair index, and despawning a target
 //! cascades through that index.
 use std::marker::PhantomData;
+use std::ops::Range;
 
 use crate::access::Write;
 use crate::change::{Mut, MutSlice};
@@ -44,6 +45,22 @@ pub trait Relation: Send + Sync + 'static {
     /// Refuse edges that would close a cycle (relating panics), so walks
     /// along it end: `Query::cascade` needs it.
     const ACYCLIC: bool = false;
+    /// Keep link lists in insertion order: unlinking shifts later entries
+    /// down instead of swapping the last one in, and `relate_at` places a
+    /// source at a position among its target's sources (e.g. children in
+    /// declaration order). Unlinking costs O(entries after it). Fragmenting
+    /// relations cannot be ordered:
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct InSquad;
+    /// impl Relation for InSquad {
+    ///     type Kind = OneToMany;
+    ///     const FRAGMENTING: bool = true;
+    ///     const ORDERED: bool = true;
+    /// }
+    /// App::new().relation::<InSquad>().build();
+    /// ```
+    const ORDERED: bool = false;
     /// This relation from the entity it is inserted on to `target`, as a
     /// bundle part: `commands.spawn((Name("Raider"), Targets.to(station)))`.
     /// Inserting replaces the entity's previous link (every edge, for
@@ -123,8 +140,9 @@ pub trait Side: Default + Send + Sync + 'static {
     fn entries_mut(&mut self) -> &mut [(Entity, u32)];
     /// Append; returns the new entry's index. A `One` side must be empty.
     fn push(&mut self, entry: (Entity, u32)) -> u32;
-    /// Remove entry `index`; returns the entry moved into its place, if any.
-    fn swap_remove(&mut self, index: u32) -> Option<(Entity, u32)>;
+    /// Remove entry `index`, swapping the last entry in or, if `ordered`,
+    /// shifting the rest down; returns the indices whose entries moved.
+    fn remove(&mut self, index: u32, ordered: bool) -> std::ops::Range<u32>;
 }
 #[doc(hidden)]
 #[derive(Default)]
@@ -145,9 +163,9 @@ impl Side for One {
         self.0 = Some(entry);
         0
     }
-    fn swap_remove(&mut self, _: u32) -> Option<(Entity, u32)> {
+    fn remove(&mut self, _: u32, _: bool) -> std::ops::Range<u32> {
         self.0 = None;
-        None
+        0..0
     }
 }
 impl Side for Many {
@@ -162,9 +180,15 @@ impl Side for Many {
         self.0.push(entry);
         u32::try_from(self.0.len() - 1).expect("relation list exceeds u32 entries")
     }
-    fn swap_remove(&mut self, index: u32) -> Option<(Entity, u32)> {
-        self.0.swap_remove(index as usize);
-        self.0.get(index as usize).copied()
+    fn remove(&mut self, index: u32, ordered: bool) -> std::ops::Range<u32> {
+        let len = self.0.len() as u32 - 1;
+        if ordered {
+            self.0.remove(index as usize);
+            index..len
+        } else {
+            self.0.swap_remove(index as usize);
+            index..(index + 1).min(len)
+        }
     }
 }
 
@@ -299,70 +323,51 @@ unsafe impl<L: 'static, S: ComponentLookup<L>> FetchQuery<S> for LinksMut<L> {
 
 /// Both sides of relation `R`, by entity: the world, or a hook's queries.
 /// `source`/`target` mark the side changed (`Relinked<R>`); back-index
-/// fix-ups go through `repoint`, which does not: the entity's links stay.
+/// fix-ups go through `repoint_*`, which do not: the entity's links stay.
 trait Lists<R: Relation> {
     fn source(&mut self, entity: Entity) -> &mut SourceSide<R>;
     fn target(&mut self, entity: Entity) -> &mut TargetSide<R>;
     fn source_unmarked(&mut self, entity: Entity) -> &mut SourceSide<R>;
     fn target_unmarked(&mut self, entity: Entity) -> &mut TargetSide<R>;
 }
-/// An entry moved within one side: repoint its counterpart's back index.
-enum Moved {
-    /// Within a source's list: `(target, slot in target)` now sits at `index`.
-    InSource {
-        target: Entity,
-        slot: u32,
-        index: u32,
-    },
-    /// Within a target's list: `(source, index in source)` now sits at `slot`.
-    InTarget {
-        source: Entity,
-        index: u32,
-        slot: u32,
-    },
-}
-fn repoint<R: Relation>(lists: &mut impl Lists<R>, moved: Moved) {
-    match moved {
-        Moved::InSource {
-            target,
-            slot,
-            index,
-        } => {
+/// Entries `moved` of `source`'s list changed position: repoint each
+/// target's back index. Pending entries have no counterpart.
+fn repoint_source<R: Relation>(lists: &mut impl Lists<R>, source: Entity, moved: Range<u32>) {
+    for index in moved {
+        let (target, slot) = lists.source_unmarked(source).entries()[index as usize];
+        if slot != PENDING {
             lists.target_unmarked(target).entries_mut()[slot as usize].1 = index;
         }
-        Moved::InTarget {
-            source,
-            index,
-            slot,
-        } => {
-            lists.source_unmarked(source).entries_mut()[index as usize].1 = slot;
-        }
+    }
+}
+/// Entries `moved` of `target`'s list changed position: repoint each
+/// source's back index.
+fn repoint_target<R: Relation>(lists: &mut impl Lists<R>, target: Entity, moved: Range<u32>) {
+    for slot in moved {
+        let (source, index) = lists.target_unmarked(target).entries()[slot as usize];
+        lists.source_unmarked(source).entries_mut()[index as usize].1 = slot;
     }
 }
 /// Unlink `source`'s entry `index` from both sides; returns its target.
 fn unlink<R: Relation>(lists: &mut impl Lists<R>, source: Entity, index: u32) -> Entity {
     let (target, slot) = lists.source(source).entries()[index as usize];
-    if let Some((moved, back)) = lists.source(source).swap_remove(index) {
-        repoint(
-            lists,
-            Moved::InSource {
-                target: moved,
-                slot: back,
-                index,
-            },
-        );
-    }
-    if let Some((moved, back)) = lists.target(target).swap_remove(slot) {
-        repoint(
-            lists,
-            Moved::InTarget {
-                source: moved,
-                index: back,
-                slot,
-            },
-        );
-    }
+    let moved = lists.source(source).remove(index, R::ORDERED);
+    repoint_source(lists, source, moved);
+    let moved = lists.target(target).remove(slot, R::ORDERED);
+    repoint_target(lists, target, moved);
     target
+}
+/// Move `target`'s source entry `from` to `to`, shifting those between.
+fn place<R: Relation>(lists: &mut impl Lists<R>, target: Entity, from: u32, to: u32) {
+    let entries = lists.target(target).entries_mut();
+    let (low, high) = (from.min(to), from.max(to));
+    let span = &mut entries[low as usize..=high as usize];
+    if from > to {
+        span.rotate_right(1);
+    } else {
+        span.rotate_left(1);
+    }
+    repoint_target(lists, target, low..high + 1);
 }
 fn link<R: Relation>(lists: &mut impl Lists<R>, source: Entity, target: Entity) {
     let index = lists.source(source).entries().len() as u32;
@@ -481,6 +486,37 @@ impl<S: Storage> World<S> {
         }
         link::<R>(self, source, target);
     }
+    /// `relate`, then place `source` at `position` among `target`'s
+    /// sources (clamped to the end). Relating an existing pair moves it.
+    /// Only `ORDERED` relations with many sources per target:
+    /// ```compile_fail
+    /// use static_ecs::prelude::*;
+    /// struct ChildOf;
+    /// impl Relation for ChildOf {
+    ///     type Kind = OneToMany;
+    /// }
+    /// let mut app = App::new().relation::<ChildOf>().build();
+    /// let (a, b) = (app.world.spawn(), app.world.spawn());
+    /// app.world.relate_at(a, ChildOf, b, 0);
+    /// ```
+    pub fn relate_at<R: Relation>(&mut self, source: Entity, value: R, target: Entity, position: usize)
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
+    {
+        const {
+            assert!(
+                R::ORDERED && !TargetSide::<R>::ONE,
+                "relate_at needs an ORDERED relation with many sources per target"
+            )
+        };
+        self.relate(source, value, target);
+        let entries = self.get::<Sources<R>>(target).unwrap().side.entries();
+        let from = entries.iter().position(|&(s, _)| s == source).unwrap();
+        let to = position.min(entries.len() - 1);
+        if from != to {
+            place::<R>(self, target, from as u32, to as u32);
+        }
+    }
     /// Fragmenting: one table move into the `(R, target)` pair.
     fn relate_pair<R: Relation>(&mut self, source: Entity, target: Entity)
     where
@@ -546,17 +582,13 @@ impl<S: Storage> World<S> {
             }
             if !self.contains(target) {
                 // Never linked: only this side moves an entry into `index`.
-                let mut relates = self.links_mut::<Relates<R>>(source).unwrap();
-                if let Some((moved, back)) = relates.side.swap_remove(index as u32)
-                    && back != PENDING
-                {
-                    let moved = Moved::InSource {
-                        target: moved,
-                        slot: back,
-                        index: index as u32,
-                    };
-                    repoint::<R>(self, moved);
-                }
+                let moved = self
+                    .links_mut::<Relates<R>>(source)
+                    .unwrap()
+                    .into_inner()
+                    .side
+                    .remove(index as u32, R::ORDERED);
+                repoint_source::<R>(self, source, moved);
                 continue;
             }
             self.check_edge::<R>(source, target);
@@ -676,6 +708,17 @@ impl<S: Storage> Commands<'_, S> {
             }
         });
     }
+    /// Deferred `World::relate_at`; skipped if either entity died meanwhile.
+    pub fn relate_at<R: Relation>(&mut self, source: Entity, value: R, target: Entity, position: usize)
+    where
+        S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>> + ComponentLookup<PairOf<R>>,
+    {
+        self.queue(move |world| {
+            if world.contains(source) && world.contains(target) {
+                world.relate_at(source, value, target, position);
+            }
+        });
+    }
     /// Deferred `World::unrelate`.
     pub fn unrelate<R: Relation>(&mut self, source: Entity, target: Entity)
     where
@@ -706,7 +749,7 @@ fn source_gone<
         // From the end: no entry moves.
         while let Some(index) = lists.source(source).entries().len().checked_sub(1) {
             if lists.source(source).entries()[index].1 == PENDING {
-                lists.source(source).swap_remove(index as u32);
+                lists.source(source).remove(index as u32, R::ORDERED);
                 continue;
             }
             let target = unlink::<R>(&mut lists, source, index as u32);
@@ -815,6 +858,12 @@ where
         + ComponentLookup<Sources<R>>
         + ComponentLookup<PairOf<R>>,
 {
+    const {
+        assert!(
+            !(R::ORDERED && R::FRAGMENTING),
+            "a fragmenting relation cannot be ORDERED: its sources are ordered by table"
+        )
+    };
     pair_index::<R, S>();
     (
         schedule(
