@@ -265,3 +265,15 @@ fn queries_that_never_see_a_disabling_component_run_beside_ones_requiring_it() {
     assert_eq!(app.world.get::<Hp>(live), Some(&Hp(1)));
     assert_eq!(app.world.get::<Hp>(prefab), Some(&Hp(100)));
 }
+
+#[test]
+fn disabled_entities_keep_their_relation_links_consistent() {
+    let mut world = App::new().relation::<InPanel>().register::<Hp>().register::<Prefab>().build().world;
+    let parent = world.spawn_bundle((Hp(0), Prefab));
+    let kids: Vec<Entity> = (1..=3).map(|i| world.spawn_bundle((Hp(i), Prefab, InPanel.to(parent)))).collect();
+    assert_eq!(world.sources::<InPanel>(parent).collect::<Vec<_>>(), kids, "linked while disabled");
+    world.despawn(kids[1]);
+    assert_eq!(world.sources::<InPanel>(parent).collect::<Vec<_>>(), [kids[0], kids[2]]);
+    world.despawn(parent);
+    assert!(!world.contains(kids[0]) && !world.contains(kids[2]), "LINKED despawns reach disabled sources");
+}

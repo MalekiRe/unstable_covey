@@ -126,7 +126,7 @@ impl<S: Storage> World<S> {
     /// Depth-first, parents before children, in link order: `visit` returns
     /// whether to descend. Moves up through each entity's parent link, so
     /// it needs no stack.
-    fn walk_subtree<R: Relation>(&mut self, root: Entity, mut visit: impl FnMut(&mut Self, Entity) -> bool)
+    pub(crate) fn walk_subtree<R: Relation>(&mut self, root: Entity, mut visit: impl FnMut(&mut Self, Entity) -> bool)
     where
         S: ComponentLookup<Relates<R>> + ComponentLookup<Sources<R>>,
     {

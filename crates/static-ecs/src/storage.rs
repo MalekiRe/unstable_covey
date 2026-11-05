@@ -102,6 +102,9 @@ pub trait Storage: sealed::Sealed + Default + Send + Sync + 'static {
     const POINTS: usize = 0;
     #[doc(hidden)]
     fn describe(output: &mut Vec<Info>);
+    /// Insert clones of `from`'s `Clone` components on `to`.
+    #[doc(hidden)]
+    fn clone_components<W: Storage>(_world: &mut World<W>, _from: Entity, _to: Entity) {}
     /// Each component's transitive requirements in world `W`, in index order.
     #[cfg(feature = "devtools")]
     #[doc(hidden)]
@@ -119,6 +122,9 @@ macro_rules! schema {
             const HAS_SPARSE: bool = $sparse;
             fn describe(output: &mut Vec<Info>) {
                 output.push(Info::of::<T>($sparse, SUMMARY));
+            }
+            fn clone_components<W: Storage>(world: &mut World<W>, from: Entity, to: Entity) {
+                <T as crate::clone::MaybeClone>::clone_component(world, from, to);
             }
             #[cfg(feature = "devtools")]
             fn requirements<W: Storage>(output: &mut Vec<Vec<usize>>) {
@@ -144,6 +150,10 @@ impl<A: Storage, B: Storage> Storage for (A, B) {
     fn describe(output: &mut Vec<Info>) {
         A::describe(output);
         B::describe(output);
+    }
+    fn clone_components<W: Storage>(world: &mut World<W>, from: Entity, to: Entity) {
+        A::clone_components(world, from, to);
+        B::clone_components(world, from, to);
     }
     #[cfg(feature = "devtools")]
     fn requirements<W: Storage>(output: &mut Vec<Vec<usize>>) {

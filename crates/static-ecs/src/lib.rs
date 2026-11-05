@@ -12,6 +12,7 @@ mod access;
 mod behavior;
 mod bridge;
 mod change;
+mod clone;
 mod column;
 mod command;
 #[cfg(feature = "devtools")]

@@ -405,6 +405,9 @@ commands its hooks queue apply after all of it.
   `world.disable_subtree::<D, ChildOf>(root)` inserts `D` down a hierarchy
   without allocating, and `enable_subtree` removes it, leaving subtrees that
   were disabled on their own (their roots carry `DisabledRoot<D>`) disabled.
+  `world.clone_subtree::<ChildOf>(prototype)` copies every `Clone` component
+  down a hierarchy and relinks the copies in order; a prototype's non-`Clone`
+  disabling marker stays behind, so the copy comes out visible.
 
 ### Composing systems
 

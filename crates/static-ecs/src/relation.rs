@@ -279,7 +279,9 @@ where
 impl<R: Relation> Immutable for Relates<R> {}
 impl<R: Relation> Immutable for Sources<R> {}
 
-/// `&mut L` for the relation's own hooks, past the `Immutable` gate.
+/// `&mut L` for the relation's own hooks, past the `Immutable` gate. It
+/// mentions every component, so `Disabling` ones never hide a row: links of
+/// disabled entities are kept as consistent as any others.
 #[doc(hidden)]
 pub struct LinksMut<L>(PhantomData<fn() -> L>);
 impl<L: 'static> QueryData for LinksMut<L> {
@@ -296,8 +298,8 @@ impl<L: 'static> QueryData for LinksMut<L> {
     fn requires(index: &usize, component: usize) -> bool {
         <&mut L as QueryData>::requires(index, component)
     }
-    fn mentions(index: &usize, component: usize) -> bool {
-        <&mut L as QueryData>::mentions(index, component)
+    fn mentions(_: &usize, _: usize) -> bool {
+        true
     }
     unsafe fn fetch(reach: Reach, table: &Table, index: &usize, tick: u64) -> ColumnPtr {
         unsafe { <&mut L as QueryData>::fetch(reach, table, index, tick) }
@@ -798,7 +800,7 @@ fn pending_inserted<
         + ComponentLookup<PairOf<R>>,
 >(
     trigger: Trigger,
-    mut sources: Query<&'static Relates<R>>,
+    mut sources: Query<LinksMut<Relates<R>>>,
     mut commands: Commands<S>,
 ) {
     for &source in trigger.iter() {
@@ -830,10 +832,10 @@ type CleanupSystem<R, S> = FunctionSystem<
     Batch,
 >;
 type Pending<R, S> =
-    for<'a, 'b, 'c> fn(Trigger<'a>, Query<'b, &'static Relates<R>>, Commands<'c, S>);
+    for<'a, 'b, 'c> fn(Trigger<'a>, Query<'b, LinksMut<Relates<R>>>, Commands<'c, S>);
 type PendingSystem<R, S> = FunctionSystem<
     Pending<R, S>,
-    (Query<'static, &'static Relates<R>>, Commands<'static, S>),
+    (Query<'static, LinksMut<Relates<R>>>, Commands<'static, S>),
     (QueryState, CommandQueue<S>),
     (),
     Batch,
