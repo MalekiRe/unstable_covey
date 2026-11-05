@@ -1,0 +1,13 @@
+[package]
+name = "static-ui-clay-oracle"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Test-only: clay.h (vendored, v0.14) as the oracle for static-ui-layout"
+
+[dependencies]
+static-ui-layout = { path = "../static-ui-layout" }
+
+# Only this test crate compiles C.
+[build-dependencies]
+cc = "1"

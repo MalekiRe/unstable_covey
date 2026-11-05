@@ -204,6 +204,18 @@ name = "static-ecs-mcp"
 version = "0.1.0"
 
 [[package]]
+name = "static-ui-clay-oracle"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "static-ui-layout",
+]
+
+[[package]]
+name = "static-ui-layout"
+version = "0.1.0"
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

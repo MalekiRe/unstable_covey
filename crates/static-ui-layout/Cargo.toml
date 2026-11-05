@@ -1,0 +1,7 @@
+[package]
+name = "static-ui-layout"
+version = "0.1.0"
+edition = "2024"
+description = "Clay's layout algorithm over flat arrays: no ECS, no dependencies, no allocation once warm"
+
+[dependencies]
