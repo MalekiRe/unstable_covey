@@ -243,8 +243,14 @@ pub fn frame_start(clock: Option<Res<UiClock>>, mut timers: ResMut<Timers>, mut 
 }
 /// `UiFrame`, last: keep frames coming while something animates, and wake
 /// for the earliest timer.
-pub fn frame_end(timers: Res<Timers>, ticks: Res<Inbox<FrameTick>>, mut redraw: ResMut<Redraw>) {
-    let next = Redraw { animating: ticks.any_waiting(), deadline: timers.next() };
+pub fn frame_end(
+    timers: Res<Timers>,
+    ticks: Res<Inbox<FrameTick>>,
+    transitions: Option<Res<crate::transition::ActiveTransitions>>,
+    mut redraw: ResMut<Redraw>,
+) {
+    let animating = ticks.any_waiting() || transitions.is_some_and(|t| t.0 > 0);
+    let next = Redraw { animating, deadline: timers.next() };
     if *redraw != next {
         *redraw = next;
     }

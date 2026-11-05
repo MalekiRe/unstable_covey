@@ -28,6 +28,7 @@ pub mod input;
 mod interact;
 mod render;
 mod spawn;
+pub mod transition;
 pub mod widgets;
 
 pub use behave::{Either, FrameTick, InScope, Scope, Timers, UiClock, UiUpdate, animate, scoped, select, select_all, sleep};
@@ -37,7 +38,7 @@ pub use interact::{
     Click, Drag, DragEnd, DragStart, Focus, FocusIn, FocusOut, Focusable, InputPlugin, Interaction, KeyPress, Pointer,
     PointerEnter, PointerLeave, Press, Release, TextInput, Wheel, bubble, hit_test, DRAG_THRESHOLD,
 };
-pub use render::{ClearColor, Command, Draw, RenderList, render_system};
+pub use render::{ClearColor, Command, DebugOverlay, DebugTimings, Draw, RenderList, render_system};
 pub use spawn::{El, SpawnList, SpawnTree, SpawnUi, el};
 
 /// The UI's frame: input, behaviors, layout and rendering run under it.
@@ -299,6 +300,9 @@ impl<M: Measure> Plugin for UiPlugin<M> {
         static_ecs::Wakeup,
         Timers,
         UiClock,
+        transition::ActiveTransitions,
+        DebugOverlay,
+        DebugTimings,
         static_ecs::Inbox<FrameTick>,
         behave::ScopeRoot,
         M,

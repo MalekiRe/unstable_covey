@@ -23,6 +23,18 @@ fn main() {
                 }
             })
         })
+        // F12 cycles the debug overlay: boxes, damage, timings, off.
+        .add_systems(Input::FocusLost, |input: &Input, mut overlay: ResMut<DebugOverlay>| {
+            if let Input::Key { key: Key::Other(88), pressed: true, .. } = input {
+                *overlay = match (overlay.boxes, overlay.damage, overlay.timings) {
+                    (false, false, false) => DebugOverlay { boxes: true, ..DebugOverlay::default() },
+                    (true, false, false) => DebugOverlay { damage: true, ..DebugOverlay::default() },
+                    (false, true, false) => DebugOverlay { timings: true, ..DebugOverlay::default() },
+                    _ => DebugOverlay::default(),
+                };
+            }
+        })
+        .init_resource::<DebugOverlay>()
         .build();
     let world = &mut app.world;
     let screen = world.spawn_ui(el((

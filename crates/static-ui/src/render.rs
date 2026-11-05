@@ -22,7 +22,8 @@ pub enum Draw {
 /// One drawing command.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Command {
-    pub entity: Entity,
+    /// The element's entity; `None` for debug overlay marks.
+    pub entity: Option<Entity>,
     /// The element in the flattened tree (for text: where its string is).
     pub element: u32,
     /// Where to draw.
@@ -54,6 +55,10 @@ pub struct RenderList {
     roots: Vec<u32>,
     walk: Vec<(u32, bool)>,
     clip_stack: Vec<layout::Rect>,
+    debug: DebugOverlay,
+    /// Damage marked by the overlay last frame, to erase.
+    flashed: Vec<layout::Rect>,
+    build_time: std::time::Duration,
 }
 impl RenderList {
     pub fn commands(&self) -> &[Command] {
@@ -71,6 +76,21 @@ impl RenderList {
     pub fn has_damage(&self) -> bool {
         !self.damage.is_empty()
     }
+    /// How long the last rebuild took.
+    pub fn build_time(&self) -> std::time::Duration {
+        self.build_time
+    }
+}
+
+/// Debugging aids drawn over the UI: a resource.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DebugOverlay {
+    /// Outline every element's box.
+    pub boxes: bool,
+    /// Tint what each frame redraws.
+    pub damage: bool,
+    /// Show layout and render-list timings in a corner.
+    pub timings: bool,
 }
 
 /// Merge overlapping rectangles; past 16 of them, their union.
@@ -117,6 +137,7 @@ pub fn render_system(
     mut styles: Query<Styles>,
     mut restyled: Restyled,
     mut overlaid: Query<&crate::Rect, Changed<Overlay>>,
+    debug: Option<Res<DebugOverlay>>,
 ) {
     let list = &mut *list;
     let mut changed = false;
@@ -130,9 +151,23 @@ pub fn render_system(
     });
     list.damage.extend(ui.take_damage());
     let ui = &*ui;
-    if !changed && ui.runs() == list.built_from {
+    let debug = debug.map(|d| *d).unwrap_or_default();
+    if debug.damage {
+        // Erase last frame's marks; mark this frame's damage.
+        let previous = std::mem::take(&mut list.flashed);
+        list.flashed = list.damage.clone();
+        list.damage.extend(previous);
+        changed |= !list.flashed.is_empty();
+    } else if !list.flashed.is_empty() {
+        let previous = std::mem::take(&mut list.flashed);
+        list.damage.extend(previous);
+        changed = true;
+    }
+    if !changed && ui.runs() == list.built_from && debug == list.debug {
         return;
     }
+    let started = std::time::Instant::now();
+    list.debug = debug;
     list.built_from = ui.runs();
     list.builds += 1;
     list.commands.clear();
@@ -155,6 +190,23 @@ pub fn render_system(
         paint(ui, list, &mut styles, root, clip, window);
     }
     list.roots = roots;
+    if debug.boxes {
+        // Every element's box, outlined.
+        for element in 1..tree.len() as u32 {
+            let rect = tree.rect(element);
+            list.commands.push(Command {
+                entity: Some(ui.entity(element)),
+                element,
+                rect,
+                clip: window,
+                draw: Draw::Border { color: Color::rgba(255, 0, 200, 160), width: BorderWidth::all(1), radius: Radius::default() },
+            });
+        }
+    }
+    for &area in &list.flashed {
+        list.commands.push(Command { entity: None, element: 0, rect: area, clip: window, draw: Draw::Overlay { color: Color::rgba(255, 40, 40, 70) } });
+    }
+    list.build_time = started.elapsed();
 }
 
 /// Commands for `root`'s subtree, depth-first: an element's background
@@ -182,10 +234,10 @@ fn paint(ui: &UiLayout, list: &mut RenderList, styles: &mut Query<Styles>, root:
             }
             continue;
         }
-        let entity = ui.entity(element);
-        let Some((background, border, radius, overlay, text, clip_config)) = styles.get_mut(entity) else {
+        let Some((background, border, radius, overlay, text, clip_config)) = styles.get_mut(ui.entity(element)) else {
             continue;
         };
+        let entity = Some(ui.entity(element));
         let clip = *clips.last().unwrap();
         let radius = radius.copied().unwrap_or_default();
         let visible = !rect.intersect(window).is_empty();
@@ -246,4 +298,53 @@ fn paint(ui: &UiLayout, list: &mut RenderList, styles: &mut Query<Styles>, root:
     }
     list.walk = stack;
     list.clip_stack = clips;
+}
+
+/// Marks the overlay's timings text.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DebugTimings;
+/// Show (or hide) the timings corner of the debug overlay.
+#[allow(clippy::type_complexity)]
+pub fn debug_timings_system<S: Storage>(
+    debug: Option<Res<DebugOverlay>>,
+    ui: Res<UiLayout>,
+    list: Res<RenderList>,
+    mut texts: Query<(&mut Text, &Relates<crate::ChildOf>), With<DebugTimings>>,
+    mut commands: Commands<S>,
+) {
+    let on = debug.is_some_and(|d| d.timings);
+    let mut found = false;
+    texts.each(|(mut text, parent)| {
+        found = true;
+        if !on {
+            commands.despawn(parent.target());
+            return;
+        }
+        let shown = format!(
+            "layout {:.1} µs · {} runs, {} rebuilds · render list {:.1} µs, {} builds",
+            ui.layout_time().as_secs_f64() * 1e6,
+            ui.runs(),
+            ui.rebuilds(),
+            list.build_time().as_secs_f64() * 1e6,
+            list.builds(),
+        );
+        if text.text != shown {
+            text.text = shown;
+        }
+    });
+    if on && !found {
+        let corner = commands.spawn((
+            crate::Node::row().padding(crate::Padding::xy(6, 3)),
+            Background(Color::rgba(20, 20, 24, 200)),
+            crate::Floating {
+                attach: crate::Attach::Root,
+                element: crate::AttachPoint::RightTop,
+                parent: crate::AttachPoint::RightTop,
+                z: i16::MAX,
+                pointer: crate::PointerCapture::Passthrough,
+                ..crate::Floating::default()
+            },
+        ));
+        commands.spawn((Text::new("", 12).color(Color::WHITE), DebugTimings, crate::ChildOf.to(corner)));
+    }
 }

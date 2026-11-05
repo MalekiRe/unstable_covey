@@ -25,6 +25,7 @@ pub struct UiLayout {
     viewport: Viewport,
     runs: u64,
     rebuilds: u64,
+    layout_time: std::time::Duration,
     damage: Vec<layout::Rect>,
     /// Flattening work list: `Some(entity)` opens, `None` closes.
     stack: Vec<Option<Entity>>,
@@ -43,6 +44,7 @@ impl Default for UiLayout {
             viewport: Viewport { width: -1.0, height: -1.0 },
             runs: 0,
             rebuilds: 0,
+            layout_time: std::time::Duration::ZERO,
             damage: Vec::new(),
             stack: Vec::new(),
             roots: Vec::new(),
@@ -58,6 +60,10 @@ impl UiLayout {
     /// Times the visible tree was flattened again.
     pub fn rebuilds(&self) -> u64 {
         self.rebuilds
+    }
+    /// How long the last layout took (flattening, passes, write-back).
+    pub fn layout_time(&self) -> std::time::Duration {
+        self.layout_time
     }
     /// The flattened tree, with its last layout.
     pub fn tree(&self) -> &Tree {
@@ -227,6 +233,7 @@ pub fn layout_system<M: Measure>(
     mut rects: Query<&mut Rect>,
 ) {
     let ui = &mut *ui;
+    let started = std::time::Instant::now();
     let mut dirty = false;
     if *viewport != ui.viewport {
         ui.viewport = *viewport;
@@ -286,6 +293,7 @@ pub fn layout_system<M: Measure>(
             ui.damage(new);
         }
     }
+    ui.layout_time = started.elapsed();
 }
 
 /// Mark the structure dirty: a node appeared, left, or was hidden.
@@ -316,6 +324,7 @@ fn init<S: Storage, M: Measure>(world: &mut World<S>) {
     world.init_resource::<crate::Redraw>();
     world.init_resource::<crate::Timers>();
     world.init_resource::<static_ecs::Inbox<crate::FrameTick>>();
+    world.init_resource::<crate::transition::ActiveTransitions>();
 }
 
 /// The core's systems: structure hooks, resource setup, layout.
@@ -343,6 +352,8 @@ pub(crate) fn systems<S: Storage, M: Measure>() -> impl Systems<S> {
         schedule(crate::UiUpdate, exclusive(init::<S, M>)),
         schedule(UiFrame, exclusive(init::<S, M>)),
         schedule(crate::UiUpdate, crate::behave::frame_start),
+        schedule(crate::UiUpdate, crate::transition::reset_active),
+        schedule(crate::UiUpdate, crate::render::debug_timings_system::<S>),
         schedule(UiFrame, layout_system::<M>),
         schedule(UiFrame, crate::render_system),
         schedule(UiFrame, crate::behave::frame_end),
