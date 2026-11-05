@@ -602,6 +602,10 @@ pub struct Tree {
     aspect: Vec<u32>,
     walk: Vec<Walk>,
     stalls: u64,
+    /// Bytes of `text` no element refers to any more.
+    dead_text: usize,
+    /// The previous arena, reused by compaction.
+    spare_text: String,
 }
 
 impl Tree {
@@ -632,8 +636,10 @@ impl Tree {
             element.attached = match config.floating.attach_to {
                 AttachTo::Parent => parent,
                 AttachTo::Root => 0,
-                AttachTo::Element(target) if target < index => target,
-                AttachTo::Element(_) | AttachTo::None => NONE,
+                // Checked in `end`: unlike Clay, a later element may be the
+                // target (Clay reports an error for those).
+                AttachTo::Element(target) => target,
+                AttachTo::None => NONE,
             };
             self.roots.push(Root { element: index, z: config.floating.z });
         }
@@ -688,6 +694,12 @@ impl Tree {
         self.close_element(0);
         debug_assert!(self.pending.is_empty());
         let n = self.elements.len();
+        for element in &mut self.elements {
+            if element.attached != NONE && element.attached as usize >= n {
+                element.attached = NONE;
+            }
+        }
+        self.dead_text = 0;
         self.boxes.resize(n, Rect::default());
         self.content.resize(n, Size::default());
     }
@@ -705,22 +717,52 @@ impl Tree {
     pub fn config(&self, element: u32) -> &Config {
         &self.elements[element as usize].config
     }
-    /// Resize the root.
+    /// Resize the root (nothing to resize before the first `begin`).
     pub fn set_root_size(&mut self, width: f32, height: f32) {
-        let layout = &mut self.elements[0].config.layout;
+        let Some(root) = self.elements.first_mut() else { return };
+        let layout = &mut root.config.layout;
         layout.width = Sizing::fixed(width);
         layout.height = Sizing::fixed(height);
     }
-    /// Replace a text element's text and config. The old text stays in the
-    /// arena until the tree is declared again.
+    /// Replace a text element's text and config. Text that fits is
+    /// overwritten in place; the arena is compacted once half of it is
+    /// stale, reusing its capacity.
     pub fn set_text(&mut self, element: u32, text: &str, config: TextConfig) {
-        let start = self.text.len() as u32;
-        self.text.push_str(text);
-        let element = &mut self.elements[element as usize];
-        assert!(element.is_text, "not a text element");
-        element.text = config;
-        element.text_start = start;
-        element.text_len = text.len() as u32;
+        let index = element as usize;
+        assert!(self.elements[index].is_text, "not a text element");
+        let (start, len) = (self.elements[index].text_start as usize, self.elements[index].text_len as usize);
+        self.elements[index].text = config;
+        if text.len() <= len && self.text.is_char_boundary(start + text.len()) {
+            self.text.replace_range(start..start + text.len(), text);
+            self.dead_text += len - text.len();
+        } else {
+            self.dead_text += len;
+            let start = self.text.len() as u32;
+            self.text.push_str(text);
+            self.elements[index].text_start = start;
+        }
+        self.elements[index].text_len = text.len() as u32;
+        if self.dead_text * 2 > self.text.len() {
+            self.compact_text();
+        }
+    }
+    /// Pack live text to the front of the arena.
+    fn compact_text(&mut self) {
+        let mut packed = std::mem::take(&mut self.spare_text);
+        packed.clear();
+        for element in self.elements.iter_mut().filter(|e| e.is_text) {
+            let (start, len) = (element.text_start as usize, element.text_len as usize);
+            element.text_start = packed.len() as u32;
+            packed.push_str(&self.text[start..start + len]);
+        }
+        self.spare_text = std::mem::replace(&mut self.text, packed);
+        self.dead_text = 0;
+    }
+    /// Point floating `element` at `target` (another element), or at
+    /// nothing; for targets declared after it.
+    pub fn set_attached(&mut self, element: u32, target: Option<u32>) {
+        let target = target.filter(|&t| (t as usize) < self.elements.len()).unwrap_or(NONE);
+        self.elements[element as usize].attached = target;
     }
     pub fn is_text(&self, element: u32) -> bool {
         self.elements[element as usize].is_text

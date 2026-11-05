@@ -1,0 +1,12 @@
+[package]
+name = "static-ui"
+version = "0.1.0"
+edition = "2024"
+description = "A retained, async, ECS-native UI on static-ecs: Clay layout, Disabling-toggled panels, behaviors as futures"
+
+[dependencies]
+static-ecs = { path = "../static-ecs" }
+static-ui-layout = { path = "../static-ui-layout" }
+
+[dev-dependencies]
+static-ui-clay-oracle = { path = "../static-ui-clay-oracle" }

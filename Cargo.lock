@@ -204,6 +204,15 @@ name = "static-ecs-mcp"
 version = "0.1.0"
 
 [[package]]
+name = "static-ui"
+version = "0.1.0"
+dependencies = [
+ "static-ecs",
+ "static-ui-clay-oracle",
+ "static-ui-layout",
+]
+
+[[package]]
 name = "static-ui-clay-oracle"
 version = "0.1.0"
 dependencies = [

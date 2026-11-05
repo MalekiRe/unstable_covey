@@ -217,7 +217,7 @@ impl<R: Relation> Relates<R> {
             value,
         }
     }
-    pub fn targets(&self) -> impl ExactSizeIterator<Item = Entity> + '_ {
+    pub fn targets(&self) -> impl DoubleEndedIterator<Item = Entity> + ExactSizeIterator + '_ {
         self.side.entries().iter().map(|&(entity, _)| entity)
     }
     pub fn len(&self) -> usize {
@@ -252,7 +252,7 @@ impl<R: Relation> Sources<R> {
             relation: PhantomData,
         }
     }
-    pub fn sources(&self) -> impl ExactSizeIterator<Item = Entity> + '_ {
+    pub fn sources(&self) -> impl DoubleEndedIterator<Item = Entity> + ExactSizeIterator + '_ {
         self.side.entries().iter().map(|&(entity, _)| entity)
     }
     pub fn len(&self) -> usize {

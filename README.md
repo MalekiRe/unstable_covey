@@ -3,6 +3,7 @@
 | Path | What it is |
 |---|---|
 | [`crates/static-ecs`](crates/static-ecs) | The ECS: the whole app is one Rust type ([README](crates/static-ecs/README.md), [benchmarks](crates/static-ecs/BENCHMARKS.md)) |
+| [`crates/static-ui`](crates/static-ui) | The UI on static-ecs: components, flattened Clay layout, `Closed` panels |
 | [`crates/static-ui-layout`](crates/static-ui-layout) | Clay's layout algorithm over flat arrays, no dependencies |
 | [`crates/static-ui-clay-oracle`](crates/static-ui-clay-oracle) | Test-only: clay.h as the oracle for the layout port (100,000 random trees), and a layout benchmark |
 | [`demo/`](demo) | Apps built from plugins, including a CPU-rendered Wayland client |
