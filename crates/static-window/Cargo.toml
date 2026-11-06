@@ -13,6 +13,8 @@ wayland-protocols = { version = "0.32", features = ["client", "staging", "unstab
 rustix = { version = "1", features = ["fs", "mm", "time", "event", "pipe"] }
 # Keymaps: pure Rust XKB, with compose for dead keys.
 kbvm = { version = "0.2", default-features = false, features = ["compose"] }
+# Cursor themes, for compositors without cursor-shape-v1.
+xcursor = "0.3"
 
 [dev-dependencies]
 wayland-server = "0.31"

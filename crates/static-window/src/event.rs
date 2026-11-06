@@ -79,6 +79,14 @@ pub struct PointerButton {
     pub button: MouseButton,
     pub pressed: bool,
 }
+/// Raw, unaccelerated pointer motion while the window holds the pointer
+/// with [`PointerLock`](crate::PointerLock).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerDelta {
+    pub window: Entity,
+    pub dx: f32,
+    pub dy: f32,
+}
 /// Wheel or touchpad scroll, in logical units, positive down and right.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scroll {
@@ -116,7 +124,7 @@ impl TextInput {
     }
 }
 
-payload!(Redraw, CloseRequested, Resized, FocusChanged, PointerMoved, PointerLeft, PointerButton, Scroll, KeyInput, TextInput);
+payload!(Redraw, CloseRequested, Resized, FocusChanged, PointerMoved, PointerLeft, PointerButton, PointerDelta, Scroll, KeyInput, TextInput);
 
 /// Up to 32 bytes of UTF-8 inline, so a keystroke allocates nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]

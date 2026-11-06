@@ -16,11 +16,17 @@ use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::{Connection, ConnectError, EventQueue, Proxy};
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
-use crate::event::{CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput};
+use crate::clipboard::{Clipboard, ClipboardText};
+use crate::cursor::{CursorIcon, PointerLock, Theme};
+use crate::event::{
+    CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerDelta, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step,
+    TextInput,
+};
 use crate::framebuffer::{Framebuffer, Shm};
 use crate::input::{Key, Keys, Pointer};
 use crate::wayland::{Feedback, Globals, InputEvent, Proto, State, placeholder};
 use crate::window::{Animating, KeyboardFocus, Minimize, PointerOver, Surface, Window, WindowMode, WindowState};
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime;
 
 /// Emit a window event's label, then deliver it to its window entity for
 /// behaviors.
@@ -61,6 +67,10 @@ pub trait WindowWorld:
     + Stores<Inbox<PointerMoved>>
     + Stores<Inbox<PointerLeft>>
     + Stores<Inbox<PointerButton>>
+    + Stores<Inbox<PointerDelta>>
+    + Stores<CursorIcon>
+    + Stores<PointerLock>
+    + Stores<Clipboard>
     + Stores<Inbox<Scroll>>
     + Stores<Inbox<KeyInput>>
     + Stores<Inbox<TextInput>>
@@ -86,6 +96,10 @@ impl<S> WindowWorld for S where
         + Stores<Inbox<PointerMoved>>
         + Stores<Inbox<PointerLeft>>
         + Stores<Inbox<PointerButton>>
+        + Stores<Inbox<PointerDelta>>
+        + Stores<CursorIcon>
+        + Stores<PointerLock>
+        + Stores<Clipboard>
         + Stores<Inbox<Scroll>>
         + Stores<Inbox<KeyInput>>
         + Stores<Inbox<TextInput>>
@@ -102,6 +116,8 @@ pub trait WindowLabels<S: Storage>:
     + Handles<PointerMoved, World<S>>
     + Handles<PointerLeft, World<S>>
     + Handles<PointerButton, World<S>>
+    + Handles<PointerDelta, World<S>>
+    + Handles<ClipboardText, World<S>>
     + Handles<Scroll, World<S>>
     + Handles<KeyInput, World<S>>
     + Handles<TextInput, World<S>>
@@ -116,6 +132,8 @@ impl<S: Storage, L> WindowLabels<S> for L where
         + Handles<PointerMoved, World<S>>
         + Handles<PointerLeft, World<S>>
         + Handles<PointerButton, World<S>>
+        + Handles<PointerDelta, World<S>>
+        + Handles<ClipboardText, World<S>>
         + Handles<Scroll, World<S>>
         + Handles<KeyInput, World<S>>
         + Handles<TextInput, World<S>>
@@ -236,9 +254,16 @@ impl WindowLoop {
             viewporter: list.bind(&qh, 1..=1, ()).ok(),
             fractional: list.bind(&qh, 1..=1, ()).ok(),
             presentation: list.bind(&qh, 1..=2, ()).ok(),
+            cursor_shape: list.bind(&qh, 1..=1, ()).ok(),
+            constraints: list.bind(&qh, 1..=1, ()).ok(),
+            relative: list.bind(&qh, 1..=1, ()).ok(),
+            data_device: list.bind(&qh, 1..=3, ()).ok(),
         };
         let mut state = State::default();
         state.seat.seat = list.bind(&qh, 1..=8, ()).ok();
+        if let (Some(manager), Some(seat)) = (&globals.data_device, &state.seat.seat) {
+            state.selection.device = Some(manager.get_data_device(seat, &qh, ()));
+        }
         let registry = list.registry().clone();
         for global in list.contents().clone_list() {
             if global.interface == WlOutput::interface().name {
@@ -335,6 +360,9 @@ impl WindowLoop {
         self.count_frame(&app.world);
         self.apply(app);
         self.apply_input(app);
+        if let Some(text) = self.state.selection.received.take() {
+            app.emit(&ClipboardText { text });
+        }
         let now = Instant::now();
         let wall = self.last_step.map_or(0.0, |t| (now - t).as_secs_f32());
         self.last_step = Some(now);
@@ -359,6 +387,7 @@ impl WindowLoop {
         world.init_resource::<Keys>();
         world.init_resource::<Pointer>();
         world.init_resource::<WakeAt>();
+        world.init_resource::<Clipboard>();
         let wake = self.wake.clone();
         world.insert_resource(Wakeup(Arc::new(move || {
             let _ = rustix::io::write(&*wake, &1u64.to_ne_bytes());
@@ -368,6 +397,7 @@ impl WindowLoop {
     fn has_work<S: WindowWorld>(&self, world: &World<S>) -> bool {
         self.woken
             || !self.state.input.is_empty()
+            || self.state.selection.received.is_some()
             || self.state.seat.repeat.deadline().is_some_and(|at| at <= now_ns())
             || self.state.windows.iter().any(|w| w.dirty || w.close_requested || w.frame_done)
             || !self.state.released.is_empty() && self.state.windows.iter().any(|w| w.waiting)
@@ -390,8 +420,14 @@ impl WindowLoop {
         let timeout = [timeout, wake_at, repeat].into_iter().flatten().min();
         let timespec = timeout.map(|t| Timespec { tv_sec: t.as_secs() as i64, tv_nsec: t.subsec_nanos() as i64 });
         let socket = guard.connection_fd();
-        let mut fds = [PollFd::new(&socket, PollFlags::IN), PollFd::new(&*self.wake, PollFlags::IN)];
-        let ready = match rustix::event::poll(&mut fds, timespec.as_ref()) {
+        let pipe = self.state.selection.reading.as_ref().map(|(pipe, _)| pipe);
+        let mut fds = [
+            PollFd::new(&socket, PollFlags::IN),
+            PollFd::new(&*self.wake, PollFlags::IN),
+            PollFd::new(pipe.unwrap_or(&*self.wake), PollFlags::IN),
+        ];
+        let polled = if pipe.is_some() { &mut fds[..] } else { &mut fds[..2] };
+        let ready = match rustix::event::poll(polled, timespec.as_ref()) {
             Ok(ready) => ready,
             Err(rustix::io::Errno::INTR) => 1,
             Err(_) => return None,
@@ -412,6 +448,7 @@ impl WindowLoop {
         if socket.contains(PollFlags::HUP) {
             return None;
         }
+        self.state.selection.drain();
         if wake.contains(PollFlags::IN) {
             let mut count = [0u8; 8];
             let _ = rustix::io::read(&*self.wake, &mut count);
@@ -565,6 +602,14 @@ impl WindowLoop {
                     }
                     if alive(world, window) {
                         emit!(app, PointerButton { window, button, pressed });
+                    }
+                }
+                InputEvent::Delta { window, dx, dy } => {
+                    if let Some(pointer) = world.resource_mut::<Pointer>().map(Mut::into_inner) {
+                        pointer.add_delta(dx, dy);
+                    }
+                    if alive(world, window) {
+                        emit!(app, PointerDelta { window, dx, dy });
                     }
                 }
                 InputEvent::Scroll { window, dx, dy, lines } => {
@@ -777,6 +822,70 @@ impl WindowLoop {
                 window.toplevel.set_minimized();
             }
         }
+        self.sync_pointer(world);
+        let qh = self.queue.handle();
+        if let Some(clipboard) = world.resource_mut::<Clipboard>().map(Mut::into_inner) {
+            if let (Some(text), Some(manager)) = (clipboard.set.take(), &self.globals.data_device) {
+                self.state.selection.set(manager, &qh, text, self.state.seat.input_serial);
+            }
+            if std::mem::take(&mut clipboard.requested) {
+                self.state.selection.request(&self.conn);
+            }
+        }
+    }
+
+    /// Pointer locks (with raw motion while any holds), and the cursor of
+    /// the window under the pointer.
+    fn sync_pointer<S: WindowWorld>(&mut self, world: &World<S>) {
+        let qh = self.queue.handle();
+        let seat = &mut self.state.seat;
+        let Some(pointer) = &seat.pointer else { return };
+        for window in &mut self.state.windows {
+            let wanted = world.get::<PointerLock>(window.entity).is_some();
+            match (wanted, window.lock.take(), &self.globals.constraints) {
+                (true, None, Some(constraints)) => {
+                    window.lock = Some(constraints.lock_pointer(&window.surface, pointer, None, Lifetime::Persistent, &qh, ()));
+                }
+                (true, held, _) => window.lock = held,
+                (false, Some(lock), _) => lock.destroy(),
+                (false, None, _) => {}
+            }
+        }
+        let locked = self.state.windows.iter().any(|w| w.lock.is_some());
+        match (locked, seat.relative.take(), &self.globals.relative) {
+            (true, None, Some(manager)) => seat.relative = Some(manager.get_relative_pointer(pointer, &qh, ())),
+            (true, held, _) => seat.relative = held,
+            (false, Some(relative), _) => relative.destroy(),
+            (false, None, _) => {}
+        }
+        let Some(window) = seat.pointer_focus else { return };
+        let icon = if world.get::<PointerLock>(window).is_some() {
+            CursorIcon::Hidden
+        } else {
+            world.get::<CursorIcon>(window).copied().unwrap_or_default()
+        };
+        if seat.cursor == Some(icon) {
+            return;
+        }
+        seat.cursor = Some(icon);
+        let serial = seat.pointer_serial;
+        match (icon.shape(), &self.globals.cursor_shape) {
+            (None, _) => pointer.set_cursor(serial, None, 0, 0),
+            (Some(shape), Some(manager)) => {
+                seat.cursor_device.get_or_insert_with(|| manager.get_pointer(pointer, &qh, ())).set_shape(serial, shape);
+            }
+            // The compositor won't draw it: the theme's image, at the
+            // window's (whole) scale.
+            (Some(_), None) => {
+                let outputs = &self.state.outputs;
+                let scale = self.state.windows.iter().find(|w| w.entity == window).map_or(1, |w| w.scale(outputs).0.div_ceil(crate::Scale::UNIT));
+                let theme = self.state.theme.get_or_insert_with(|| Theme::new(&self.globals.compositor, &qh));
+                let hotspot = theme.show(icon, scale, &self.globals.shm, &qh).or_else(|| theme.show(CursorIcon::Default, scale, &self.globals.shm, &qh));
+                if let Some((x, y)) = hotspot {
+                    pointer.set_cursor(serial, Some(&theme.surface), x, y);
+                }
+            }
+        }
     }
 
     fn create(&mut self, entity: Entity, window: Window, mode: WindowMode) {
@@ -830,6 +939,7 @@ impl WindowLoop {
             pacer: Default::default(),
             commits: 0,
             frame_seq: 0,
+            lock: None,
         };
         set_mode(&mut proto, mode);
         proto.surface.commit();

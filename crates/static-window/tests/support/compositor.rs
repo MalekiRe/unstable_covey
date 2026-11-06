@@ -15,13 +15,17 @@ use std::thread::JoinHandle;
 
 use rustix::event::{PollFd, PollFlags};
 use wayland_protocols::wp::fractional_scale::v1::server::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1};
+use wayland_protocols::wp::cursor_shape::v1::server::{wp_cursor_shape_device_v1, wp_cursor_shape_manager_v1};
+use wayland_protocols::wp::pointer_constraints::zv1::server::{zwp_locked_pointer_v1, zwp_pointer_constraints_v1};
 use wayland_protocols::wp::presentation_time::server::{wp_presentation, wp_presentation_feedback};
+use wayland_protocols::wp::relative_pointer::zv1::server::{zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1};
 use wayland_protocols::wp::viewporter::server::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
 use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::backend::ClientId;
 use wayland_server::protocol::{
-    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_callback, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_data_source, wl_keyboard, wl_output,
+    wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource, WEnum};
 
@@ -32,12 +36,20 @@ pub struct Globals {
     pub viewporter: bool,
     pub fractional_scale: bool,
     pub presentation: bool,
+    pub cursor_shape: bool,
     /// The keymap sent to the client's keyboard.
     pub keymap: &'static [u8],
 }
 impl Default for Globals {
     fn default() -> Self {
-        Self { decoration: true, viewporter: true, fractional_scale: true, presentation: true, keymap: include_bytes!("us.xkb") }
+        Self {
+            decoration: true,
+            viewporter: true,
+            fractional_scale: true,
+            presentation: true,
+            cursor_shape: true,
+            keymap: include_bytes!("us.xkb"),
+        }
     }
 }
 
@@ -108,6 +120,12 @@ fn serve(stream: UnixStream, globals: Globals, wake: OwnedFd, commands: Receiver
     if globals.presentation {
         handle.create_global::<Server, wp_presentation::WpPresentation, ()>(1, ());
     }
+    if globals.cursor_shape {
+        handle.create_global::<Server, wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()>(1, ());
+    }
+    handle.create_global::<Server, zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()>(1, ());
+    handle.create_global::<Server, zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ()>(1, ());
+    handle.create_global::<Server, wl_data_device_manager::WlDataDeviceManager, ()>(3, ());
     let client = handle.insert_client(stream, Arc::new(())).expect("client");
     let mut server = Server { client: Some(client.id()), keymap: globals.keymap, ..Server::default() };
     loop {
@@ -229,6 +247,16 @@ pub struct Server {
     pub outputs: Vec<wl_output::WlOutput>,
     pub pointer: Option<wl_pointer::WlPointer>,
     pub keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// Shapes set through cursor-shape-v1.
+    pub shapes: Vec<wp_cursor_shape_device_v1::Shape>,
+    /// `wl_pointer.set_cursor` calls: whether a surface was given.
+    pub set_cursor: Vec<bool>,
+    /// Pointer locks: the locked surface's index, and whether it was let go.
+    pub locks: Vec<(usize, bool)>,
+    pub relative: Option<zwp_relative_pointer_v1::ZwpRelativePointerV1>,
+    pub data_device: Option<wl_data_device::WlDataDevice>,
+    /// The client's selection: the source, its types, and the serial quoted.
+    pub selection: Option<(wl_data_source::WlDataSource, Vec<String>, u32)>,
     keymap: &'static [u8],
     serial: u32,
     time: u32,
@@ -352,6 +380,33 @@ impl Server {
         let secs = display_ns / 1_000_000_000;
         feedback.presented((secs >> 32) as u32, secs as u32, (display_ns % 1_000_000_000) as u32, refresh_ns, 0, 0, wp_presentation_feedback::Kind::Vsync);
     }
+    /// Raw pointer motion, for a locked pointer.
+    pub fn relative_motion(&mut self, dx: f64, dy: f64) {
+        let relative = self.relative.as_ref().expect("no relative pointer");
+        relative.relative_motion(0, 0, dx * 2.0, dy * 2.0, dx, dy);
+        self.pointer.as_ref().unwrap().frame();
+    }
+    /// Paste the client's selection as `mime`: the pipe to read it from
+    /// once the client has handled the request.
+    pub fn paste(&mut self, mime: &str) -> OwnedFd {
+        let (read, write) = rustix::pipe::pipe().unwrap();
+        self.selection.as_ref().expect("no selection").0.send(mime.into(), write.as_fd());
+        read
+    }
+    /// Another client puts `text` on the clipboard.
+    pub fn offer_text(&mut self, handle: &DisplayHandle, text: &str) {
+        let device = self.data_device.as_ref().expect("no data device");
+        let client = handle.get_client(device.id()).unwrap();
+        let offer = client.create_resource::<wl_data_offer::WlDataOffer, Arc<str>, Server>(handle, device.version(), text.into()).unwrap();
+        device.data_offer(&offer);
+        offer.offer("text/plain".into());
+        offer.offer("text/plain;charset=utf-8".into());
+        device.selection(Some(&offer));
+        // Our client's own source, if any, is no longer the selection.
+        if let Some((source, _, _)) = self.selection.take() {
+            source.cancelled();
+        }
+    }
     /// Fire every committed frame callback with time `ms`.
     pub fn fire_frames(&mut self, toplevel: usize, ms: u32) -> usize {
         let surface = self.toplevels[toplevel].surface;
@@ -460,7 +515,115 @@ impl Dispatch<wl_seat::WlSeat, ()> for Server {
 }
 
 impl Dispatch<wl_pointer::WlPointer, ()> for Server {
-    fn request(_: &mut Self, _: &Client, _: &wl_pointer::WlPointer, _: wl_pointer::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {}
+    fn request(server: &mut Self, _: &Client, _: &wl_pointer::WlPointer, request: wl_pointer::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+        if let wl_pointer::Request::SetCursor { surface, .. } = request {
+            server.set_cursor.push(surface.is_some());
+        }
+    }
+}
+
+impl GlobalDispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for Server {
+    fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1>, _: &(), init: &mut DataInit<'_, Self>) {
+        init.init(resource, ());
+    }
+}
+impl Dispatch<wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, ()> for Server {
+    fn request(_: &mut Self, _: &Client, _: &wp_cursor_shape_manager_v1::WpCursorShapeManagerV1, request: wp_cursor_shape_manager_v1::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
+        if let wp_cursor_shape_manager_v1::Request::GetPointer { cursor_shape_device, .. } = request {
+            init.init(cursor_shape_device, ());
+        }
+    }
+}
+impl Dispatch<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &wp_cursor_shape_device_v1::WpCursorShapeDeviceV1, request: wp_cursor_shape_device_v1::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+        if let wp_cursor_shape_device_v1::Request::SetShape { shape: WEnum::Value(shape), .. } = request {
+            server.shapes.push(shape);
+        }
+    }
+}
+
+impl GlobalDispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for Server {
+    fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>, _: &(), init: &mut DataInit<'_, Self>) {
+        init.init(resource, ());
+    }
+}
+impl Dispatch<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, request: zwp_pointer_constraints_v1::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
+        if let zwp_pointer_constraints_v1::Request::LockPointer { id, surface, .. } = request {
+            let index = server.locks.len();
+            server.locks.push((*surface.data::<usize>().unwrap(), false));
+            init.init(id, index).locked();
+        }
+    }
+}
+impl Dispatch<zwp_locked_pointer_v1::ZwpLockedPointerV1, usize> for Server {
+    fn request(server: &mut Self, _: &Client, _: &zwp_locked_pointer_v1::ZwpLockedPointerV1, request: zwp_locked_pointer_v1::Request, &index: &usize, _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+        if let zwp_locked_pointer_v1::Request::Destroy = request {
+            server.locks[index].1 = true;
+        }
+    }
+}
+
+impl GlobalDispatch<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ()> for Server {
+    fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>, _: &(), init: &mut DataInit<'_, Self>) {
+        init.init(resource, ());
+    }
+}
+impl Dispatch<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1, request: zwp_relative_pointer_manager_v1::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
+        if let zwp_relative_pointer_manager_v1::Request::GetRelativePointer { id, .. } = request {
+            server.relative = Some(init.init(id, ()));
+        }
+    }
+}
+impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &zwp_relative_pointer_v1::ZwpRelativePointerV1, request: zwp_relative_pointer_v1::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+        if let zwp_relative_pointer_v1::Request::Destroy = request {
+            server.relative = None;
+        }
+    }
+}
+
+impl GlobalDispatch<wl_data_device_manager::WlDataDeviceManager, ()> for Server {
+    fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<wl_data_device_manager::WlDataDeviceManager>, _: &(), init: &mut DataInit<'_, Self>) {
+        init.init(resource, ());
+    }
+}
+impl Dispatch<wl_data_device_manager::WlDataDeviceManager, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &wl_data_device_manager::WlDataDeviceManager, request: wl_data_device_manager::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
+        match request {
+            wl_data_device_manager::Request::CreateDataSource { id } => {
+                init.init(id, std::sync::Mutex::new(Vec::<String>::new()));
+            }
+            wl_data_device_manager::Request::GetDataDevice { id, .. } => server.data_device = Some(init.init(id, ())),
+            _ => {}
+        }
+    }
+}
+impl Dispatch<wl_data_device::WlDataDevice, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &wl_data_device::WlDataDevice, request: wl_data_device::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+        if let wl_data_device::Request::SetSelection { source, serial } = request {
+            server.selection = source.map(|source| {
+                let mimes = source.data::<std::sync::Mutex<Vec<String>>>().unwrap().lock().unwrap().clone();
+                (source, mimes, serial)
+            });
+        }
+    }
+}
+impl Dispatch<wl_data_source::WlDataSource, std::sync::Mutex<Vec<String>>> for Server {
+    fn request(_: &mut Self, _: &Client, _: &wl_data_source::WlDataSource, request: wl_data_source::Request, mimes: &std::sync::Mutex<Vec<String>>, _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+        if let wl_data_source::Request::Offer { mime_type } = request {
+            mimes.lock().unwrap().push(mime_type);
+        }
+    }
+}
+impl Dispatch<wl_data_offer::WlDataOffer, Arc<str>> for Server {
+    fn request(_: &mut Self, _: &Client, _: &wl_data_offer::WlDataOffer, request: wl_data_offer::Request, text: &Arc<str>, _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+        // Another client's selection: write it, then close the pipe.
+        if let wl_data_offer::Request::Receive { fd, .. } = request {
+            rustix::io::write(&fd, text.as_bytes()).unwrap();
+        }
+    }
 }
 
 impl Dispatch<wl_keyboard::WlKeyboard, ()> for Server {

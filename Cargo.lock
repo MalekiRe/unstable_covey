@@ -433,6 +433,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-server",
+ "xcursor",
 ]
 
 [[package]]
@@ -599,3 +600,9 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "xcursor"
+version = "0.3.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "163b33ed8786455e2fa5d72f554057ce3f3182425434f756cd39c99839d88e23"

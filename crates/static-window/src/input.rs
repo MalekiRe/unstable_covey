@@ -283,6 +283,11 @@ impl Pointer {
         self.x = x;
         self.y = y;
     }
+    /// Raw motion while locked: the position stays, the delta grows.
+    pub(crate) fn add_delta(&mut self, dx: f32, dy: f32) {
+        self.delta.0 += dx;
+        self.delta.1 += dy;
+    }
     pub(crate) fn set_button(&mut self, button: MouseButton, down: bool) {
         if down {
             self.buttons |= button.bit();

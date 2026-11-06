@@ -15,6 +15,8 @@
 //!
 //! See `WINDOW_PLAN.md` at the workspace root for the design.
 
+mod clipboard;
+mod cursor;
 mod event;
 mod framebuffer;
 mod input;
@@ -30,8 +32,11 @@ use static_ecs::prelude::*;
 use static_ecs::{Inbox, Wakeup};
 
 pub use event::{
-    CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput,
+    CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerDelta, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step,
+    TextInput,
 };
+pub use clipboard::{Clipboard, ClipboardText};
+pub use cursor::{CursorIcon, PointerLock};
 pub use framebuffer::{Framebuffer, PixelRect, Target};
 pub use input::{Key, KeyCode, Keys, Modifiers, MouseButton, Pointer};
 pub use run::{Error, Flow, Stats, WakeAt, WindowLabels, WindowLoop, WindowWorld, run};
@@ -53,6 +58,9 @@ impl Plugin for WindowPlugin {
         PointerOver,
         Animating,
         Framebuffer,
+        CursorIcon,
+        PointerLock,
+        Clipboard,
         Keys,
         Pointer,
         WakeAt,
@@ -64,10 +72,11 @@ impl Plugin for WindowPlugin {
         Inbox<PointerMoved>,
         Inbox<PointerLeft>,
         Inbox<PointerButton>,
+        Inbox<PointerDelta>,
         Inbox<Scroll>,
         Inbox<KeyInput>,
         Inbox<TextInput>,
     );
-    type Storage = (Sparse<Minimize>, Sparse<KeyboardFocus>, Sparse<PointerOver>, Sparse<Animating>);
+    type Storage = (Sparse<Minimize>, Sparse<KeyboardFocus>, Sparse<PointerOver>, Sparse<Animating>, Sparse<PointerLock>);
     fn systems<S: Storage>(self) -> impl Systems<S> {}
 }

@@ -24,7 +24,16 @@ use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 
+use crate::clipboard::Selection;
+use crate::cursor::{CursorIcon, Theme};
 use crate::event::TextInput;
+use wayland_client::protocol::wl_data_device_manager::WlDataDeviceManager;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1;
+use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1;
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::ZwpLockedPointerV1;
+use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::ZwpPointerConstraintsV1;
+use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1;
+use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1::{self, ZwpRelativePointerV1};
 use crate::framebuffer::BufferId;
 use crate::input::{Key, KeyCode, MouseButton};
 use crate::keyboard::{Keymap, Typed};
@@ -46,6 +55,10 @@ pub(crate) struct Globals {
     pub viewporter: Option<WpViewporter>,
     pub fractional: Option<WpFractionalScaleManagerV1>,
     pub presentation: Option<WpPresentation>,
+    pub cursor_shape: Option<WpCursorShapeManagerV1>,
+    pub constraints: Option<ZwpPointerConstraintsV1>,
+    pub relative: Option<ZwpRelativePointerManagerV1>,
+    pub data_device: Option<WlDataDeviceManager>,
 }
 
 /// An output, for the integer-scale fallback and its refresh rate.
@@ -109,6 +122,8 @@ pub(crate) struct Proto {
     pub commits: u64,
     /// The commit the outstanding frame callback rides on.
     pub frame_seq: u64,
+    /// The pointer lock, while [`crate::PointerLock`] is on the window.
+    pub lock: Option<ZwpLockedPointerV1>,
 }
 
 impl Proto {
@@ -130,6 +145,9 @@ impl Drop for Proto {
     fn drop(&mut self) {
         // Role objects before their surface; a decoration before its
         // toplevel (the reverse is a protocol error).
+        if let Some(lock) = self.lock.take() {
+            lock.destroy();
+        }
         if let Some(decoration) = self.decoration.take() {
             decoration.destroy();
         }
@@ -166,6 +184,9 @@ pub(crate) struct State {
     pub clock: Option<u32>,
     /// Input-to-screen latencies, in nanoseconds, if the loop records them.
     pub presented: Option<Vec<u64>>,
+    pub selection: Selection,
+    /// The cursor theme, where the compositor cannot draw shapes itself.
+    pub theme: Option<Theme>,
 }
 
 impl State {
@@ -408,6 +429,23 @@ delegate_noop!(State: WpViewporter);
 delegate_noop!(State: WpViewport);
 delegate_noop!(State: WpFractionalScaleManagerV1);
 delegate_noop!(State: ZxdgDecorationManagerV1);
+delegate_noop!(State: WpCursorShapeManagerV1);
+delegate_noop!(State: WpCursorShapeDeviceV1);
+delegate_noop!(State: ZwpPointerConstraintsV1);
+delegate_noop!(State: ZwpRelativePointerManagerV1);
+delegate_noop!(State: ignore ZwpLockedPointerV1);
+// The theme's cursor surface.
+delegate_noop!(State: ignore WlSurface);
+
+impl Dispatch<ZwpRelativePointerV1, ()> for State {
+    fn event(state: &mut Self, _: &ZwpRelativePointerV1, event: zwp_relative_pointer_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let zwp_relative_pointer_v1::Event::RelativeMotion { dx_unaccel, dy_unaccel, .. } = event
+            && let Some(window) = state.seat.pointer_focus
+        {
+            state.input.push(InputEvent::Delta { window, dx: dx_unaccel as f32, dy: dy_unaccel as f32 });
+        }
+    }
+}
 
 /// Input, in the order the compositor sent it, for the loop to apply.
 #[derive(Clone, Copy, Debug)]
@@ -421,6 +459,8 @@ pub(crate) enum InputEvent {
     Motion { window: Entity, x: f32, y: f32 },
     Button { window: Entity, button: MouseButton, pressed: bool },
     Scroll { window: Entity, dx: f32, dy: f32, lines: Option<(f32, f32)> },
+    /// Unaccelerated motion, while the pointer is locked.
+    Delta { window: Entity, dx: f32, dy: f32 },
 }
 
 /// Scroll gathered over a pointer frame: pixels, and wheel detents.
@@ -430,7 +470,7 @@ type PendingScroll = (f32, f32, Option<(f32, f32)>);
 #[derive(Default)]
 pub(crate) struct Seat {
     pub seat: Option<WlSeat>,
-    pointer: Option<WlPointer>,
+    pub pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     keymap: Option<Keymap>,
     /// The keymap being compiled off the loop's thread: compiling one, with
@@ -442,6 +482,14 @@ pub(crate) struct Seat {
     pub pointer_focus: Option<Entity>,
     /// The serial of the last pointer enter (cursor requests quote it).
     pub pointer_serial: u32,
+    /// The latest input event's serial: setting the selection quotes it.
+    pub input_serial: u32,
+    /// The compositor draws the cursor shape we name, if it can.
+    pub cursor_device: Option<WpCursorShapeDeviceV1>,
+    /// The cursor last set; reset by each pointer enter.
+    pub cursor: Option<CursorIcon>,
+    /// Raw motion, while some window holds the pointer locked.
+    pub relative: Option<ZwpRelativePointerV1>,
     /// Scroll gathered until `wl_pointer.frame`.
     scroll: Option<PendingScroll>,
 }
@@ -524,7 +572,8 @@ impl Dispatch<WlKeyboard, ()> for State {
                     state.seat.compiling = Some(std::thread::spawn(move || Keymap::from_bytes(&bytes)));
                 }
             }
-            wl_keyboard::Event::Enter { surface, keys, .. } => {
+            wl_keyboard::Event::Enter { serial, surface, keys } => {
+                state.seat.input_serial = serial;
                 let Some(&window) = surface.data::<Entity>() else { return };
                 state.seat.keyboard_focus = Some(window);
                 let mut held = [None; 8];
@@ -543,7 +592,8 @@ impl Dispatch<WlKeyboard, ()> for State {
                 }
                 state.input.push(InputEvent::KeyboardLeave { window });
             }
-            wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } => {
+            wl_keyboard::Event::Key { serial, key, state: WEnum::Value(key_state), .. } => {
+                state.seat.input_serial = serial;
                 let Some(window) = state.seat.keyboard_focus else { return };
                 let pressed = key_state == wl_keyboard::KeyState::Pressed;
                 if pressed {
@@ -573,6 +623,9 @@ impl Dispatch<WlPointer, ()> for State {
                 let Some(&window) = surface.data::<Entity>() else { return };
                 state.seat.pointer_focus = Some(window);
                 state.seat.pointer_serial = serial;
+                state.seat.input_serial = serial;
+                // The compositor hands cursor duty back on every enter.
+                state.seat.cursor = None;
                 state.input.push(InputEvent::PointerEnter { window, x: surface_x as f32, y: surface_y as f32 });
             }
             wl_pointer::Event::Leave { surface, .. } => {
@@ -586,7 +639,8 @@ impl Dispatch<WlPointer, ()> for State {
                     state.input.push(InputEvent::Motion { window, x: surface_x as f32, y: surface_y as f32 });
                 }
             }
-            wl_pointer::Event::Button { button, state: WEnum::Value(button_state), .. } => {
+            wl_pointer::Event::Button { serial, button, state: WEnum::Value(button_state), .. } => {
+                state.seat.input_serial = serial;
                 if let Some(window) = state.seat.pointer_focus {
                     let pressed = button_state == wl_pointer::ButtonState::Pressed;
                     state.input.push(InputEvent::Button { window, button: MouseButton::from_evdev(button), pressed });
