@@ -56,7 +56,14 @@ fn main() {
         .build();
     app.world.spawn_bundle((Window::new("software").size(480, 200).app_id("static-window.software"), Framebuffer::default(), Animating));
     match run(&mut app) {
-        Ok(stats) => println!("{} wakeups, {} commits", stats.wakeups, stats.commits),
+        Ok(stats) => println!(
+            "{} wakeups, {} frames ({} from frame callbacks), {} commits, first commit {:.2} ms after start",
+            stats.wakeups,
+            stats.frames,
+            stats.callback_frames,
+            stats.commits,
+            stats.first_commit_ns as f64 / 1e6
+        ),
         Err(e) => eprintln!("{e}"),
     }
 }

@@ -15,6 +15,8 @@ use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_n
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1;
 use wayland_protocols::wp::fractional_scale::v1::client::wp_fractional_scale_v1::{self, WpFractionalScaleV1};
 use wayland_protocols::wp::viewporter::client::wp_viewport::WpViewport;
+use wayland_protocols::wp::presentation_time::client::wp_presentation::{self, WpPresentation};
+use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback::{self, WpPresentationFeedback};
 use wayland_protocols::wp::viewporter::client::wp_viewporter::WpViewporter;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_decoration_manager_v1::ZxdgDecorationManagerV1;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::{self, ZxdgToplevelDecorationV1};
@@ -26,6 +28,7 @@ use crate::event::TextInput;
 use crate::framebuffer::BufferId;
 use crate::input::{Key, KeyCode, MouseButton};
 use crate::keyboard::{Keymap, Typed};
+use crate::pacer::Pacer;
 use crate::repeat::Repeat;
 use crate::scale::Scale;
 use crate::window::WindowState;
@@ -42,6 +45,7 @@ pub(crate) struct Globals {
     pub decoration: Option<ZxdgDecorationManagerV1>,
     pub viewporter: Option<WpViewporter>,
     pub fractional: Option<WpFractionalScaleManagerV1>,
+    pub presentation: Option<WpPresentation>,
 }
 
 /// An output, for the integer-scale fallback and its refresh rate.
@@ -99,6 +103,12 @@ pub(crate) struct Proto {
     pub predrawn: Option<usize>,
     /// A frame is due but both buffers are with the compositor.
     pub waiting: bool,
+    /// Display timing for this surface, after StereoKit's frame pacer.
+    pub pacer: Pacer,
+    /// Buffer commits so far: the id of each commit's presentation.
+    pub commits: u64,
+    /// The commit the outstanding frame callback rides on.
+    pub frame_seq: u64,
 }
 
 impl Proto {
@@ -152,6 +162,10 @@ pub(crate) struct State {
     pub seat: Seat,
     /// Input since the loop last looked, in order.
     pub input: Vec<InputEvent>,
+    /// The presentation clock (CLOCK_MONOTONIC is 1, the clock we read).
+    pub clock: Option<u32>,
+    /// Input-to-screen latencies, in nanoseconds, if the loop records them.
+    pub presented: Option<Vec<u64>>,
 }
 
 impl State {
@@ -327,11 +341,58 @@ impl Dispatch<WlBuffer, BufferId> for State {
 
 impl Dispatch<WlCallback, Entity> for State {
     fn event(state: &mut Self, _: &WlCallback, event: wl_callback::Event, &entity: &Entity, _: &Connection, _: &QueueHandle<Self>) {
-        if let wl_callback::Event::Done { .. } = event
-            && let Some(window) = state.window(entity)
-        {
-            window.frame_requested = false;
-            window.frame_done = true;
+        let wl_callback::Event::Done { callback_data: ms } = event else { return };
+        let presentation = state.clock == Some(MONOTONIC);
+        let Some(window) = state.window(entity) else { return };
+        window.frame_requested = false;
+        window.frame_done = true;
+        // Without presentation-time, the callback's time is when the frame
+        // went to the screen (milliseconds on an unnamed clock that every
+        // compositor makes CLOCK_MONOTONIC, as sk_app assumes).
+        if !presentation {
+            let now = crate::run::now_ns();
+            let delta_ms = ms.wrapping_sub((now / 1_000_000) as u32) as i32;
+            if delta_ms.abs() < 1000 {
+                window.pacer.presented(window.frame_seq, (now as i64 + delta_ms as i64 * 1_000_000) as u64);
+            }
+        }
+    }
+}
+
+const MONOTONIC: u32 = 1;
+
+/// What a presentation feedback reports on.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Feedback {
+    pub window: Entity,
+    pub seq: u64,
+    /// When the input this frame answers arrived, for latency.
+    pub input_at: Option<u64>,
+}
+
+impl Dispatch<WpPresentation, ()> for State {
+    fn event(state: &mut Self, _: &WpPresentation, event: wp_presentation::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.clock = Some(clk_id);
+        }
+    }
+}
+
+impl Dispatch<WpPresentationFeedback, Feedback> for State {
+    fn event(state: &mut Self, _: &WpPresentationFeedback, event: wp_presentation_feedback::Event, feedback: &Feedback, _: &Connection, _: &QueueHandle<Self>) {
+        let wp_presentation_feedback::Event::Presented { tv_sec_hi, tv_sec_lo, tv_nsec, refresh, .. } = event else { return };
+        if state.clock != Some(MONOTONIC) {
+            return;
+        }
+        let shown = ((tv_sec_hi as u64) << 32 | tv_sec_lo as u64) * 1_000_000_000 + tv_nsec as u64;
+        if let (Some(at), Some(latencies)) = (feedback.input_at, &mut state.presented) {
+            latencies.push(shown.saturating_sub(at));
+        }
+        if let Some(window) = state.window(feedback.window) {
+            window.pacer.presented(feedback.seq, shown);
+            if refresh > 0 {
+                window.pacer.set_refresh(refresh as u64);
+            }
         }
     }
 }

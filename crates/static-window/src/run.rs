@@ -19,7 +19,7 @@ use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1
 use crate::event::{CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput};
 use crate::framebuffer::{Framebuffer, Shm};
 use crate::input::{Key, Keys, Pointer};
-use crate::wayland::{Globals, InputEvent, Proto, State, placeholder};
+use crate::wayland::{Feedback, Globals, InputEvent, Proto, State, placeholder};
 use crate::window::{Animating, KeyboardFocus, Minimize, PointerOver, Surface, Window, WindowMode, WindowState};
 
 /// Emit a window event's label, then deliver it to its window entity for
@@ -166,13 +166,28 @@ pub enum Flow {
     Disconnected,
 }
 
-/// The loop's own counters, for measuring an idle window.
+/// The loop's own counters, for measuring an idle window and latency.
 #[derive(Clone, Debug, Default)]
 pub struct Stats {
     /// Returns from `poll`.
     pub wakeups: u64,
+    /// Wakeups that ran a frame ([`Step`]), and what started them.
+    pub frames: u64,
+    pub input_frames: u64,
+    pub callback_frames: u64,
+    pub woken_frames: u64,
+    pub timer_frames: u64,
     /// Surface commits.
     pub commits: u64,
+    /// Nanoseconds from the loop's creation (or [`WindowLoop::launched_at`])
+    /// to the first buffer commit leaving the process; 0 before it.
+    pub first_commit_ns: u64,
+    /// With [`WindowLoop::record_latency`]: for each commit that answered
+    /// input or a wakeup, the nanoseconds from its arrival to the commit
+    /// leaving the process (our share), and to the screen, as
+    /// `wp_presentation` reports it.
+    pub input_to_commit_ns: Vec<u64>,
+    pub input_to_present_ns: Vec<u64>,
 }
 
 /// A Wayland connection driving one app's windows.
@@ -188,6 +203,11 @@ pub struct WindowLoop {
     woken: bool,
     started: bool,
     last_step: Option<Instant>,
+    /// When the launch began, for `Stats::first_commit_ns`.
+    launched_ns: u64,
+    /// When this wakeup's input (or wakeup) arrived.
+    input_at: Option<u64>,
+    record_latency: bool,
     missing: Vec<&'static str>,
     /// Numbers framebuffer allocations, so a late release of a replaced
     /// buffer is ignored.
@@ -215,6 +235,7 @@ impl WindowLoop {
             decoration: list.bind(&qh, 1..=1, ()).ok(),
             viewporter: list.bind(&qh, 1..=1, ()).ok(),
             fractional: list.bind(&qh, 1..=1, ()).ok(),
+            presentation: list.bind(&qh, 1..=2, ()).ok(),
         };
         let mut state = State::default();
         state.seat.seat = list.bind(&qh, 1..=8, ()).ok();
@@ -244,6 +265,9 @@ impl WindowLoop {
             woken: false,
             started: false,
             last_step: None,
+            launched_ns: now_ns(),
+            input_at: None,
+            record_latency: false,
             missing,
             generation: 0,
             stats: Stats::default(),
@@ -254,10 +278,29 @@ impl WindowLoop {
     pub fn missing(&self) -> &[&'static str] {
         &self.missing
     }
+    /// Measure `Stats::first_commit_ns` from `ns` (CLOCK_MONOTONIC), a
+    /// launcher's timestamp from before the process started.
+    pub fn launched_at(&mut self, ns: u64) {
+        self.launched_ns = ns;
+    }
+    /// Keep every input-to-commit and input-to-screen latency in `Stats`
+    /// (a growing list: for benchmarks).
+    pub fn record_latency(&mut self, record: bool) {
+        self.record_latency = record;
+        self.state.presented = record.then(Vec::new);
+    }
+    /// The stats, with the presentation latencies reported so far.
+    pub fn stats(&mut self) -> &Stats {
+        if let Some(presented) = &mut self.state.presented {
+            self.stats.input_to_present_ns.append(presented);
+        }
+        &self.stats
+    }
 
     /// Run until no windows remain or the compositor goes away.
     pub fn run<S: WindowWorld, L: WindowLabels<S>>(mut self, app: &mut App<S, L>) -> Stats {
         while self.step(app, None) == Flow::Continue {}
+        self.stats();
         self.stats
     }
 
@@ -289,15 +332,19 @@ impl WindowLoop {
             return Flow::Disconnected;
         }
         self.state.pump_repeat(now_ns());
+        self.count_frame(&app.world);
         self.apply(app);
         self.apply_input(app);
         let now = Instant::now();
-        let dt = self.last_step.map_or(0.0, |t| (now - t).as_secs_f32());
+        let wall = self.last_step.map_or(0.0, |t| (now - t).as_secs_f32());
         self.last_step = Some(now);
         if let Some(mut wake) = app.world.resource_mut::<WakeAt>() {
             *wake = WakeAt::default();
         }
-        app.world.insert_resource(FrameTime { now_ns: now_ns(), display_ns: 0, dt });
+        let now_ns = now_ns();
+        let paced = self.pace(now_ns);
+        let dt = if paced.dt_ns > 0 { paced.dt_ns as f32 / 1e9 } else { wall };
+        app.world.insert_resource(FrameTime { now_ns, display_ns: paced.display_ns, dt });
         app.emit(&Step);
         self.sync(&mut app.world);
         self.present(app);
@@ -627,8 +674,10 @@ impl WindowLoop {
             let Some(fb) = app.world.get_mut::<Framebuffer>(entity).map(Mut::into_inner) else { continue };
             fb.back = None;
             let surface = &window.surface;
+            let mut new_buffer = false;
             match (index, &mut fb.shm) {
                 (Some(index), Some(shm)) => {
+                    new_buffer = true;
                     surface.attach(Some(&shm.buffers[index]), 0, 0);
                     for r in &fb.regions {
                         surface.damage_buffer(r.x as i32, r.y as i32, r.width as i32, r.height as i32);
@@ -638,6 +687,11 @@ impl WindowLoop {
                         None => surface.set_buffer_scale(scale.0.div_ceil(crate::Scale::UNIT) as i32),
                     }
                     shm.busy[index] = true;
+                    window.commits += 1;
+                    if let Some(presentation) = &self.globals.presentation {
+                        let feedback = Feedback { window: entity, seq: window.commits, input_at: self.input_at };
+                        presentation.feedback(surface, &qh, feedback);
+                    }
                 }
                 // Nothing new to show, but an animation wants the next frame.
                 _ if animating && !window.frame_requested => {}
@@ -646,10 +700,49 @@ impl WindowLoop {
             if animating && !window.frame_requested {
                 surface.frame(&qh, entity);
                 window.frame_requested = true;
+                window.frame_seq = window.commits;
             }
             surface.commit();
             self.stats.commits += 1;
+            // Our share of the latency ends when the commit leaves.
+            if new_buffer && (self.stats.first_commit_ns == 0 || self.record_latency && self.input_at.is_some()) {
+                let _ = self.conn.flush();
+                let now = now_ns();
+                if self.stats.first_commit_ns == 0 {
+                    self.stats.first_commit_ns = now.saturating_sub(self.launched_ns).max(1);
+                }
+                if let (true, Some(at)) = (self.record_latency, self.input_at) {
+                    self.stats.input_to_commit_ns.push(now.saturating_sub(at));
+                }
+            }
         }
+    }
+
+    /// Count a frame and why it ran; note when its input arrived.
+    fn count_frame<S: WindowWorld>(&mut self, world: &World<S>) {
+        let s = &mut self.stats;
+        s.frames += 1;
+        let input = !self.state.input.is_empty();
+        s.input_frames += input as u64;
+        s.woken_frames += self.woken as u64;
+        s.callback_frames += self.state.windows.iter().any(|w| w.frame_done) as u64;
+        s.timer_frames += world.resource::<WakeAt>().and_then(WakeAt::get).is_some_and(|at| at <= Instant::now()) as u64;
+        self.input_at = (input || self.woken).then(now_ns);
+    }
+
+    /// This wakeup's display timing, from the main (oldest) window's pacer,
+    /// as StereoKit's main frame pacer drives its time step.
+    fn pace(&mut self, now: u64) -> crate::pacer::Paced {
+        let outputs = &self.state.outputs;
+        let Some(main) = self.state.windows.first_mut() else { return Default::default() };
+        if main.pacer.refresh_ns() == 0 {
+            // No presentation report yet: the outputs' current mode.
+            let millihertz = outputs.iter().filter(|o| main.outputs.contains(&o.name)).map(|o| o.refresh_mhz).max();
+            if let Some(mhz) = millihertz.filter(|&m| m > 0) {
+                main.pacer.set_refresh(1_000_000_000_000 / mhz as u64);
+            }
+        }
+        main.pacer.next(main.commits + 1, now)
     }
 
     /// What the world wants, to the compositor: new windows, changed ones,
@@ -734,6 +827,9 @@ impl WindowLoop {
             frame_done: false,
             predrawn: None,
             waiting: false,
+            pacer: Default::default(),
+            commits: 0,
+            frame_seq: 0,
         };
         set_mode(&mut proto, mode);
         proto.surface.commit();

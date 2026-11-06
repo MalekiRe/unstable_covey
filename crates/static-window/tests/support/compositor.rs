@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 
 use rustix::event::{PollFd, PollFlags};
 use wayland_protocols::wp::fractional_scale::v1::server::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1};
+use wayland_protocols::wp::presentation_time::server::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::viewporter::server::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
 use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -30,12 +31,13 @@ pub struct Globals {
     pub decoration: bool,
     pub viewporter: bool,
     pub fractional_scale: bool,
+    pub presentation: bool,
     /// The keymap sent to the client's keyboard.
     pub keymap: &'static [u8],
 }
 impl Default for Globals {
     fn default() -> Self {
-        Self { decoration: true, viewporter: true, fractional_scale: true, keymap: include_bytes!("us.xkb") }
+        Self { decoration: true, viewporter: true, fractional_scale: true, presentation: true, keymap: include_bytes!("us.xkb") }
     }
 }
 
@@ -103,6 +105,9 @@ fn serve(stream: UnixStream, globals: Globals, wake: OwnedFd, commands: Receiver
         handle.create_global::<Server, wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()>(1, ());
     }
     handle.create_global::<Server, wl_seat::WlSeat, ()>(8, ());
+    if globals.presentation {
+        handle.create_global::<Server, wp_presentation::WpPresentation, ()>(1, ());
+    }
     let client = handle.insert_client(stream, Arc::new(())).expect("client");
     let mut server = Server { client: Some(client.id()), keymap: globals.keymap, ..Server::default() };
     loop {
@@ -171,6 +176,8 @@ pub struct SurfaceRecord {
     pub viewport_destination: Option<(i32, i32)>,
     pub has_viewport: bool,
     pub fractional_scale: Option<wp_fractional_scale_v1::WpFractionalScaleV1>,
+    /// Presentation feedback requested, oldest first.
+    pub feedbacks: Vec<wp_presentation_feedback::WpPresentationFeedback>,
     /// Frame callbacks committed and not yet fired.
     pub callbacks: Vec<wl_callback::WlCallback>,
     pub destroyed: bool,
@@ -337,6 +344,14 @@ impl Server {
         pointer.axis(time, wl_pointer::Axis::VerticalScroll, dy);
         pointer.frame();
     }
+    /// Report the window's oldest pending commit as shown at `display_ns`
+    /// (CLOCK_MONOTONIC) on an output refreshing every `refresh_ns`.
+    pub fn present(&mut self, toplevel: usize, display_ns: u64, refresh_ns: u32) {
+        let surface = self.toplevels[toplevel].surface;
+        let feedback = self.surfaces[surface].feedbacks.remove(0);
+        let secs = display_ns / 1_000_000_000;
+        feedback.presented((secs >> 32) as u32, secs as u32, (display_ns % 1_000_000_000) as u32, refresh_ns, 0, 0, wp_presentation_feedback::Kind::Vsync);
+    }
     /// Fire every committed frame callback with time `ms`.
     pub fn fire_frames(&mut self, toplevel: usize, ms: u32) -> usize {
         let surface = self.toplevels[toplevel].surface;
@@ -394,6 +409,27 @@ impl GlobalDispatch<xdg_wm_base::XdgWmBase, ()> for Server {
     fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<xdg_wm_base::XdgWmBase>, _: &(), init: &mut DataInit<'_, Self>) {
         init.init(resource, ());
     }
+}
+
+impl GlobalDispatch<wp_presentation::WpPresentation, ()> for Server {
+    fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<wp_presentation::WpPresentation>, _: &(), init: &mut DataInit<'_, Self>) {
+        // CLOCK_MONOTONIC, which the client reads too.
+        init.init(resource, ()).clock_id(1);
+    }
+}
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &wp_presentation::WpPresentation, request: wp_presentation::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
+        if let wp_presentation::Request::Feedback { surface, callback } = request {
+            let index = *surface.data::<usize>().unwrap();
+            let feedback = init.init(callback, ());
+            server.surfaces[index].feedbacks.push(feedback);
+        }
+    }
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ()> for Server {
+    fn request(_: &mut Self, _: &Client, _: &wp_presentation_feedback::WpPresentationFeedback, _: wp_presentation_feedback::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {}
 }
 
 impl GlobalDispatch<wl_seat::WlSeat, ()> for Server {
@@ -457,6 +493,7 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for Server {
                     viewport_destination: None,
                     has_viewport: false,
                     fractional_scale: None,
+                    feedbacks: Vec::new(),
                     callbacks: Vec::new(),
                     destroyed: false,
                 });
