@@ -154,3 +154,44 @@ fn plugins_choose_storage_for_their_components() {
     app.emit(&());
     assert_eq!(app.world.get::<Hot>(e).unwrap().0, 1);
 }
+
+#[test]
+fn a_plugin_may_only_declare_components() {
+    struct Marker;
+    struct Count(u32);
+    struct Vocabulary;
+    impl Plugin for Vocabulary {
+        type Components = (Marker, Count);
+        type Storage = (Sparse<Marker>,);
+        fn systems<S: Storage>(self) -> impl Systems<S> {}
+    }
+    let mut app = App::new()
+        .add_plugins(Vocabulary)
+        .add_systems((), |mut q: Query<&mut Count, With<Marker>>| q.iter_mut().for_each(|mut c| c.0 += 1))
+        .build();
+    let e = app.world.spawn_bundle((Count(0), Marker));
+    app.emit(&());
+    assert_eq!(app.world.get::<Count>(e).unwrap().0, 1);
+}
+
+#[test]
+fn payload_labels_with_named_fields_are_named_by_type() {
+    struct Hit {
+        target: Entity,
+        amount: u32,
+    }
+    impl Schedule for Hit {
+        type In = Ref<Self>;
+    }
+    struct Health(u32);
+    let mut app = App::new()
+        .add_systems(label::<Hit>(), |hit: &Hit, mut q: Query<&mut Health>| {
+            if let Some(mut health) = q.get_mut(hit.target) {
+                health.0 -= hit.amount;
+            }
+        })
+        .build();
+    let target = app.world.spawn_bundle((Health(10),));
+    app.emit(&Hit { target, amount: 4 });
+    assert_eq!(app.world.get::<Health>(target).unwrap().0, 6);
+}

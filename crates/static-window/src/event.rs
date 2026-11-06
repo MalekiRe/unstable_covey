@@ -14,9 +14,16 @@ macro_rules! payload {
     };
 }
 
-/// Once per wakeup that does work, after the events: the app's update.
+/// Once per wakeup that does work, after the events: the app's update (and
+/// where behaviors are polled: `behavior::<B, _>(Step)`). The timing is in
+/// [`FrameTime`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Step;
+impl Schedule for Step {}
+
+/// This wakeup's timing: a resource, set before [`Step`].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Step {
+pub struct FrameTime {
     /// CLOCK_MONOTONIC nanoseconds, now.
     pub now_ns: u64,
     /// When this wakeup's frames are predicted to reach the screen, or 0
@@ -109,7 +116,7 @@ impl TextInput {
     }
 }
 
-payload!(Step, Redraw, CloseRequested, Resized, FocusChanged, PointerMoved, PointerLeft, PointerButton, Scroll, KeyInput, TextInput);
+payload!(Redraw, CloseRequested, Resized, FocusChanged, PointerMoved, PointerLeft, PointerButton, Scroll, KeyInput, TextInput);
 
 /// Up to 32 bytes of UTF-8 inline, so a keystroke allocates nothing.
 #[derive(Clone, Copy, PartialEq, Eq)]

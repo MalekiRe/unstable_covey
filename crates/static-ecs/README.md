@@ -231,7 +231,9 @@ assert_eq!(app.world.get::<Health>(entity).unwrap().0, 7);
 ```
 
 Systems registered for one label run in registration order as one frame.
-`()` is a ready-made plain label.
+`()` is a ready-made plain label. A label is named by a value or a tuple
+struct's constructor (`Damage` above); for a payload with named fields,
+`label::<Hit>()` names it without one.
 
 ### Plugins
 
@@ -273,11 +275,12 @@ assert_eq!(app.world.query::<&Clicks>().iter_mut().next().unwrap().0, 3);
 ```
 
 `systems` returns `schedule(label, systems)`, `task(body)`, another plugin's
-systems, or tuples of them. `type Relations` (default `()`) installs relations
-once, however many plugins name them, and `type Storage` (default `()`)
-chooses storage for the plugin's components, e.g. `Components<Pos, true>` for
-change summaries or `Sparse<Hovered>`. A plugin's systems are checked against
-the world once, at `build`, which also keeps compile times down for large apps.
+systems, tuples of them, or `()` for a plugin that only declares components.
+`type Relations` (default `()`) installs relations once, however many plugins
+name them, and `type Storage` (default `()`) chooses storage for the plugin's
+components, e.g. `Components<Pos, true>` for change summaries or
+`Sparse<Hovered>`. A plugin's systems are checked against the world once, at
+`build`, which also keeps compile times down for large apps.
 
 ### The world
 

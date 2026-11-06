@@ -100,6 +100,15 @@ impl<E: Schedule, A, F: FnOnce(A) -> E> Label<E, fn(A)> for F {}
 impl<E: Schedule, A, B, F: FnOnce(A, B) -> E> Label<E, fn(A, B)> for F {}
 impl<E: Schedule, A, B, C, F: FnOnce(A, B, C) -> E> Label<E, fn(A, B, C)> for F {}
 
+/// Names label `E` without a value of it, for payload labels whose fields
+/// are named: `add_systems(label::<KeyInput>(), |key: &KeyInput| ...)`.
+pub struct LabelOf<E>(PhantomData<fn() -> E>);
+/// See [`LabelOf`].
+pub fn label<E: Schedule>() -> LabelOf<E> {
+    LabelOf(PhantomData)
+}
+impl<E: Schedule> Label<E, LabelOf<E>> for LabelOf<E> {}
+
 /// An installable registration, e.g. returned by a plugin:
 /// `.add_plugins(schedule(Click, count_clicks))` equals
 /// `.add_systems(Click, count_clicks)`.

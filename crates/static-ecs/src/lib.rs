@@ -46,8 +46,8 @@ pub use change::{Mut, MutSlice};
 pub use command::Commands;
 pub use disabled::{Disabled, DisabledRoot, Disabling};
 pub use dispatch::{
-    App, AppBuilder, Cons, Dispatch, Handle, Label, MaybeHandle, Nil, On, Placed, Plugins, Run,
-    Schedule, Scheduled, schedule,
+    App, AppBuilder, Cons, Dispatch, Handle, Label, LabelOf, MaybeHandle, Nil, On, Placed, Plugins, Run,
+    Schedule, Scheduled, label, schedule,
 };
 pub use executor::WorkerPool;
 pub use filter::{Added, Changed, MayHave, Or, Related, Relinked, With, Without};
@@ -80,7 +80,7 @@ pub mod prelude {
         OnReplace, OnTransition, OneOf, OneToMany, OneToOne, Or, Plugin, Query, Ref, Related,
         Relates, Relation, Relinked, Remote, Requires, Res, ResMut, Schedule, Single, Sources,
         Sparse, State, Storage, Stores, SyncPoint, Systems, Trigger, With, Without, WorkerPool,
-        World, exclusive, in_state, node, ready, schedule, sync_point, task,
+        World, exclusive, in_state, label, node, ready, schedule, sync_point, task,
     };
 }
 pub use storage::{Bundle, Components, Entity, Point, Sparse, Storage, World};

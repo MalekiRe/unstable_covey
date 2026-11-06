@@ -35,7 +35,9 @@ impl Default for Globals {
     }
 }
 
-type Command = Box<dyn FnOnce(&mut Server, &DisplayHandle) + Send>;
+/// Runs on the server; returns the reply, sent after the server flushed what
+/// the command made it send.
+type Command = Box<dyn FnOnce(&mut Server, &DisplayHandle) -> Box<dyn FnOnce() + Send> + Send>;
 
 /// The handle tests hold; dropping it stops the server.
 pub struct Compositor {
@@ -54,11 +56,15 @@ impl Compositor {
         (Self { commands: Some(commands), wake, thread: Some(thread) }, client_end)
     }
 
-    /// Run `f` on the server once it has read everything the client sent.
+    /// Run `f` on the server once it has read everything the client sent;
+    /// whatever `f` sends is flushed before this returns.
     pub fn with<R: Send + 'static>(&self, f: impl FnOnce(&mut Server, &DisplayHandle) -> R + Send + 'static) -> R {
         let (reply, result) = channel();
         let command: Command = Box::new(move |server, handle| {
-            let _ = reply.send(f(server, handle));
+            let value = f(server, handle);
+            Box::new(move || {
+                let _ = reply.send(value);
+            })
         });
         self.commands.as_ref().unwrap().send(command).expect("server stopped");
         rustix::io::write(&self.wake, &[1]).expect("wake server");
@@ -110,15 +116,15 @@ fn serve(stream: UnixStream, globals: Globals, wake: OwnedFd, commands: Receiver
                 match commands.try_recv() {
                     Ok(command) => {
                         let _ = display.dispatch_clients(&mut server);
-                        command(&mut server, &handle);
+                        let reply = command(&mut server, &handle);
                         let _ = display.flush_clients();
+                        reply();
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                 }
             }
         }
-        let _ = &mut handle;
     }
 }
 
@@ -247,6 +253,16 @@ impl Server {
         let surface = &self.surfaces[self.toplevels[toplevel].surface];
         surface.fractional_scale.as_ref().expect("no fractional scale object").preferred_scale(scale_120);
     }
+    /// Change output `index`'s integer scale.
+    pub fn set_output_scale(&mut self, index: usize, factor: i32) {
+        self.outputs[index].scale(factor);
+        self.outputs[index].done();
+    }
+    /// Put the window's surface on output `index`.
+    pub fn enter(&mut self, toplevel: usize, index: usize) {
+        let surface = &self.surfaces[self.toplevels[toplevel].surface];
+        surface.resource.enter(&self.outputs[index]);
+    }
     /// Fire every committed frame callback with time `ms`.
     pub fn fire_frames(&mut self, toplevel: usize, ms: u32) -> usize {
         let surface = self.toplevels[toplevel].surface;
@@ -274,7 +290,7 @@ impl Server {
         let mut out = Vec::with_capacity((b.width * b.height) as usize);
         for row in 0..b.height {
             let start = (b.offset + row * b.stride) as usize;
-            out.extend(bytes[start..start + b.width as usize * 4].chunks_exact(4).map(|p| u32::from_ne_bytes(p.try_into().unwrap())));
+            out.extend(bytes[start..start + b.width as usize * 4].as_chunks::<4>().0.iter().map(|&p| u32::from_ne_bytes(p)));
         }
         unsafe {
             let _ = rustix::mm::munmap(map, len);

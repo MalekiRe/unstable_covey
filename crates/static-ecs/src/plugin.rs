@@ -115,6 +115,14 @@ where
         (self, Nil)
     }
 }
+/// No systems: a plugin that only declares components and storage.
+impl<S: Storage> Systems<S> for () {
+    type Listeners = Nil;
+    type Hooks = Nil;
+    fn split(self) -> (Nil, Nil) {
+        (Nil, Nil)
+    }
+}
 impl<S: Storage, A: Systems<S>> Systems<S> for (A,) {
     type Listeners = A::Listeners;
     type Hooks = A::Hooks;

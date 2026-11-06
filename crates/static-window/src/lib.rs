@@ -19,12 +19,51 @@ mod event;
 mod input;
 mod pacer;
 mod repeat;
+mod run;
 mod scale;
+mod wayland;
 mod window;
 
+use static_ecs::prelude::*;
+use static_ecs::{Inbox, Wakeup};
+
 pub use event::{
-    CloseRequested, FocusChanged, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput,
+    CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput,
 };
 pub use input::{Key, KeyCode, Keys, Modifiers, MouseButton, Pointer};
+pub use run::{Error, Flow, Stats, WakeAt, WindowLabels, WindowLoop, WindowWorld, run};
 pub use scale::Scale;
 pub use window::{Animating, KeyboardFocus, Minimize, PointerOver, Surface, Window, WindowMode, WindowState};
+
+/// The vocabulary the loop reads and writes. It has no systems: the loop
+/// ([`run`], [`WindowLoop`]) applies the compositor's reports and the
+/// world's requests itself, between emits.
+pub struct WindowPlugin;
+impl Plugin for WindowPlugin {
+    type Components = (
+        Window,
+        WindowMode,
+        Minimize,
+        Surface,
+        WindowState,
+        KeyboardFocus,
+        PointerOver,
+        Animating,
+        Keys,
+        Pointer,
+        WakeAt,
+        FrameTime,
+        Wakeup,
+        Inbox<CloseRequested>,
+        Inbox<Resized>,
+        Inbox<FocusChanged>,
+        Inbox<PointerMoved>,
+        Inbox<PointerLeft>,
+        Inbox<PointerButton>,
+        Inbox<Scroll>,
+        Inbox<KeyInput>,
+        Inbox<TextInput>,
+    );
+    type Storage = (Sparse<Minimize>, Sparse<KeyboardFocus>, Sparse<PointerOver>, Sparse<Animating>);
+    fn systems<S: Storage>(self) -> impl Systems<S> {}
+}
