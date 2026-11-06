@@ -258,6 +258,22 @@ fn optional_globals_the_compositor_lacks_are_listed() {
     assert!(lp.missing()[0].starts_with("xdg-decoration"));
 }
 
+#[test]
+fn the_compositor_is_asked_to_draw_title_bars_except_for_undecorated_windows() {
+    let (compositor, mut lp) = open(Globals::default());
+    let mut app = test_app!();
+    app.world.spawn_bundle((Window::new("framed"),));
+    let bare = app.world.spawn_bundle((Window::new("bare").decorated(false),));
+    lp.step(&mut app, NOW);
+    app.world.get_mut::<Window>(bare).unwrap().decorated = true;
+    lp.step(&mut app, NOW);
+    // Modes: 2 server side, 1 client side (from us: none at all).
+    compositor.with(|s, _| {
+        assert_eq!(s.toplevel(0).decoration_modes, [2]);
+        assert_eq!(s.toplevel(1).decoration_modes, [1, 2]);
+    });
+}
+
 struct ConfirmClose;
 impl Behavior for ConfirmClose {
     async fn start<S: Storage>(me: Entity, cx: Cx<S>) {

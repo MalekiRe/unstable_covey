@@ -17,6 +17,7 @@
 
 mod clipboard;
 mod cursor;
+mod decor;
 mod event;
 mod framebuffer;
 mod input;

@@ -14,7 +14,8 @@ use wayland_client::globals::{BindError, GlobalError, registry_queue_init};
 use wayland_client::protocol::wl_buffer::WlBuffer;
 use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::{Connection, ConnectError, EventQueue, Proxy};
-use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+
+use crate::decor::{Decorations, Libdecor, Role};
 
 use crate::clipboard::{Clipboard, ClipboardText};
 use crate::cursor::{CursorIcon, PointerLock, Theme};
@@ -24,7 +25,7 @@ use crate::event::{
 };
 use crate::framebuffer::{Framebuffer, Shm};
 use crate::input::{Key, Keys, Pointer};
-use crate::wayland::{Feedback, Globals, InputEvent, Proto, State, placeholder};
+use crate::wayland::{Feedback, Globals, InputEvent, OwnedSurface, Proto, State, placeholder};
 use crate::window::{Animating, KeyboardFocus, Minimize, PointerOver, Surface, Window, WindowMode, WindowState};
 use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_pointer_constraints_v1::Lifetime;
 
@@ -208,10 +209,10 @@ pub struct Stats {
     pub input_to_present_ns: Vec<u64>,
 }
 
-/// A Wayland connection driving one app's windows.
+/// A Wayland connection driving one app's windows. Fields drop in order:
+/// windows, libdecor and globals while the connection still stands, the
+/// connection last (libdecor destroys its objects on its way out).
 pub struct WindowLoop {
-    conn: Connection,
-    queue: EventQueue<State>,
     state: State,
     globals: Globals,
     /// Shared 1×1 placeholder (with a viewporter).
@@ -226,11 +227,16 @@ pub struct WindowLoop {
     /// When this wakeup's input (or wakeup) arrived.
     input_at: Option<u64>,
     record_latency: bool,
+    /// Who draws title bars, and whether libdecor was tried yet.
+    decorations: Decorations,
+    decor_tried: bool,
     missing: Vec<&'static str>,
     /// Numbers framebuffer allocations, so a late release of a replaced
     /// buffer is ignored.
     generation: u32,
     pub stats: Stats,
+    queue: EventQueue<State>,
+    conn: Connection,
 }
 
 impl WindowLoop {
@@ -272,7 +278,7 @@ impl WindowLoop {
         }
         let mut missing = Vec::new();
         if globals.decoration.is_none() {
-            missing.push("xdg-decoration: windows have no title bar");
+            missing.push("xdg-decoration: title bars come from libdecor, where it is installed");
         }
         if globals.fractional.is_none() || globals.viewporter.is_none() {
             missing.push("fractional-scale-v1 and viewporter: display scaling rounds to whole steps");
@@ -280,6 +286,7 @@ impl WindowLoop {
         let wake = Arc::new(
             rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK).expect("eventfd"),
         );
+        let decorations = crate::decor::choose(globals.decoration.is_some(), crate::decor::forced());
         Ok(Self {
             conn,
             queue,
@@ -293,6 +300,8 @@ impl WindowLoop {
             launched_ns: now_ns(),
             input_at: None,
             record_latency: false,
+            decorations,
+            decor_tried: false,
             missing,
             generation: 0,
             stats: Stats::default(),
@@ -348,12 +357,12 @@ impl WindowLoop {
                     Some(true) => break,
                     Some(false) => {}
                 }
-                if self.queue.dispatch_pending(&mut self.state).is_err() {
+                if !self.dispatch() {
                     return Flow::Disconnected;
                 }
             }
         }
-        if self.queue.dispatch_pending(&mut self.state).is_err() {
+        if !self.dispatch() {
             return Flow::Disconnected;
         }
         self.state.pump_repeat(now_ns());
@@ -819,7 +828,7 @@ impl WindowLoop {
                 set_mode(window, mode);
             }
             if world.remove::<Minimize>(entity).is_some() {
-                window.toplevel.set_minimized();
+                window.role.set_minimized();
             }
         }
         self.sync_pointer(world);
@@ -888,33 +897,64 @@ impl WindowLoop {
         }
     }
 
+    /// Our queue's events, then libdecor's (its objects sit on libwayland's
+    /// default queue). False if the connection broke.
+    fn dispatch(&mut self) -> bool {
+        if self.queue.dispatch_pending(&mut self.state).is_err() {
+            return false;
+        }
+        if self.state.decor.is_some() {
+            Libdecor::dispatch(&mut self.state);
+        }
+        true
+    }
+
+    /// The libdecor context, loaded at the first window that needs it.
+    fn libdecor(&mut self) -> Option<&Libdecor> {
+        if !std::mem::replace(&mut self.decor_tried, true) {
+            self.state.decor = Libdecor::new(self.conn.backend().display_ptr().cast());
+            if self.state.decor.is_none() {
+                eprintln!("static-window: no xdg-decoration and no libdecor: windows have no title bar");
+            }
+        }
+        self.state.decor.as_ref()
+    }
+
     fn create(&mut self, entity: Entity, window: Window, mode: WindowMode) {
         let qh = self.queue.handle();
+        let surface = self.globals.compositor.create_surface(&qh, entity);
+        let client_side = window.decorated && self.decorations == Decorations::Client;
+        let frame = if client_side { self.libdecor().and_then(|decor| decor.decorate(&surface, entity, &window)) } else { None };
         let g = &self.globals;
-        let surface = g.compositor.create_surface(&qh, entity);
-        let xdg = g.wm.get_xdg_surface(&surface, &qh, entity);
-        let toplevel = xdg.get_toplevel(&qh, entity);
-        let decoration = g.decoration.as_ref().map(|manager| manager.get_toplevel_decoration(&toplevel, &qh, entity));
+        let role = match frame {
+            Some(frame) => Role::Decor(frame),
+            None => {
+                let xdg = g.wm.get_xdg_surface(&surface, &qh, entity);
+                let toplevel = xdg.get_toplevel(&qh, entity);
+                let decoration = match self.decorations {
+                    Decorations::Server => g.decoration.as_ref().map(|manager| manager.get_toplevel_decoration(&toplevel, &qh, entity)),
+                    Decorations::Client => None,
+                };
+                // Everything before the first commit, so the first
+                // configure already reflects it.
+                let role = Role::Xdg { xdg, toplevel, decoration };
+                role.set_title(&window.title);
+                role.set_app_id(&app_id(&window));
+                role.set_limits(&window);
+                role.set_decorated(window.decorated);
+                role
+            }
+        };
         let viewport = g.viewporter.as_ref().map(|v| v.get_viewport(&surface, &qh, ()));
         let fractional = match (&g.fractional, &viewport) {
             (Some(manager), Some(_)) => Some(manager.get_fractional_scale(&surface, &qh, entity)),
             _ => None,
         };
-        // Everything before the first commit, so the first configure
-        // already reflects it.
-        toplevel.set_title(window.title.clone());
-        toplevel.set_app_id(app_id(&window));
-        send_limits(&toplevel, &window);
-        if let Some(decoration) = &decoration {
-            decoration.set_mode(decoration_mode(&window));
-        }
         let size = (window.width.max(1), window.height.max(1));
         let mut proto = Proto {
             entity,
-            surface,
-            xdg,
-            toplevel,
-            decoration,
+            role,
+            surface: OwnedSurface(surface),
             viewport,
             fractional,
             sent: window,
@@ -942,59 +982,53 @@ impl WindowLoop {
             lock: None,
         };
         set_mode(&mut proto, mode);
-        proto.surface.commit();
+        // libdecor maps its frame itself.
+        if let Role::Xdg { .. } = proto.role {
+            proto.surface.commit();
+        }
         self.state.windows.push(proto);
     }
 }
 
-fn app_id(window: &Window) -> String {
+pub(crate) fn app_id(window: &Window) -> String {
     if window.app_id.is_empty() { exe_name() } else { window.app_id.clone() }
-}
-fn send_limits(toplevel: &wayland_protocols::xdg::shell::client::xdg_toplevel::XdgToplevel, window: &Window) {
-    let ((min_w, min_h), (max_w, max_h)) = window.limits();
-    toplevel.set_min_size(min_w as i32, min_h as i32);
-    toplevel.set_max_size(max_w as i32, max_h as i32);
-}
-/// Undecorated: neither side draws a frame.
-fn decoration_mode(window: &Window) -> DecorationMode {
-    if window.decorated { DecorationMode::ServerSide } else { DecorationMode::ClientSide }
 }
 
 /// Send what differs between `window.sent` and `wanted`.
 fn update(window: &mut Proto, wanted: Window) {
     let sent = &window.sent;
+    let role = &window.role;
     if wanted.title != sent.title {
-        window.toplevel.set_title(wanted.title.clone());
+        role.set_title(&wanted.title);
     }
     if wanted.app_id != sent.app_id {
-        window.toplevel.set_app_id(app_id(&wanted));
+        role.set_app_id(&app_id(&wanted));
     }
     if wanted.limits() != sent.limits() {
-        send_limits(&window.toplevel, &wanted);
+        role.set_limits(&wanted);
     }
-    if wanted.decorated != sent.decorated
-        && let Some(decoration) = &window.decoration
-    {
-        decoration.set_mode(decoration_mode(&wanted));
+    if wanted.decorated != sent.decorated {
+        role.set_decorated(wanted.decorated);
     }
     // A floating window's size is ours to choose.
     if (wanted.width, wanted.height) != (sent.width, sent.height) && !window.state.maximized && !window.state.fullscreen {
         window.size = (wanted.width.max(1), wanted.height.max(1));
+        role.resized(window.size.0, window.size.1);
         window.dirty = true;
     }
     window.sent = wanted;
 }
 
 fn set_mode(window: &mut Proto, mode: WindowMode) {
-    let toplevel = &window.toplevel;
-    match (window.sent_mode, mode) {
-        (WindowMode::Maximized, _) => toplevel.unset_maximized(),
-        (WindowMode::Fullscreen, _) => toplevel.unset_fullscreen(),
-        _ => {}
+    let role = &window.role;
+    match window.sent_mode {
+        WindowMode::Maximized => role.set_maximized(false),
+        WindowMode::Fullscreen => role.set_fullscreen(false),
+        WindowMode::Windowed => {}
     }
     match mode {
-        WindowMode::Maximized => toplevel.set_maximized(),
-        WindowMode::Fullscreen => toplevel.set_fullscreen(None),
+        WindowMode::Maximized => role.set_maximized(true),
+        WindowMode::Fullscreen => role.set_fullscreen(true),
         WindowMode::Windowed => {}
     }
     window.sent_mode = mode;

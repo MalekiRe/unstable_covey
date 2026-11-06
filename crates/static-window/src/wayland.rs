@@ -70,12 +70,11 @@ pub(crate) struct Output {
 }
 
 /// A window's protocol objects and what the compositor last said about it.
+/// Fields drop in order: the role before the surface it is a role of.
 pub(crate) struct Proto {
     pub entity: Entity,
-    pub surface: WlSurface,
-    pub xdg: XdgSurface,
-    pub toplevel: XdgToplevel,
-    pub decoration: Option<ZxdgToplevelDecorationV1>,
+    pub role: crate::decor::Role,
+    pub surface: OwnedSurface,
     pub viewport: Option<WpViewport>,
     pub fractional: Option<WpFractionalScaleV1>,
     /// The `Window` and mode last sent.
@@ -143,13 +142,10 @@ impl Proto {
 
 impl Drop for Proto {
     fn drop(&mut self) {
-        // Role objects before their surface; a decoration before its
-        // toplevel (the reverse is a protocol error).
+        // Extensions of the surface first; then (as fields) its role, then
+        // the surface itself.
         if let Some(lock) = self.lock.take() {
             lock.destroy();
-        }
-        if let Some(decoration) = self.decoration.take() {
-            decoration.destroy();
         }
         if let Some(fractional) = self.fractional.take() {
             fractional.destroy();
@@ -157,14 +153,25 @@ impl Drop for Proto {
         if let Some(viewport) = self.viewport.take() {
             viewport.destroy();
         }
-        self.toplevel.destroy();
-        self.xdg.destroy();
-        self.surface.destroy();
         if let Some((buffer, size)) = self.placeholder.take()
             && size != (1, 1)
         {
             buffer.destroy();
         }
+    }
+}
+
+/// A surface destroyed when dropped.
+pub(crate) struct OwnedSurface(pub WlSurface);
+impl std::ops::Deref for OwnedSurface {
+    type Target = WlSurface;
+    fn deref(&self) -> &WlSurface {
+        &self.0
+    }
+}
+impl Drop for OwnedSurface {
+    fn drop(&mut self) {
+        self.0.destroy();
     }
 }
 
@@ -187,6 +194,9 @@ pub(crate) struct State {
     pub selection: Selection,
     /// The cursor theme, where the compositor cannot draw shapes itself.
     pub theme: Option<Theme>,
+    /// libdecor, drawing title bars where the compositor won't. After the
+    /// windows, so their frames go first.
+    pub decor: Option<crate::decor::Libdecor>,
 }
 
 impl State {

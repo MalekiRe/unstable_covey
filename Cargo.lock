@@ -427,6 +427,7 @@ name = "static-window"
 version = "0.1.0"
 dependencies = [
  "kbvm",
+ "libloading",
  "rustix",
  "static-ecs",
  "wayland-backend",
