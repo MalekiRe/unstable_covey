@@ -1,0 +1,8 @@
+[package]
+name = "static-window"
+version = "0.1.0"
+edition = "2024"
+description = "Windows as entities: an ECS-driven Wayland windowing crate for static-ecs, modeled on StereoKit's sk_app"
+
+[dependencies]
+static-ecs = { path = "../static-ecs" }
