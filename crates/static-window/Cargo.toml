@@ -6,3 +6,12 @@ description = "Windows as entities: an ECS-driven Wayland windowing crate for st
 
 [dependencies]
 static-ecs = { path = "../static-ecs" }
+# libwayland, loaded with dlopen (as sk_app does): libdecor needs its wl_display.
+wayland-client = { version = "0.31", features = ["system"] }
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+rustix = { version = "1", features = ["fs", "mm", "time", "event", "pipe"] }
+
+[dev-dependencies]
+wayland-server = "0.31"
+wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }

@@ -25,6 +25,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfg-if"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
+
+[[package]]
 name = "demo-analytics"
 version = "0.1.0"
 dependencies = [
@@ -55,6 +61,15 @@ dependencies = [
  "demo-input",
  "demo-networking",
  "static-ecs",
+]
+
+[[package]]
+name = "dlib"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -96,10 +111,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "log"
+version = "0.4.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "memchr"
@@ -117,6 +148,12 @@ dependencies = [
  "wasi",
  "windows-sys",
 ]
+
+[[package]]
+name = "once_cell"
+version = "1.21.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pin-project-lite"
@@ -169,6 +206,12 @@ dependencies = [
  "linux-raw-sys",
  "windows-sys",
 ]
+
+[[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "shlex"
@@ -237,6 +280,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "static-window"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "static-ecs",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-server",
+]
+
+[[package]]
 name = "tokio"
 version = "1.54.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -277,6 +332,7 @@ dependencies = [
  "cc",
  "downcast-rs",
  "rustix",
+ "scoped-tls",
  "smallvec",
  "wayland-sys",
 ]
@@ -303,6 +359,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-scanner",
+ "wayland-server",
 ]
 
 [[package]]
@@ -317,11 +374,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayland-server"
+version = "0.31.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dde9c29be0f723a573977de51ee455bf3dfa03652730a74f9dd3b337e374d75"
+dependencies = [
+ "bitflags",
+ "downcast-rs",
+ "rustix",
+ "wayland-backend",
+ "wayland-scanner",
+]
+
+[[package]]
 name = "wayland-sys"
 version = "0.31.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
 dependencies = [
+ "dlib",
+ "log",
+ "once_cell",
  "pkg-config",
 ]
 
