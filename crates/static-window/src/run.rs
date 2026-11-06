@@ -458,9 +458,9 @@ impl WindowLoop {
                 }
                 InputEvent::KeyboardLeave { window } => {
                     // Keys held as focus leaves would otherwise stay down.
-                    loop {
-                        let Some(keys) = app.world.resource_mut::<Keys>().map(Mut::into_inner) else { break };
-                        let Some(code) = keys.release_one() else { break };
+                    while let Some(keys) = app.world.resource_mut::<Keys>().map(Mut::into_inner)
+                        && let Some(code) = keys.release_one()
+                    {
                         let modifiers = keys.modifiers();
                         if alive(&app.world, window) {
                             let key = self.state.seat.keymap().map_or(Key::Unidentified, |k| k.key(code.0 as u32));

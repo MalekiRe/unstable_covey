@@ -362,6 +362,9 @@ pub(crate) enum InputEvent {
     Scroll { window: Entity, dx: f32, dy: f32, lines: Option<(f32, f32)> },
 }
 
+/// Scroll gathered over a pointer frame: pixels, and wheel detents.
+type PendingScroll = (f32, f32, Option<(f32, f32)>);
+
 /// The seat: one, as in sk_app.
 #[derive(Default)]
 pub(crate) struct Seat {
@@ -379,7 +382,7 @@ pub(crate) struct Seat {
     /// The serial of the last pointer enter (cursor requests quote it).
     pub pointer_serial: u32,
     /// Scroll gathered until `wl_pointer.frame`.
-    scroll: Option<(f32, f32, Option<(f32, f32)>)>,
+    scroll: Option<PendingScroll>,
 }
 
 impl Seat {

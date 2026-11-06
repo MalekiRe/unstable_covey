@@ -290,13 +290,6 @@ impl Pointer {
             self.buttons &= !button.bit();
         }
     }
-    /// The buttons down, for releasing them when focus leaves.
-    pub(crate) fn held(&self) -> impl Iterator<Item = MouseButton> + use<> {
-        let buttons = self.buttons;
-        [MouseButton::Left, MouseButton::Right, MouseButton::Middle, MouseButton::Back, MouseButton::Forward]
-            .into_iter()
-            .filter(move |b| buttons & b.bit() != 0)
-    }
 }
 
 #[cfg(test)]
@@ -339,6 +332,8 @@ mod tests {
         assert_eq!(p.take_delta(), (0.0, 0.0));
         p.set_button(MouseButton::Left, true);
         p.set_button(MouseButton::Forward, true);
-        assert_eq!(p.held().collect::<Vec<_>>(), [MouseButton::Left, MouseButton::Forward]);
+        assert!(p.pressed(MouseButton::Left) && p.pressed(MouseButton::Forward) && !p.pressed(MouseButton::Right));
+        p.set_button(MouseButton::Left, false);
+        assert!(!p.pressed(MouseButton::Left));
     }
 }
