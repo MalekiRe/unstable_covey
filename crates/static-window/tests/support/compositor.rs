@@ -173,6 +173,8 @@ pub struct Commit {
     pub damage: Vec<Damage>,
     pub buffer_scale: i32,
     pub frame_callbacks: usize,
+    /// The commit carried a viewport destination or a buffer scale.
+    pub geometry: bool,
 }
 
 #[derive(Default)]
@@ -693,6 +695,7 @@ impl Dispatch<wl_surface::WlSurface, usize> for Server {
                 if let Some(buffer) = pending.buffer {
                     surface.buffer = buffer;
                 }
+                let geometry = pending.buffer_scale.is_some() || pending.viewport_destination.is_some();
                 if let Some(scale) = pending.buffer_scale {
                     surface.buffer_scale = scale;
                 }
@@ -704,6 +707,7 @@ impl Dispatch<wl_surface::WlSurface, usize> for Server {
                     damage: pending.damage,
                     buffer_scale: surface.buffer_scale,
                     frame_callbacks: pending.callbacks.len(),
+                    geometry,
                 });
                 surface.callbacks.extend(pending.callbacks);
             }

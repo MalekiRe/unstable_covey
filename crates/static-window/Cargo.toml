@@ -21,3 +21,5 @@ libloading = "0.8"
 [dev-dependencies]
 wayland-server = "0.31"
 wayland-protocols = { version = "0.32", features = ["server", "staging", "unstable"] }
+# examples/key_latency.rs: a virtual keyboard to press keys through the compositor.
+wayland-protocols-misc = { version = "0.3", features = ["client"] }

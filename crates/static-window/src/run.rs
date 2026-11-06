@@ -653,8 +653,8 @@ impl WindowLoop {
     fn present_placeholder(&mut self, index: usize, surface: &Surface) {
         let qh = self.queue.handle();
         let window = &mut self.state.windows[index];
-        if let Some(viewport) = &window.viewport {
-            viewport.set_destination(surface.width as i32, surface.height as i32);
+        if window.viewport.is_some() {
+            window.set_geometry(surface.width, surface.height, surface.scale);
             if window.placeholder.is_none() {
                 let shared = self.placeholder.get_or_insert_with(|| placeholder(&self.globals.shm, &qh, 1, 1)).clone();
                 window.surface.attach(Some(&shared), 0, 0);
@@ -673,7 +673,7 @@ impl WindowLoop {
                 window.surface.damage_buffer(0, 0, size.0 as i32, size.1 as i32);
                 window.placeholder = Some((buffer, size));
             }
-            window.surface.set_buffer_scale(factor as i32);
+            window.set_geometry(surface.width, surface.height, surface.scale);
         }
         window.surface.commit();
         self.stats.commits += 1;
@@ -743,24 +743,20 @@ impl WindowLoop {
             let window = &mut self.state.windows[i];
             let Some(fb) = app.world.get_mut::<Framebuffer>(entity).map(Mut::into_inner) else { continue };
             fb.back = None;
-            let surface = &window.surface;
             let mut new_buffer = false;
             match (index, &mut fb.shm) {
                 (Some(index), Some(shm)) => {
                     new_buffer = true;
-                    surface.attach(Some(&shm.buffers[index]), 0, 0);
+                    window.surface.attach(Some(&shm.buffers[index]), 0, 0);
                     for r in &fb.regions {
-                        surface.damage_buffer(r.x as i32, r.y as i32, r.width as i32, r.height as i32);
+                        window.surface.damage_buffer(r.x as i32, r.y as i32, r.width as i32, r.height as i32);
                     }
-                    match &window.viewport {
-                        Some(viewport) => viewport.set_destination(w as i32, h as i32),
-                        None => surface.set_buffer_scale(scale.0.div_ceil(crate::Scale::UNIT) as i32),
-                    }
+                    window.set_geometry(w, h, scale);
                     shm.busy[index] = true;
                     window.commits += 1;
                     if let Some(presentation) = &self.globals.presentation {
                         let feedback = Feedback { window: entity, seq: window.commits, input_at: self.input_at };
-                        presentation.feedback(surface, &qh, feedback);
+                        presentation.feedback(&window.surface, &qh, feedback);
                     }
                 }
                 // Nothing new to show, but an animation wants the next frame.
@@ -768,11 +764,11 @@ impl WindowLoop {
                 _ => continue,
             }
             if animating && !window.frame_requested {
-                surface.frame(&qh, entity);
+                window.surface.frame(&qh, entity);
                 window.frame_requested = true;
                 window.frame_seq = window.commits;
             }
-            surface.commit();
+            window.surface.commit();
             self.stats.commits += 1;
             // Our share of the latency ends when the commit leaves.
             if new_buffer && (self.stats.first_commit_ns == 0 || self.record_latency && self.input_at.is_some()) {
@@ -994,6 +990,9 @@ impl WindowLoop {
             close_requested: false,
             server_decorated: None,
             placeholder: None,
+            destination: None,
+            // wl_surface's initial buffer scale.
+            buffer_scale: 1,
             frame_requested: false,
             frame_done: false,
             predrawn: None,

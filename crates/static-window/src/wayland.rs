@@ -106,6 +106,10 @@ pub(crate) struct Proto {
     pub server_decorated: Option<bool>,
     /// A placeholder buffer is attached (no renderer yet).
     pub placeholder: Option<(WlBuffer, (u32, u32))>,
+    /// The viewport destination and buffer scale last sent: surface state
+    /// that holds across commits, so sent only when it changes.
+    pub destination: Option<(i32, i32)>,
+    pub buffer_scale: i32,
     /// A frame callback is outstanding.
     pub frame_requested: bool,
     /// A frame callback fired since the loop last looked.
@@ -137,6 +141,27 @@ impl Proto {
         }
         let factor = outputs.iter().filter(|o| self.outputs.contains(&o.name)).map(|o| o.scale).max().unwrap_or(1);
         Scale::integer(factor.max(1) as u32)
+    }
+
+    /// Show the buffer at logical size `width × height`: through the
+    /// viewport where there is one, else as an integer buffer scale.
+    pub fn set_geometry(&mut self, width: u32, height: u32, scale: Scale) {
+        match &self.viewport {
+            Some(viewport) => {
+                let destination = (width as i32, height as i32);
+                if self.destination != Some(destination) {
+                    viewport.set_destination(destination.0, destination.1);
+                    self.destination = Some(destination);
+                }
+            }
+            None => {
+                let factor = scale.0.div_ceil(Scale::UNIT) as i32;
+                if self.buffer_scale != factor {
+                    self.surface.set_buffer_scale(factor);
+                    self.buffer_scale = factor;
+                }
+            }
+        }
     }
 }
 

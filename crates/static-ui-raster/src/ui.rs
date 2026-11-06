@@ -5,8 +5,8 @@
 use static_ecs::prelude::*;
 use static_ecs::Dispatch as Handles;
 use static_ui::layout::Rect;
-use static_ui::{ClearColor, RenderList, UiFrame, UiLayout, UiUpdate, UiWindow};
-use static_window::{Error, Framebuffer, PixelRect, Redraw, Stats, Window, WindowLabels, WindowLoop, WindowWorld};
+use static_ui::{ClearColor, RenderList, UiClock, UiFrame, UiLayout, UiUpdate, UiWindow};
+use static_window::{Error, FrameTime, Framebuffer, PixelRect, Redraw, Stats, Window, WindowLabels, WindowLoop, WindowWorld};
 
 use crate::canvas::Canvas;
 use crate::font::{Atlas, Fonts};
@@ -70,10 +70,21 @@ fn paint_window(
 pub trait UiLabels<S: Storage>: WindowLabels<S> + Handles<UiUpdate, World<S>> + Handles<UiFrame, World<S>> {}
 impl<S: Storage, L: WindowLabels<S> + Handles<UiUpdate, World<S>> + Handles<UiFrame, World<S>>> UiLabels<S> for L {}
 
-/// The UI's update and frame, after each `Step`.
-pub fn ui_frame<S: Storage, L: UiLabels<S>>(app: &mut App<S, L>) {
+/// The UI's update and frame, after each `Step`. Unless a test drives it
+/// (`UiClock::Manual`), the UI's clock reads the frame's predicted display
+/// time ([`FrameTime`]) throughout, and the system clock again after.
+pub fn ui_frame<S: WindowWorld + Stores<UiClock>, L: UiLabels<S>>(app: &mut App<S, L>) {
+    let manual = matches!(app.world.resource::<UiClock>(), Some(UiClock::Manual(_)));
+    if !manual {
+        let ahead = app.world.resource::<FrameTime>().map_or(0, |t| t.display_ns.saturating_sub(t.now_ns));
+        let now = std::time::Instant::now() + std::time::Duration::from_nanos(ahead);
+        app.world.insert_resource(UiClock::Frame(now));
+    }
     app.emit(&UiUpdate);
     app.emit(&UiFrame);
+    if !manual {
+        app.world.insert_resource(UiClock::System);
+    }
 }
 
 /// Connect to the compositor and run the app's windows (and its UI) until

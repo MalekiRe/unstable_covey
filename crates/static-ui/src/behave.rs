@@ -140,18 +140,24 @@ pub async fn animate<S: Storage>(cx: Cx<S>, me: Entity, duration: Duration, ease
     }
 }
 
-/// The UI's time: the system clock, or a manual one tests advance.
+/// The UI's time: the system clock, a frame's display time, or a manual
+/// clock tests advance.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum UiClock {
     #[default]
     System,
+    /// When the frame being made will reach the screen, so animations move as
+    /// far as the screen shows them. The window layer sets it around each
+    /// frame (`static_ui_raster::ui_frame`, from static-window's `FrameTime`)
+    /// and puts back `System` after.
+    Frame(Instant),
     Manual(Instant),
 }
 impl UiClock {
     pub fn now(self) -> Instant {
         match self {
             Self::System => Instant::now(),
-            Self::Manual(now) => now,
+            Self::Frame(now) | Self::Manual(now) => now,
         }
     }
     /// Move a manual clock forward (a system clock moves by itself).

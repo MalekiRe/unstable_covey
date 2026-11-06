@@ -11,11 +11,51 @@ Template: StereoKit's windowing layer, [sk_app](https://github.com/StereoKit/sk_
 (`StereoKitC/xr_backends/window.cpp`, `systems/frame_pacer.*`). Code below
 marked **SPECULATIVE** is the target API, not code that exists.
 
+## Status: implemented
+
+Every phase below is implemented, in `crates/static-window`
+([README](crates/static-window/README.md)). Measurements against the
+budgets are in [WINDOW_BENCHMARKS.md](WINDOW_BENCHMARKS.md). Where the code
+differs from the **SPECULATIVE** parts:
+
+- **No `Update` label.** `Step` is a plain label, and the step's timing is the
+  `FrameTime` resource (`now_ns`, `display_ns`, `dt`), set before it.
+  Behaviors can be polled only under plain labels (`behavior::<B, _>(Step)`).
+  Layers above the window hook in after `Step` through
+  `WindowLoop::run_with`/`step_with`:
+  - static-ui-raster's `ui_frame` emits `UiUpdate` and `UiFrame`;
+  - flappy emits its `Tick` from `FrameTime::dt`.
+- **Protocol state lives in the loop, not in a `Native` component.** Each
+  window's protocol objects are kept by the `WindowLoop`. Requests go out
+  from the components it reads after `Step`, so no system needs protocol
+  access. The cursor is the per-window `CursorIcon` component, not a
+  resource.
+- **Rendering.** The plan's `framebuffer.back()` is `Framebuffer::target()`,
+  which returns `Target { pixels, width, height, scale, regions }`.
+  `Framebuffer::at_scale(Scale::ONE)` keeps a fixed resolution that the
+  viewport stretches; flappy uses it. Viewport destination and buffer scale
+  are sent only when they change.
+- **Additions.**
+  - `Window::passthrough` (an empty input region);
+  - `Stats::first_commit_ns` and opt-in latency recording;
+  - `Entity::PLACEHOLDER` in static-ecs, for synthetic events in tests;
+  - `UiClock::Frame`: during a window frame, `ui_frame` sets the UI's clock to
+    the frame's predicted display time. This is how "`UiClock` takes the
+    step" (phase 8) came out.
+- **Budgets missed.**
+  - Launch is about 0.3 ms over budget. Loading libwayland and libffi with
+    `dlopen` costs that much, and the old pure-Rust clients never paid it.
+  - Allocation-free holds for our code, not for libwayland: libwayland
+    mallocs one closure per message, and wayland-rs allocates for each new
+    object and for events with more than four arguments.
+
+  Details are in WINDOW_BENCHMARKS.md.
+
 ---
 
 ## 1. Why a crate, and why now
 
-Two hand-written Wayland loops exist today and they have diverged:
+Before this crate, two hand-written Wayland loops existed, and they had diverged:
 
 | | `static-ui-wayland/src/window.rs` (546 lines) | `demo/flappy/src/main.rs` (451 lines) |
 |---|---|---|

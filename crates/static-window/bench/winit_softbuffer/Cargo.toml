@@ -1,0 +1,22 @@
+# static-window's `examples/software.rs` on winit and softbuffer, Wayland
+# only, for WINDOW_BENCHMARKS.md (binary size). Not part of the workspace.
+#   cargo build --release                       # no client-side title bars
+#   cargo build --release --features csd        # winit's own (Adwaita) title bars
+[package]
+name = "winit-softbuffer-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
+softbuffer = { version = "0.4", default-features = false, features = ["wayland", "wayland-dlopen"] }
+
+[features]
+csd = ["winit/wayland-csd-adwaita"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

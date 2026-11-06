@@ -208,6 +208,33 @@ fn a_scale_change_reallocates_at_the_pixel_size() {
 }
 
 #[test]
+fn the_viewport_is_sent_again_only_when_the_size_changes() {
+    let (compositor, mut lp, mut app, _) = mapped!(Globals::default());
+    let first = compositor.with(|s, _| {
+        assert!(s.surface_of(0).commits.last().unwrap().geometry, "the first frame sets the viewport");
+        s.surface_of(0).buffer.unwrap()
+    });
+    paint(&mut app.world).request.push(PixelRect::new(0, 0, 4, 4));
+    lp.step(&mut app, NOW);
+    compositor.with(move |s, _| s.release(first));
+    paint(&mut app.world).request.push(PixelRect::new(8, 0, 4, 4));
+    lp.step(&mut app, NOW);
+    compositor.with(|s, _| {
+        let commits = &s.surface_of(0).commits;
+        let later = &commits[commits.len() - 2..];
+        assert!(later.iter().all(|c| c.buffer.is_some() && !c.geometry), "later frames at the same size: {later:?}");
+        let configure = s.configure(0, 80, 40, &[]);
+        assert!(configure > 0);
+    });
+    lp.step(&mut app, NOW);
+    compositor.with(|s, _| {
+        let surface = s.surface_of(0);
+        assert!(surface.commits.last().unwrap().geometry);
+        assert_eq!(surface.viewport_destination, Some((80, 40)));
+    });
+}
+
+#[test]
 fn a_fixed_scale_framebuffer_keeps_its_pixels_and_the_viewport_stretches_them() {
     let (compositor, socket) = Compositor::spawn(Globals::default());
     let mut lp = WindowLoop::from_socket(socket).unwrap();
