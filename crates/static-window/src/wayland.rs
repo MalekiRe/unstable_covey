@@ -22,10 +22,17 @@ use wayland_protocols::xdg::shell::client::xdg_surface::{self, XdgSurface};
 use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 
-use crate::scale::Scale;
+use crate::event::TextInput;
 use crate::framebuffer::BufferId;
+use crate::input::{Key, KeyCode, MouseButton};
+use crate::keyboard::{Keymap, Typed};
+use crate::repeat::Repeat;
+use crate::scale::Scale;
 use crate::window::WindowState;
 use wayland_client::protocol::wl_callback::{self, WlCallback};
+use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
+use wayland_client::protocol::wl_pointer::{self, WlPointer};
+use wayland_client::protocol::wl_seat::{self, WlSeat};
 
 /// Globals bound once at connect.
 pub(crate) struct Globals {
@@ -142,6 +149,9 @@ pub(crate) struct State {
     pub outputs_changed: bool,
     /// Framebuffer buffers the compositor gave back.
     pub released: Vec<BufferId>,
+    pub seat: Seat,
+    /// Input since the loop last looked, in order.
+    pub input: Vec<InputEvent>,
 }
 
 impl State {
@@ -337,3 +347,208 @@ delegate_noop!(State: WpViewporter);
 delegate_noop!(State: WpViewport);
 delegate_noop!(State: WpFractionalScaleManagerV1);
 delegate_noop!(State: ZxdgDecorationManagerV1);
+
+/// Input, in the order the compositor sent it, for the loop to apply.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum InputEvent {
+    /// Keyboard focus arrived; `held` are the modifiers already down.
+    KeyboardEnter { window: Entity, held: [Option<KeyCode>; 8] },
+    KeyboardLeave { window: Entity },
+    Key { window: Entity, code: KeyCode, pressed: bool, repeat: bool, key: Key, text: Option<TextInput> },
+    PointerEnter { window: Entity, x: f32, y: f32 },
+    PointerLeave { window: Entity },
+    Motion { window: Entity, x: f32, y: f32 },
+    Button { window: Entity, button: MouseButton, pressed: bool },
+    Scroll { window: Entity, dx: f32, dy: f32, lines: Option<(f32, f32)> },
+}
+
+/// The seat: one, as in sk_app.
+#[derive(Default)]
+pub(crate) struct Seat {
+    pub seat: Option<WlSeat>,
+    pointer: Option<WlPointer>,
+    keyboard: Option<WlKeyboard>,
+    keymap: Option<Keymap>,
+    /// The keymap being compiled off the loop's thread: compiling one, with
+    /// the locale's compose table, takes milliseconds, and it arrives while
+    /// the first frame is on its way.
+    compiling: Option<std::thread::JoinHandle<Option<Keymap>>>,
+    pub repeat: Repeat,
+    pub keyboard_focus: Option<Entity>,
+    pub pointer_focus: Option<Entity>,
+    /// The serial of the last pointer enter (cursor requests quote it).
+    pub pointer_serial: u32,
+    /// Scroll gathered until `wl_pointer.frame`.
+    scroll: Option<(f32, f32, Option<(f32, f32)>)>,
+}
+
+impl Seat {
+    /// The compiled keymap, waiting for the compile if it is still running.
+    pub fn keymap(&mut self) -> Option<&mut Keymap> {
+        if let Some(compiling) = self.compiling.take()
+            && let Ok(Some(keymap)) = compiling.join()
+        {
+            self.keymap = Some(keymap);
+        }
+        self.keymap.as_mut()
+    }
+    /// A key event for `code`, with what it means and types now.
+    fn key(&mut self, window: Entity, code: u32, pressed: bool, repeat: bool) -> InputEvent {
+        let (key, text) = match self.keymap() {
+            Some(keymap) => {
+                let key = keymap.key(code);
+                let text = (pressed && keymap.typed(code) == Typed::Text).then(|| TextInput::new(window, keymap.text())).flatten();
+                (key, text)
+            }
+            None => (Key::Unidentified, None),
+        };
+        InputEvent::Key { window, code: KeyCode(code as u16), pressed, repeat, key, text }
+    }
+}
+
+impl State {
+    /// A held key's repeat, if one is due at `now_ns`.
+    pub fn pump_repeat(&mut self, now_ns: u64) {
+        if let Some(code) = self.seat.repeat.due(now_ns)
+            && let Some(window) = self.seat.keyboard_focus
+        {
+            let event = self.seat.key(window, code, true, true);
+            self.input.push(event);
+        }
+    }
+    fn flush_scroll(&mut self) {
+        if let (Some((dx, dy, lines)), Some(window)) = (self.seat.scroll.take(), self.seat.pointer_focus) {
+            self.input.push(InputEvent::Scroll { window, dx, dy, lines });
+        }
+    }
+}
+
+impl Dispatch<WlSeat, ()> for State {
+    fn event(state: &mut Self, seat: &WlSeat, event: wl_seat::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>) {
+        let wl_seat::Event::Capabilities { capabilities: WEnum::Value(caps) } = event else { return };
+        let s = &mut state.seat;
+        match (caps.contains(wl_seat::Capability::Pointer), s.pointer.take()) {
+            (true, None) => s.pointer = Some(seat.get_pointer(qh, ())),
+            (true, kept) => s.pointer = kept,
+            (false, Some(pointer)) if pointer.version() >= 3 => pointer.release(),
+            (false, _) => {}
+        }
+        match (caps.contains(wl_seat::Capability::Keyboard), s.keyboard.take()) {
+            (true, None) => s.keyboard = Some(seat.get_keyboard(qh, ())),
+            (true, kept) => s.keyboard = kept,
+            (false, Some(keyboard)) if keyboard.version() >= 3 => keyboard.release(),
+            (false, _) => {}
+        }
+    }
+}
+
+impl Dispatch<WlKeyboard, ()> for State {
+    fn event(state: &mut Self, _: &WlKeyboard, event: wl_keyboard::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            wl_keyboard::Event::Keymap { format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1), fd, size } => {
+                // SAFETY: a private read-only mapping of the keymap file the
+                // compositor sent, unmapped below.
+                let map = unsafe {
+                    rustix::mm::mmap(std::ptr::null_mut(), size as usize, rustix::mm::ProtFlags::READ, rustix::mm::MapFlags::PRIVATE, &fd, 0)
+                };
+                if let Ok(map) = map {
+                    let bytes = unsafe { std::slice::from_raw_parts(map as *const u8, size as usize) }.to_vec();
+                    unsafe {
+                        let _ = rustix::mm::munmap(map, size as usize);
+                    }
+                    state.seat.keymap = None;
+                    state.seat.compiling = Some(std::thread::spawn(move || Keymap::from_bytes(&bytes)));
+                }
+            }
+            wl_keyboard::Event::Enter { surface, keys, .. } => {
+                let Some(&window) = surface.data::<Entity>() else { return };
+                state.seat.keyboard_focus = Some(window);
+                let mut held = [None; 8];
+                let modifiers = keys.as_chunks::<4>().0.iter().map(|&b| KeyCode(u32::from_ne_bytes(b) as u16)).filter(|c| c.is_modifier());
+                for (slot, code) in held.iter_mut().zip(modifiers) {
+                    *slot = Some(code);
+                }
+                state.input.push(InputEvent::KeyboardEnter { window, held });
+            }
+            wl_keyboard::Event::Leave { surface, .. } => {
+                let Some(&window) = surface.data::<Entity>() else { return };
+                state.seat.keyboard_focus = None;
+                state.seat.repeat.clear();
+                if let Some(keymap) = state.seat.keymap() {
+                    keymap.reset_compose();
+                }
+                state.input.push(InputEvent::KeyboardLeave { window });
+            }
+            wl_keyboard::Event::Key { key, state: WEnum::Value(key_state), .. } => {
+                let Some(window) = state.seat.keyboard_focus else { return };
+                let pressed = key_state == wl_keyboard::KeyState::Pressed;
+                if pressed {
+                    let repeats = state.seat.keymap().is_some_and(|k| k.repeats(key)) && !KeyCode(key as u16).is_modifier();
+                    state.seat.repeat.press(key, repeats, crate::run::now_ns());
+                } else {
+                    state.seat.repeat.release(key);
+                }
+                let event = state.seat.key(window, key, pressed, false);
+                state.input.push(event);
+            }
+            wl_keyboard::Event::Modifiers { mods_depressed, mods_latched, mods_locked, group, .. } => {
+                if let Some(keymap) = state.seat.keymap() {
+                    keymap.set_modifiers(mods_depressed, mods_latched, mods_locked, group);
+                }
+            }
+            wl_keyboard::Event::RepeatInfo { rate, delay } => state.seat.repeat.set_info(rate, delay),
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlPointer, ()> for State {
+    fn event(state: &mut Self, pointer: &WlPointer, event: wl_pointer::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+        match event {
+            wl_pointer::Event::Enter { serial, surface, surface_x, surface_y } => {
+                let Some(&window) = surface.data::<Entity>() else { return };
+                state.seat.pointer_focus = Some(window);
+                state.seat.pointer_serial = serial;
+                state.input.push(InputEvent::PointerEnter { window, x: surface_x as f32, y: surface_y as f32 });
+            }
+            wl_pointer::Event::Leave { surface, .. } => {
+                let Some(&window) = surface.data::<Entity>() else { return };
+                state.flush_scroll();
+                state.seat.pointer_focus = None;
+                state.input.push(InputEvent::PointerLeave { window });
+            }
+            wl_pointer::Event::Motion { surface_x, surface_y, .. } => {
+                if let Some(window) = state.seat.pointer_focus {
+                    state.input.push(InputEvent::Motion { window, x: surface_x as f32, y: surface_y as f32 });
+                }
+            }
+            wl_pointer::Event::Button { button, state: WEnum::Value(button_state), .. } => {
+                if let Some(window) = state.seat.pointer_focus {
+                    let pressed = button_state == wl_pointer::ButtonState::Pressed;
+                    state.input.push(InputEvent::Button { window, button: MouseButton::from_evdev(button), pressed });
+                }
+            }
+            wl_pointer::Event::Axis { axis: WEnum::Value(axis), value, .. } => {
+                let scroll = state.seat.scroll.get_or_insert((0.0, 0.0, None));
+                match axis {
+                    wl_pointer::Axis::VerticalScroll => scroll.1 += value as f32,
+                    _ => scroll.0 += value as f32,
+                }
+                // Before version 5 there are no frames to wait for.
+                if pointer.version() < 5 {
+                    state.flush_scroll();
+                }
+            }
+            wl_pointer::Event::AxisValue120 { axis: WEnum::Value(axis), value120 } => {
+                let scroll = state.seat.scroll.get_or_insert((0.0, 0.0, None));
+                let lines = scroll.2.get_or_insert((0.0, 0.0));
+                match axis {
+                    wl_pointer::Axis::VerticalScroll => lines.1 += value120 as f32 / 120.0,
+                    _ => lines.0 += value120 as f32 / 120.0,
+                }
+            }
+            wl_pointer::Event::Frame => state.flush_scroll(),
+            _ => {}
+        }
+    }
+}

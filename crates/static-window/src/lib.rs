@@ -18,6 +18,7 @@
 mod event;
 mod framebuffer;
 mod input;
+mod keyboard;
 mod pacer;
 mod repeat;
 mod run;

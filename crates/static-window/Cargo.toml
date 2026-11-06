@@ -11,6 +11,8 @@ wayland-client = { version = "0.31", features = ["system"] }
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
 rustix = { version = "1", features = ["fs", "mm", "time", "event", "pipe"] }
+# Keymaps: pure Rust XKB, with compose for dead keys.
+kbvm = { version = "0.2", default-features = false, features = ["compose"] }
 
 [dev-dependencies]
 wayland-server = "0.31"

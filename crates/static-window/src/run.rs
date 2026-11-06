@@ -17,10 +17,25 @@ use wayland_client::{Connection, ConnectError, EventQueue, Proxy};
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 
 use crate::event::{CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput};
-use crate::input::{Keys, Pointer};
 use crate::framebuffer::{Framebuffer, Shm};
-use crate::wayland::{Globals, Proto, State, placeholder};
-use crate::window::{Animating, Minimize, Surface, Window, WindowMode, WindowState};
+use crate::input::{Key, Keys, Pointer};
+use crate::wayland::{Globals, InputEvent, Proto, State, placeholder};
+use crate::window::{Animating, KeyboardFocus, Minimize, PointerOver, Surface, Window, WindowMode, WindowState};
+
+/// Emit a window event's label, then deliver it to its window entity for
+/// behaviors.
+macro_rules! emit {
+    ($app:expr, $event:expr) => {{
+        let event = $event;
+        $app.emit(&event);
+        $app.world.deliver(event.window, event);
+    }};
+}
+
+/// The window still exists (the app may have despawned it mid-batch).
+fn alive<S: WindowWorld>(world: &World<S>, window: Entity) -> bool {
+    world.get::<Window>(window).is_some()
+}
 
 /// The world's vocabulary the loop reads and writes: what [`WindowPlugin`]
 /// declares.
@@ -202,6 +217,7 @@ impl WindowLoop {
             fractional: list.bind(&qh, 1..=1, ()).ok(),
         };
         let mut state = State::default();
+        state.seat.seat = list.bind(&qh, 1..=8, ()).ok();
         let registry = list.registry().clone();
         for global in list.contents().clone_list() {
             if global.interface == WlOutput::interface().name {
@@ -272,7 +288,9 @@ impl WindowLoop {
         if self.queue.dispatch_pending(&mut self.state).is_err() {
             return Flow::Disconnected;
         }
+        self.state.pump_repeat(now_ns());
         self.apply(app);
+        self.apply_input(app);
         let now = Instant::now();
         let dt = self.last_step.map_or(0.0, |t| (now - t).as_secs_f32());
         self.last_step = Some(now);
@@ -302,6 +320,8 @@ impl WindowLoop {
 
     fn has_work<S: WindowWorld>(&self, world: &World<S>) -> bool {
         self.woken
+            || !self.state.input.is_empty()
+            || self.state.seat.repeat.deadline().is_some_and(|at| at <= now_ns())
             || self.state.windows.iter().any(|w| w.dirty || w.close_requested || w.frame_done)
             || !self.state.released.is_empty() && self.state.windows.iter().any(|w| w.waiting)
             || world.resource::<WakeAt>().and_then(WakeAt::get).is_some_and(|at| at <= Instant::now())
@@ -318,11 +338,9 @@ impl WindowLoop {
             // Events are already queued.
             return Some(false);
         };
-        let deadline = world.resource::<WakeAt>().and_then(WakeAt::get).map(|at| at.saturating_duration_since(Instant::now()));
-        let timeout = match (timeout, deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let wake_at = world.resource::<WakeAt>().and_then(WakeAt::get).map(|at| at.saturating_duration_since(Instant::now()));
+        let repeat = self.state.seat.repeat.deadline().map(|at| Duration::from_nanos(at.saturating_sub(now_ns())));
+        let timeout = [timeout, wake_at, repeat].into_iter().flatten().min();
         let timespec = timeout.map(|t| Timespec { tv_sec: t.as_secs() as i64, tv_nsec: t.subsec_nanos() as i64 });
         let socket = guard.connection_fd();
         let mut fds = [PollFd::new(&socket, PollFlags::IN), PollFd::new(&*self.wake, PollFlags::IN)];
@@ -397,21 +415,120 @@ impl WindowLoop {
                 if previous != Some(surface) {
                     world.insert(entity, surface);
                     if !first && previous.is_some() {
-                        app.emit(&Resized { window: entity, surface });
-                        app.world.deliver(entity, Resized { window: entity, surface });
+                        emit!(app, Resized { window: entity, surface });
                     }
                 }
             }
             let window = &mut self.state.windows[i];
             if std::mem::take(&mut window.close_requested) {
                 let close = app.world.get::<Window>(entity).is_some_and(|w| w.close_on_request);
-                app.emit(&CloseRequested { window: entity });
-                app.world.deliver(entity, CloseRequested { window: entity });
+                emit!(app, CloseRequested { window: entity });
                 if close {
                     app.world.despawn(entity);
                 }
             }
         }
+    }
+
+    /// Input, in order, into the world: `Keys`/`Pointer` and the focus
+    /// markers first, then each event's label and delivery.
+    fn apply_input<S: WindowWorld, L: WindowLabels<S>>(&mut self, app: &mut App<S, L>) {
+        let mut input = std::mem::take(&mut self.state.input);
+        for event in input.drain(..) {
+            let world = &mut app.world;
+            match event {
+                InputEvent::KeyboardEnter { window, held } => {
+                    if !alive(world, window) {
+                        continue;
+                    }
+                    world.insert(window, KeyboardFocus);
+                    // Modifiers held while focus arrives count, so a
+                    // shortcut begun elsewhere still works here.
+                    for code in held.into_iter().flatten() {
+                        let keys = app.world.resource_mut::<Keys>().map(Mut::into_inner);
+                        if let Some(keys) = keys
+                            && keys.set(code, true)
+                        {
+                            let modifiers = keys.modifiers();
+                            let key = self.state.seat.keymap().map_or(Key::Unidentified, |k| k.key(code.0 as u32));
+                            emit!(app, KeyInput { window, code, key, pressed: true, repeat: false, modifiers });
+                        }
+                    }
+                    emit!(app, FocusChanged { window, focused: true });
+                }
+                InputEvent::KeyboardLeave { window } => {
+                    // Keys held as focus leaves would otherwise stay down.
+                    loop {
+                        let Some(keys) = app.world.resource_mut::<Keys>().map(Mut::into_inner) else { break };
+                        let Some(code) = keys.release_one() else { break };
+                        let modifiers = keys.modifiers();
+                        if alive(&app.world, window) {
+                            let key = self.state.seat.keymap().map_or(Key::Unidentified, |k| k.key(code.0 as u32));
+                            emit!(app, KeyInput { window, code, key, pressed: false, repeat: false, modifiers });
+                        }
+                    }
+                    if alive(&app.world, window) {
+                        app.world.remove::<KeyboardFocus>(window);
+                        emit!(app, FocusChanged { window, focused: false });
+                    }
+                }
+                InputEvent::Key { window, code, pressed, repeat, key, text } => {
+                    let Some(keys) = world.resource_mut::<Keys>().map(Mut::into_inner) else { continue };
+                    keys.set(code, pressed);
+                    let modifiers = keys.modifiers();
+                    if !alive(world, window) {
+                        continue;
+                    }
+                    emit!(app, KeyInput { window, code, key, pressed, repeat, modifiers });
+                    if let Some(text) = text {
+                        emit!(app, text);
+                    }
+                }
+                InputEvent::PointerEnter { window, x, y } => {
+                    if let Some(pointer) = world.resource_mut::<Pointer>().map(Mut::into_inner) {
+                        pointer.window = Some(window);
+                        pointer.x = x;
+                        pointer.y = y;
+                    }
+                    if alive(world, window) {
+                        world.insert(window, PointerOver);
+                        emit!(app, PointerMoved { window, x, y });
+                    }
+                }
+                InputEvent::PointerLeave { window } => {
+                    if let Some(pointer) = world.resource_mut::<Pointer>().map(Mut::into_inner) {
+                        pointer.window = None;
+                    }
+                    if alive(world, window) {
+                        world.remove::<PointerOver>(window);
+                        emit!(app, PointerLeft { window });
+                    }
+                }
+                InputEvent::Motion { window, x, y } => {
+                    if let Some(pointer) = world.resource_mut::<Pointer>().map(Mut::into_inner) {
+                        pointer.moved(x, y);
+                    }
+                    if alive(world, window) {
+                        emit!(app, PointerMoved { window, x, y });
+                    }
+                }
+                InputEvent::Button { window, button, pressed } => {
+                    if let Some(pointer) = world.resource_mut::<Pointer>().map(Mut::into_inner) {
+                        pointer.set_button(button, pressed);
+                    }
+                    if alive(world, window) {
+                        emit!(app, PointerButton { window, button, pressed });
+                    }
+                }
+                InputEvent::Scroll { window, dx, dy, lines } => {
+                    if alive(world, window) {
+                        emit!(app, Scroll { window, dx, dy, lines });
+                    }
+                }
+            }
+        }
+        // Keep the allocation for the next wakeup.
+        self.state.input = input;
     }
 
     /// A window nothing draws into still needs a buffer to be shown: an

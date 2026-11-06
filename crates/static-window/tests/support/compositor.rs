@@ -19,7 +19,9 @@ use wayland_protocols::wp::viewporter::server::{wp_viewport, wp_viewporter};
 use wayland_protocols::xdg::decoration::zv1::server::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1};
 use wayland_protocols::xdg::shell::server::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_server::backend::ClientId;
-use wayland_server::protocol::{wl_buffer, wl_callback, wl_compositor, wl_output, wl_region, wl_shm, wl_shm_pool, wl_surface};
+use wayland_server::protocol::{
+    wl_buffer, wl_callback, wl_compositor, wl_keyboard, wl_output, wl_pointer, wl_region, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+};
 use wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New, Resource, WEnum};
 
 /// Which optional globals to offer.
@@ -28,10 +30,12 @@ pub struct Globals {
     pub decoration: bool,
     pub viewporter: bool,
     pub fractional_scale: bool,
+    /// The keymap sent to the client's keyboard.
+    pub keymap: &'static [u8],
 }
 impl Default for Globals {
     fn default() -> Self {
-        Self { decoration: true, viewporter: true, fractional_scale: true }
+        Self { decoration: true, viewporter: true, fractional_scale: true, keymap: include_bytes!("us.xkb") }
     }
 }
 
@@ -98,8 +102,9 @@ fn serve(stream: UnixStream, globals: Globals, wake: OwnedFd, commands: Receiver
     if globals.fractional_scale {
         handle.create_global::<Server, wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1, ()>(1, ());
     }
+    handle.create_global::<Server, wl_seat::WlSeat, ()>(8, ());
     let client = handle.insert_client(stream, Arc::new(())).expect("client");
-    let mut server = Server { client: Some(client.id()), ..Server::default() };
+    let mut server = Server { client: Some(client.id()), keymap: globals.keymap, ..Server::default() };
     loop {
         let mut fds = [PollFd::new(&display, PollFlags::IN), PollFd::new(&wake, PollFlags::IN)];
         match rustix::event::poll(&mut fds, None) {
@@ -215,7 +220,11 @@ pub struct Server {
     pub toplevels: Vec<ToplevelRecord>,
     pub buffers: Vec<BufferRecord>,
     pub outputs: Vec<wl_output::WlOutput>,
+    pub pointer: Option<wl_pointer::WlPointer>,
+    pub keyboard: Option<wl_keyboard::WlKeyboard>,
+    keymap: &'static [u8],
     serial: u32,
+    time: u32,
 }
 
 impl Server {
@@ -262,6 +271,71 @@ impl Server {
     pub fn enter(&mut self, toplevel: usize, index: usize) {
         let surface = &self.surfaces[self.toplevels[toplevel].surface];
         surface.resource.enter(&self.outputs[index]);
+    }
+    fn tick(&mut self) -> (u32, u32) {
+        self.time += 1;
+        (self.next_serial(), self.time)
+    }
+    /// Give the window keyboard focus, with `keys` (evdev) already down.
+    pub fn keyboard_enter(&mut self, toplevel: usize, keys: &[u32]) {
+        let serial = self.next_serial();
+        let surface = &self.surfaces[self.toplevels[toplevel].surface].resource;
+        let keys = keys.iter().flat_map(|k| k.to_ne_bytes()).collect();
+        self.keyboard.as_ref().expect("no keyboard").enter(serial, surface, keys);
+    }
+    pub fn keyboard_leave(&mut self, toplevel: usize) {
+        let serial = self.next_serial();
+        let surface = &self.surfaces[self.toplevels[toplevel].surface].resource;
+        self.keyboard.as_ref().unwrap().leave(serial, surface);
+    }
+    pub fn key(&mut self, code: u32, pressed: bool) {
+        let (serial, time) = self.tick();
+        let state = if pressed { wl_keyboard::KeyState::Pressed } else { wl_keyboard::KeyState::Released };
+        self.keyboard.as_ref().unwrap().key(serial, time, code, state);
+    }
+    pub fn modifiers(&mut self, depressed: u32, latched: u32, locked: u32) {
+        let serial = self.next_serial();
+        self.keyboard.as_ref().unwrap().modifiers(serial, depressed, latched, locked, 0);
+    }
+    pub fn repeat_info(&mut self, rate: i32, delay: i32) {
+        self.keyboard.as_ref().unwrap().repeat_info(rate, delay);
+    }
+    pub fn pointer_enter(&mut self, toplevel: usize, x: f64, y: f64) {
+        let serial = self.next_serial();
+        let surface = &self.surfaces[self.toplevels[toplevel].surface].resource;
+        let pointer = self.pointer.as_ref().expect("no pointer");
+        pointer.enter(serial, surface, x, y);
+        pointer.frame();
+    }
+    pub fn pointer_leave(&mut self, toplevel: usize) {
+        let serial = self.next_serial();
+        let surface = &self.surfaces[self.toplevels[toplevel].surface].resource;
+        let pointer = self.pointer.as_ref().unwrap();
+        pointer.leave(serial, surface);
+        pointer.frame();
+    }
+    pub fn motion(&mut self, x: f64, y: f64) {
+        let (_, time) = self.tick();
+        let pointer = self.pointer.as_ref().unwrap();
+        pointer.motion(time, x, y);
+        pointer.frame();
+    }
+    /// `code` is evdev (`BTN_LEFT` is 0x110).
+    pub fn button(&mut self, code: u32, pressed: bool) {
+        let (serial, time) = self.tick();
+        let state = if pressed { wl_pointer::ButtonState::Pressed } else { wl_pointer::ButtonState::Released };
+        let pointer = self.pointer.as_ref().unwrap();
+        pointer.button(serial, time, code, state);
+        pointer.frame();
+    }
+    /// A wheel turn (`value120` 120 per notch) moving `dy`, as one frame.
+    pub fn wheel(&mut self, dy: f64, value120: i32) {
+        let (_, time) = self.tick();
+        let pointer = self.pointer.as_ref().unwrap();
+        pointer.axis_source(wl_pointer::AxisSource::Wheel);
+        pointer.axis_value120(wl_pointer::Axis::VerticalScroll, value120);
+        pointer.axis(time, wl_pointer::Axis::VerticalScroll, dy);
+        pointer.frame();
     }
     /// Fire every committed frame callback with time `ms`.
     pub fn fire_frames(&mut self, toplevel: usize, ms: u32) -> usize {
@@ -320,6 +394,41 @@ impl GlobalDispatch<xdg_wm_base::XdgWmBase, ()> for Server {
     fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<xdg_wm_base::XdgWmBase>, _: &(), init: &mut DataInit<'_, Self>) {
         init.init(resource, ());
     }
+}
+
+impl GlobalDispatch<wl_seat::WlSeat, ()> for Server {
+    fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<wl_seat::WlSeat>, _: &(), init: &mut DataInit<'_, Self>) {
+        let seat = init.init(resource, ());
+        seat.capabilities(wl_seat::Capability::Pointer | wl_seat::Capability::Keyboard);
+        seat.name("seat0".into());
+    }
+}
+
+impl Dispatch<wl_seat::WlSeat, ()> for Server {
+    fn request(server: &mut Self, _: &Client, _: &wl_seat::WlSeat, request: wl_seat::Request, _: &(), _: &DisplayHandle, init: &mut DataInit<'_, Self>) {
+        match request {
+            wl_seat::Request::GetPointer { id } => server.pointer = Some(init.init(id, ())),
+            wl_seat::Request::GetKeyboard { id } => {
+                let keyboard = init.init(id, ());
+                // The keymap travels as a file: a memfd holding it and a NUL.
+                let fd = rustix::fs::memfd_create("keymap", rustix::fs::MemfdFlags::CLOEXEC).unwrap();
+                rustix::io::write(&fd, server.keymap).unwrap();
+                rustix::io::write(&fd, &[0]).unwrap();
+                keyboard.keymap(wl_keyboard::KeymapFormat::XkbV1, fd.as_fd(), server.keymap.len() as u32 + 1);
+                keyboard.repeat_info(25, 600);
+                server.keyboard = Some(keyboard);
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for Server {
+    fn request(_: &mut Self, _: &Client, _: &wl_pointer::WlPointer, _: wl_pointer::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {}
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for Server {
+    fn request(_: &mut Self, _: &Client, _: &wl_keyboard::WlKeyboard, _: wl_keyboard::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {}
 }
 
 impl GlobalDispatch<wl_output::WlOutput, ()> for Server {
