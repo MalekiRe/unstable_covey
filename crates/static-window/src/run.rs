@@ -18,8 +18,9 @@ use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1
 
 use crate::event::{CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput};
 use crate::input::{Keys, Pointer};
+use crate::framebuffer::{Framebuffer, Shm};
 use crate::wayland::{Globals, Proto, State, placeholder};
-use crate::window::{Minimize, Surface, Window, WindowMode, WindowState};
+use crate::window::{Animating, Minimize, Surface, Window, WindowMode, WindowState};
 
 /// The world's vocabulary the loop reads and writes: what [`WindowPlugin`]
 /// declares.
@@ -30,6 +31,8 @@ pub trait WindowWorld:
     + Stores<Window>
     + Stores<WindowMode>
     + Stores<Minimize>
+    + Stores<Framebuffer>
+    + Stores<Animating>
     + Stores<Surface>
     + Stores<WindowState>
     + Stores<Keys>
@@ -53,6 +56,8 @@ impl<S> WindowWorld for S where
         + Stores<Window>
         + Stores<WindowMode>
         + Stores<Minimize>
+        + Stores<Framebuffer>
+        + Stores<Animating>
         + Stores<Surface>
         + Stores<WindowState>
         + Stores<Keys>
@@ -169,6 +174,9 @@ pub struct WindowLoop {
     started: bool,
     last_step: Option<Instant>,
     missing: Vec<&'static str>,
+    /// Numbers framebuffer allocations, so a late release of a replaced
+    /// buffer is ignored.
+    generation: u32,
     pub stats: Stats,
 }
 
@@ -221,6 +229,7 @@ impl WindowLoop {
             started: false,
             last_step: None,
             missing,
+            generation: 0,
             stats: Stats::default(),
         })
     }
@@ -243,8 +252,22 @@ impl WindowLoop {
         if !self.started {
             self.started = true;
             self.attach(&mut app.world);
-        } else if !self.has_work(&app.world) && !self.wait(&app.world, timeout) {
-            return Flow::Disconnected;
+        } else {
+            // Wait through traffic that changes nothing (a ping, a buffer
+            // back that nobody waits for) until there is work or `timeout`
+            // runs out; either way, then, a frame.
+            let deadline = timeout.map(|t| Instant::now() + t);
+            while !self.has_work(&app.world) {
+                let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+                match self.wait(&app.world, remaining) {
+                    None => return Flow::Disconnected,
+                    Some(true) => break,
+                    Some(false) => {}
+                }
+                if self.queue.dispatch_pending(&mut self.state).is_err() {
+                    return Flow::Disconnected;
+                }
+            }
         }
         if self.queue.dispatch_pending(&mut self.state).is_err() {
             return Flow::Disconnected;
@@ -259,6 +282,7 @@ impl WindowLoop {
         app.world.insert_resource(FrameTime { now_ns: now_ns(), display_ns: 0, dt });
         app.emit(&Step);
         self.sync(&mut app.world);
+        self.present(app);
         if self.conn.flush().is_err() {
             return Flow::Disconnected;
         }
@@ -278,19 +302,21 @@ impl WindowLoop {
 
     fn has_work<S: WindowWorld>(&self, world: &World<S>) -> bool {
         self.woken
-            || self.state.windows.iter().any(|w| w.dirty || w.close_requested)
+            || self.state.windows.iter().any(|w| w.dirty || w.close_requested || w.frame_done)
+            || !self.state.released.is_empty() && self.state.windows.iter().any(|w| w.waiting)
             || world.resource::<WakeAt>().and_then(WakeAt::get).is_some_and(|at| at <= Instant::now())
     }
 
     /// Sleep in `poll` on the socket and the wakeup eventfd until one is
-    /// readable, the deadline, or `timeout`. False if the connection broke.
-    fn wait<S: WindowWorld>(&mut self, world: &World<S>, timeout: Option<Duration>) -> bool {
+    /// readable, the deadline, or `timeout`. `Some(true)` if the timeout
+    /// expired with nothing to read; `None` if the connection broke.
+    fn wait<S: WindowWorld>(&mut self, world: &World<S>, timeout: Option<Duration>) -> Option<bool> {
         if self.conn.flush().is_err() {
-            return false;
+            return None;
         }
         let Some(guard) = self.queue.prepare_read() else {
             // Events are already queued.
-            return true;
+            return Some(false);
         };
         let deadline = world.resource::<WakeAt>().and_then(WakeAt::get).map(|at| at.saturating_duration_since(Instant::now()));
         let timeout = match (timeout, deadline) {
@@ -300,38 +326,42 @@ impl WindowLoop {
         let timespec = timeout.map(|t| Timespec { tv_sec: t.as_secs() as i64, tv_nsec: t.subsec_nanos() as i64 });
         let socket = guard.connection_fd();
         let mut fds = [PollFd::new(&socket, PollFlags::IN), PollFd::new(&*self.wake, PollFlags::IN)];
-        match rustix::event::poll(&mut fds, timespec.as_ref()) {
-            Ok(_) | Err(rustix::io::Errno::INTR) => {}
-            Err(_) => return false,
-        }
+        let ready = match rustix::event::poll(&mut fds, timespec.as_ref()) {
+            Ok(ready) => ready,
+            Err(rustix::io::Errno::INTR) => 1,
+            Err(_) => return None,
+        };
         self.stats.wakeups += 1;
         let (socket, wake) = (fds[0].revents(), fds[1].revents());
         if socket.intersects(PollFlags::ERR | PollFlags::HUP) && !socket.contains(PollFlags::IN) {
-            return false;
+            return None;
         }
         if socket.contains(PollFlags::IN) {
             if guard.read().is_err() {
-                return false;
+                return None;
             }
         } else {
             drop(guard);
         }
         // The compositor hung up: whatever it sent last has been read.
         if socket.contains(PollFlags::HUP) {
-            return false;
+            return None;
         }
         if wake.contains(PollFlags::IN) {
             let mut count = [0u8; 8];
             let _ = rustix::io::read(&*self.wake, &mut count);
             self.woken = true;
         }
-        true
+        Some(ready == 0)
     }
 
     /// What the compositor said, into the world: sizes, scales, states,
     /// close requests, each change emitted as its label.
     fn apply<S: WindowWorld, L: WindowLabels<S>>(&mut self, app: &mut App<S, L>) {
         self.woken = false;
+        for window in &mut self.state.windows {
+            window.frame_done = false;
+        }
         if std::mem::take(&mut self.state.outputs_changed) {
             for window in &mut self.state.windows {
                 window.dirty = true;
@@ -355,7 +385,10 @@ impl WindowLoop {
                 let scale = window.scale(&self.state.outputs);
                 let surface = Surface { width: window.size.0, height: window.size.1, scale };
                 let state = window.state;
-                self.present_placeholder(i, &surface);
+                // A window the app draws into is mapped by its first frame.
+                if app.world.get::<Framebuffer>(entity).is_none() {
+                    self.present_placeholder(i, &surface);
+                }
                 let world = &mut app.world;
                 if world.get::<WindowState>(entity) != Some(&state) {
                     world.insert(entity, state);
@@ -410,6 +443,96 @@ impl WindowLoop {
         }
         window.surface.commit();
         self.stats.commits += 1;
+    }
+
+    /// Draw and commit the framebuffers with something to show: emit
+    /// [`Redraw`] for each, then attach the back buffer with its damage.
+    fn present<S: WindowWorld, L: WindowLabels<S>>(&mut self, app: &mut App<S, L>) {
+        for id in self.state.released.drain(..) {
+            if let Some(fb) = app.world.get_mut::<Framebuffer>(id.window).map(Mut::into_inner)
+                && let Some(shm) = &mut fb.shm
+                && shm.generation == id.generation
+            {
+                shm.busy[id.index as usize] = false;
+            }
+        }
+        let qh = self.queue.handle();
+        for i in 0..self.state.windows.len() {
+            let window = &mut self.state.windows[i];
+            let entity = window.entity;
+            let animating = app.world.get::<Animating>(entity).is_some();
+            let Some(fb) = app.world.get_mut::<Framebuffer>(entity).map(Mut::into_inner) else { continue };
+            // Before the first configure, the size asked for: the first
+            // frame is drawn while the compositor answers.
+            let scale = window.scale(&self.state.outputs);
+            let (w, h) = if window.configured { window.size } else { (window.sent.width.max(1), window.sent.height.max(1)) };
+            let pixels = (scale.to_pixels(w), scale.to_pixels(h));
+            if fb.shm.as_ref().is_none_or(|s| (s.width, s.height, s.scale) != (pixels.0, pixels.1, scale)) {
+                self.generation += 1;
+                fb.shm = Some(Shm::new(&self.globals.shm, &qh, entity, self.generation, pixels.0, pixels.1, scale));
+                fb.wanted = true;
+                window.predrawn = None;
+            }
+            fb.take_requests();
+            if !window.configured {
+                if window.predrawn.is_none()
+                    && let Some(index) = fb.begin()
+                {
+                    window.predrawn = Some(index);
+                    app.emit(&Redraw { window: entity });
+                    if let Some(fb) = app.world.get_mut::<Framebuffer>(entity).map(Mut::into_inner) {
+                        fb.back = None;
+                    }
+                }
+                continue;
+            }
+            let index = match window.predrawn.take() {
+                // Drawn during the configure roundtrip at the size that came
+                // back: show it as it is.
+                Some(index) => {
+                    fb.regions.clear();
+                    fb.regions.push(crate::PixelRect::new(0, 0, pixels.0, pixels.1));
+                    Some(index)
+                }
+                // The display hasn't shown the last frame yet: the next is
+                // drawn when its callback fires.
+                None if window.frame_requested => continue,
+                None => {
+                    let index = fb.begin();
+                    window.waiting = index.is_none() && fb.wanted;
+                    if index.is_some() {
+                        app.emit(&Redraw { window: entity });
+                    }
+                    index
+                }
+            };
+            let window = &mut self.state.windows[i];
+            let Some(fb) = app.world.get_mut::<Framebuffer>(entity).map(Mut::into_inner) else { continue };
+            fb.back = None;
+            let surface = &window.surface;
+            match (index, &mut fb.shm) {
+                (Some(index), Some(shm)) => {
+                    surface.attach(Some(&shm.buffers[index]), 0, 0);
+                    for r in &fb.regions {
+                        surface.damage_buffer(r.x as i32, r.y as i32, r.width as i32, r.height as i32);
+                    }
+                    match &window.viewport {
+                        Some(viewport) => viewport.set_destination(w as i32, h as i32),
+                        None => surface.set_buffer_scale(scale.0.div_ceil(crate::Scale::UNIT) as i32),
+                    }
+                    shm.busy[index] = true;
+                }
+                // Nothing new to show, but an animation wants the next frame.
+                _ if animating && !window.frame_requested => {}
+                _ => continue,
+            }
+            if animating && !window.frame_requested {
+                surface.frame(&qh, entity);
+                window.frame_requested = true;
+            }
+            surface.commit();
+            self.stats.commits += 1;
+        }
     }
 
     /// What the world wants, to the compositor: new windows, changed ones,
@@ -490,6 +613,10 @@ impl WindowLoop {
             close_requested: false,
             server_decorated: None,
             placeholder: None,
+            frame_requested: false,
+            frame_done: false,
+            predrawn: None,
+            waiting: false,
         };
         set_mode(&mut proto, mode);
         proto.surface.commit();

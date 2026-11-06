@@ -23,7 +23,9 @@ use wayland_protocols::xdg::shell::client::xdg_toplevel::{self, XdgToplevel};
 use wayland_protocols::xdg::shell::client::xdg_wm_base::{self, XdgWmBase};
 
 use crate::scale::Scale;
+use crate::framebuffer::BufferId;
 use crate::window::WindowState;
+use wayland_client::protocol::wl_callback::{self, WlCallback};
 
 /// Globals bound once at connect.
 pub(crate) struct Globals {
@@ -81,6 +83,15 @@ pub(crate) struct Proto {
     pub server_decorated: Option<bool>,
     /// A placeholder buffer is attached (no renderer yet).
     pub placeholder: Option<(WlBuffer, (u32, u32))>,
+    /// A frame callback is outstanding.
+    pub frame_requested: bool,
+    /// A frame callback fired since the loop last looked.
+    pub frame_done: bool,
+    /// The framebuffer's buffer drawn before the first configure, committed
+    /// once it arrives (if the size held).
+    pub predrawn: Option<usize>,
+    /// A frame is due but both buffers are with the compositor.
+    pub waiting: bool,
 }
 
 impl Proto {
@@ -129,6 +140,8 @@ pub(crate) struct State {
     pub outputs: Vec<Output>,
     /// An output's scale or mode changed.
     pub outputs_changed: bool,
+    /// Framebuffer buffers the compositor gave back.
+    pub released: Vec<BufferId>,
 }
 
 impl State {
@@ -290,6 +303,25 @@ impl Dispatch<WpFractionalScaleV1, Entity> for State {
         {
             window.fractional_scale = Some(scale);
             window.dirty = true;
+        }
+    }
+}
+
+impl Dispatch<WlBuffer, BufferId> for State {
+    fn event(state: &mut Self, _: &WlBuffer, event: wl_buffer::Event, &id: &BufferId, _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_buffer::Event::Release = event {
+            state.released.push(id);
+        }
+    }
+}
+
+impl Dispatch<WlCallback, Entity> for State {
+    fn event(state: &mut Self, _: &WlCallback, event: wl_callback::Event, &entity: &Entity, _: &Connection, _: &QueueHandle<Self>) {
+        if let wl_callback::Event::Done { .. } = event
+            && let Some(window) = state.window(entity)
+        {
+            window.frame_requested = false;
+            window.frame_done = true;
         }
     }
 }

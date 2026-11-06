@@ -16,6 +16,7 @@
 //! See `WINDOW_PLAN.md` at the workspace root for the design.
 
 mod event;
+mod framebuffer;
 mod input;
 mod pacer;
 mod repeat;
@@ -30,6 +31,7 @@ use static_ecs::{Inbox, Wakeup};
 pub use event::{
     CloseRequested, FocusChanged, FrameTime, KeyInput, PointerButton, PointerLeft, PointerMoved, Redraw, Resized, Scroll, Step, TextInput,
 };
+pub use framebuffer::{Framebuffer, PixelRect, Target};
 pub use input::{Key, KeyCode, Keys, Modifiers, MouseButton, Pointer};
 pub use run::{Error, Flow, Stats, WakeAt, WindowLabels, WindowLoop, WindowWorld, run};
 pub use scale::Scale;
@@ -49,6 +51,7 @@ impl Plugin for WindowPlugin {
         KeyboardFocus,
         PointerOver,
         Animating,
+        Framebuffer,
         Keys,
         Pointer,
         WakeAt,
