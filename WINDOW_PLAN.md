@@ -93,7 +93,7 @@ Each item is a decision sk_app made (file in parentheses) that we adopt:
 What we do not take: X11/Win32/macOS/Android/web backends, the 1 ms
 sleep-polling `ska_event_wait` (we `poll` on fds), the global 16-window
 array (entities), file dialogs, kvpstore, asset paths. Like sk_app we load
-libwayland with `dlopen` (§5), but only in the default build.
+libwayland and libdecor with `dlopen` (§5).
 
 ## 3. The ECS shape
 
@@ -191,7 +191,7 @@ flowchart LR
 - **First frame during the configure roundtrip** (today's trick, worth
   0.2 ms): draw at the requested size before configure arrives; commit if
   the size came back the same.
-- **GPU (later):** the default build runs on libwayland (§5), so
+- **GPU (later):** the crate runs on libwayland (§5), so
   `wl_display*` and `wl_surface*` exist to hand Vulkan or wgpu, as
   `ska_vk_create_surface` does. Not built in this plan.
 
@@ -219,19 +219,15 @@ That cost is paid only where the compositor will not decorate. COSMIC and
 KDE use `xdg-decoration` and never load libdecor. Plugin choice is left to
 libdecor, as in sk_app.
 
-**Static builds.** `dlopen` from a fully static binary is not dependable,
-so the libwayland backend and libdecor sit behind a default feature,
-`libdecor`. Without it the crate uses the pure-Rust backend, and a compositor
-without `xdg-decoration` gives an undecorated window plus a warning.
-- flappy turns the feature off and keeps its `crt-static` build. It runs at
-  a fixed size on COSMIC, which decorates it.
-- The protocol code is the same for both backends. Only the decoration
-  module and the raw-handle getters are feature-gated.
-- Clippy and tests run with the feature both on and off.
+**One backend: libwayland, like sk_app.** `wayland-client`'s `system`
+backend with `dlopen`, everywhere. Static binaries are given up: `dlopen`
+from a fully static binary is not dependable (a static glibc process would
+load a second `libc.so` with the library; static musl cannot `dlopen` at
+all). flappy becomes an ordinary dynamically linked binary, like every
+other binary in the workspace.
 
 **Keyboard layouts: kbvm** (pure Rust, with its `compose` feature for dead
-keys). This keeps static builds possible and replaces the current
-US-layout evdev table.
+keys), replacing the current US-layout evdev table.
 
 ## 6. Testing without sleeps
 
@@ -246,8 +242,7 @@ US-layout evdev table.
   (components, emitted labels, deliveries) and on what the client sent
   (commits, damage, buffer pixels, cursor shape). Steps are driven by
   roundtrips, so tests are deterministic. The client side connects with
-  `Connection::from_socket`, which works on both backends, so the suite
-  runs with the `libdecor` feature on and off.
+  `Connection::from_socket`.
 - **Decoration choice, scripted:** with `xdg-decoration` offered, the
   window asks for server-side mode, libdecor stays unloaded, and the
   compositor answering client-side is reported. Without it, the libdecor
@@ -310,7 +305,7 @@ answered with `ClipboardText`).
 ### Phase 7: title bars
 Item 14 of §2:
 - `xdg-decoration` server-side mode, plus the compositor's answer.
-- Otherwise libdecor, loaded with `dlopen` behind the `libdecor` feature.
+- Otherwise libdecor, loaded with `dlopen`.
   Its frame replaces our `xdg_surface`/`xdg_toplevel` and our configure
   path, and `Window`/`WindowMode` requests go through its API: title,
   app_id, min/max content size, maximize, fullscreen, minimize.
@@ -328,8 +323,7 @@ Item 14 of §2:
   `static-ui-raster` (fonts, glyphs, canvas, paint, and a plugin drawing the
   `RenderList` under `Redraw`); `window.rs` is deleted.
 - flappy: its loop is deleted; `Draw` runs under `Redraw`, `Tick` under
-  `Update`; it depends on static-window without the `libdecor` feature, so
-  its `crt-static` build stays.
+  `Update`. Its fully static build goes away (§5).
 - Examples and benches move; docs and `UI_BENCHMARKS.md` update.
 
 ### Phase 9: measure
@@ -339,7 +333,7 @@ winit 0.30 + softbuffer drawing the same frame:
 | Measure | Budget |
 |---|---|
 | Idle window, 60 s | 0 commits, ≤ 2 wakeups, 0.000 s CPU |
-| Launch to first commit | flappy (pure-Rust backend) ≤ its current number; static-ui widgets (libwayland backend) ≤ 3.2 ms; libdecor path reported separately |
+| Launch to first commit | flappy ≤ its current number; static-ui widgets ≤ 3.2 ms; libdecor path reported separately |
 | Key press (virtual keyboard) to commit sent | ≤ 0.1 ms median |
 | Allocations per event and per frame, warm | 0 |
 | Stripped binary size, empty window | report against winit + softbuffer |
