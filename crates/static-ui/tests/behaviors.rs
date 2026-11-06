@@ -7,14 +7,23 @@ use std::time::Duration;
 use static_ecs::prelude::*;
 use static_ecs::{Behavior, Cx, behavior};
 use static_ui::*;
+use static_window::{Animating, MouseButton, WakeAt};
+
+mod support;
+use support::{Input, send};
 
 /// Behaviors share counters: run these tests one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
-fn frame<S: Storage, L>(app: &mut App<S, L>)
+/// A frame as the window loop runs it: deadlines start over, then the UI's
+/// update and frame.
+fn frame<S: Storage + Stores<WakeAt>, L>(app: &mut App<S, L>)
 where
     L: static_ecs::Dispatch<UiUpdate, World<S>> + static_ecs::Dispatch<UiFrame, World<S>>,
 {
+    if let Some(mut wake) = app.world.resource_mut::<WakeAt>() {
+        *wake = WakeAt::default();
+    }
     app.emit(&UiUpdate);
     app.emit(&UiFrame);
 }
@@ -46,13 +55,13 @@ fn scoped_entities_die_with_their_scope_and_with_the_behavior() {
     let button = app.world.spawn_ui(el((Node::row().width(Sizing::fixed(80.0)).height(Sizing::fixed(30.0)), Tooltip)));
     frame(&mut app);
     let shown = |app: &mut App<_, _>| app.world.query_filtered::<Entity, With<Shown>>().iter_mut().count();
-    app.emit(&Input::PointerMoved { x: 10.0, y: 10.0 });
+    send(&mut app, Input::PointerMoved { x: 10.0, y: 10.0 });
     frame(&mut app);
     assert_eq!(shown(&mut app), 1);
-    app.emit(&Input::PointerMoved { x: 300.0, y: 300.0 });
+    send(&mut app, Input::PointerMoved { x: 300.0, y: 300.0 });
     frame(&mut app);
     assert_eq!(shown(&mut app), 0, "leaving closed the scope");
-    app.emit(&Input::PointerMoved { x: 10.0, y: 10.0 });
+    send(&mut app, Input::PointerMoved { x: 10.0, y: 10.0 });
     frame(&mut app);
     assert_eq!(shown(&mut app), 1);
     // Dropping the behavior (removing its marker) drops the scope too.
@@ -83,10 +92,11 @@ fn animations_request_frames_until_they_reach_exactly_one() {
         .build();
     app.world.insert_resource(UiClock::Manual(std::time::Instant::now()));
     let entity = app.world.spawn_bundle((Fade, Progress::default()));
+    let window = app.world.spawn_bundle((UiWindow,));
     frame(&mut app);
-    assert!(app.world.resource::<Redraw>().unwrap().animating);
+    assert!(app.world.get::<Animating>(window).is_some(), "the UI window draws every frame");
     let mut frames = 0;
-    while app.world.resource::<Redraw>().unwrap().animating {
+    while app.world.get::<Animating>(window).is_some() {
         app.world.resource_mut::<UiClock>().unwrap().advance(Duration::from_millis(7));
         frame(&mut app);
         frames += 1;
@@ -99,7 +109,7 @@ fn animations_request_frames_until_they_reach_exactly_one() {
     assert!(progress[..progress.len() - 1].iter().all(|&t| t < 1.0));
     // Done: no more frames.
     frame(&mut app);
-    assert!(!app.world.resource::<Redraw>().unwrap().animating);
+    assert!(app.world.get::<Animating>(window).is_none());
 }
 
 #[derive(Default)]
@@ -123,7 +133,7 @@ fn timers_set_the_deadline_and_resume_after_it() {
     app.world.insert_resource(UiClock::Manual(start));
     let entity = app.world.spawn_bundle((Alarm, Rang::default()));
     frame(&mut app);
-    let deadline = app.world.resource::<Redraw>().unwrap().deadline.expect("a timer is pending");
+    let deadline = app.world.resource::<WakeAt>().unwrap().get().expect("a timer is pending");
     assert_eq!(deadline, start + Duration::from_millis(20));
     app.world.resource_mut::<UiClock>().unwrap().advance(Duration::from_millis(19));
     frame(&mut app);
@@ -131,7 +141,7 @@ fn timers_set_the_deadline_and_resume_after_it() {
     app.world.resource_mut::<UiClock>().unwrap().advance(Duration::from_millis(1));
     frame(&mut app);
     assert!(app.world.get::<Rang>(entity).unwrap().0);
-    assert_eq!(app.world.resource::<Redraw>().unwrap().deadline, None);
+    assert_eq!(app.world.resource::<WakeAt>().unwrap().get(), None);
     assert!(app.world.resource::<Timers>().unwrap().is_empty());
 }
 
@@ -165,16 +175,16 @@ fn closing_a_panel_mid_drag_freezes_the_behavior_until_it_reopens() {
     let panel = app.world.spawn_ui(el((Node::column(),)));
     let thumb = app.world.spawn_ui_under(panel, el((Node::row().width(Sizing::fixed(20.0)).height(Sizing::fixed(20.0)), Thumb, Dragged::default())));
     frame(&mut app);
-    app.emit(&Input::PointerMoved { x: 5.0, y: 5.0 });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-    app.emit(&Input::PointerMoved { x: 15.0, y: 5.0 });
+    send(&mut app, Input::PointerMoved { x: 5.0, y: 5.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::PointerMoved { x: 15.0, y: 5.0 });
     frame(&mut app);
     assert_eq!(app.world.get::<Dragged>(thumb).unwrap().0, 10.0);
     // Close the panel mid-drag: the thumb keeps receiving the drag, frozen.
     app.world.disable_subtree::<Closed, ChildOf>(panel);
     DRAG_POLLS.store(0, Relaxed);
-    app.emit(&Input::PointerMoved { x: 20.0, y: 5.0 });
-    app.emit(&Input::PointerMoved { x: 30.0, y: 5.0 });
+    send(&mut app, Input::PointerMoved { x: 20.0, y: 5.0 });
+    send(&mut app, Input::PointerMoved { x: 30.0, y: 5.0 });
     frame(&mut app);
     frame(&mut app);
     assert_eq!(DRAG_POLLS.load(Relaxed), 0, "frozen");
@@ -183,9 +193,9 @@ fn closing_a_panel_mid_drag_freezes_the_behavior_until_it_reopens() {
     app.world.enable_subtree::<Closed, ChildOf>(panel);
     frame(&mut app);
     assert_eq!(app.world.get::<Dragged>(thumb).unwrap().0, 25.0);
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     frame(&mut app);
-    app.emit(&Input::PointerMoved { x: 40.0, y: 5.0 });
+    send(&mut app, Input::PointerMoved { x: 40.0, y: 5.0 });
     frame(&mut app);
     assert_eq!(app.world.get::<Dragged>(thumb).unwrap().0, 25.0, "the drag ended");
 }

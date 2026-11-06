@@ -116,7 +116,9 @@ pub struct TextInput {
     text: InlineText,
 }
 impl TextInput {
-    pub(crate) fn new(window: Entity, text: &str) -> Option<Self> {
+    /// Text for `window`, or `None` past 32 bytes (one keystroke's worth;
+    /// for synthetic input).
+    pub fn new(window: Entity, text: &str) -> Option<Self> {
         Some(Self { window, text: InlineText::new(text)? })
     }
     pub fn text(&self) -> &str {

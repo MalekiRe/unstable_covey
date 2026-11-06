@@ -1,143 +1,43 @@
-//! Raw input, as the window system reports it: a payload label, emitted once
-//! per event before the frame's `UiFrame`.
-use std::time::Instant;
-
+//! Where the UI meets its window ([`static_window`]): the window events it
+//! handles, the window it fills ([`UiWindow`]), and keeping that window
+//! drawing while something animates.
 use static_ecs::prelude::*;
+use static_window::{Animating, Key, Modifiers, MouseButton, Surface};
 
-/// A mouse button.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum MouseButton {
-    Left,
-    Right,
-    Middle,
-    Other(u16),
-}
-/// A key, by meaning (US layout), not by scancode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Key {
-    Tab,
-    Enter,
-    Escape,
-    Backspace,
-    Delete,
-    Left,
-    Right,
-    Up,
-    Down,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    Space,
-    Shift,
-    Control,
-    Alt,
-    /// A printable key, unshifted: `'a'`, `'1'`, `'/'`.
-    Char(char),
-    /// Anything else, by evdev code.
-    Other(u32),
-}
-/// Modifier keys held.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Modifiers {
-    pub shift: bool,
-    pub control: bool,
-    pub alt: bool,
-}
+use crate::Viewport;
 
-/// One input event: emit with `app.emit(&Input::...)`; systems under
-/// `Input` take `&Input` first.
+/// The window the UI fills: its size is the [`Viewport`], and it keeps
+/// drawing frames (it holds [`Animating`]) while the UI animates.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UiWindow;
+
+/// One window event, in the shape the input handler takes.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Input {
-    /// The pointer moved to `(x, y)`, window coordinates.
+pub(crate) enum Input {
     PointerMoved { x: f32, y: f32 },
-    /// The pointer left the window.
     PointerLeft,
     Button { button: MouseButton, pressed: bool },
-    /// Wheel or touchpad scroll, in pixels (positive: down / right).
     Scroll { dx: f32, dy: f32 },
     Key { key: Key, pressed: bool, modifiers: Modifiers },
-    /// Text typed: a printable character, layout applied.
     Text(char),
-    /// The window lost keyboard focus.
     FocusLost,
 }
-impl Schedule for Input {
-    type In = Ref<Self>;
-}
 
-/// What the window loop should do next: keep requesting frames while
-/// something animates, and wake at `deadline` for a timer. A resource;
-/// with neither, an idle UI sleeps until input arrives.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Redraw {
-    /// Request a frame callback after this frame.
-    pub animating: bool,
-    /// Emit a frame no later than this.
-    pub deadline: Option<Instant>,
-}
-
-/// The evdev keycode `code` as a key, US layout.
-pub fn key_from_evdev(code: u32) -> Key {
-    const ROW1: &[u8] = b"1234567890-=";
-    const ROW2: &[u8] = b"qwertyuiop[]";
-    const ROW3: &[u8] = b"asdfghjkl;'`";
-    const ROW4: &[u8] = b"\\zxcvbnm,./";
-    match code {
-        1 => Key::Escape,
-        2..=13 => Key::Char(ROW1[code as usize - 2] as char),
-        14 => Key::Backspace,
-        15 => Key::Tab,
-        16..=27 => Key::Char(ROW2[code as usize - 16] as char),
-        28 | 96 => Key::Enter,
-        29 | 97 => Key::Control,
-        30..=41 => Key::Char(ROW3[code as usize - 30] as char),
-        42 | 54 => Key::Shift,
-        43..=53 => Key::Char(ROW4[code as usize - 43] as char),
-        56 | 100 => Key::Alt,
-        57 => Key::Space,
-        102 => Key::Home,
-        103 => Key::Up,
-        104 => Key::PageUp,
-        105 => Key::Left,
-        106 => Key::Right,
-        107 => Key::End,
-        108 => Key::Down,
-        109 => Key::PageDown,
-        111 => Key::Delete,
-        other => Key::Other(other),
+/// `UiUpdate`, first: the viewport follows the UI window's size.
+pub(crate) fn follow_window(mut windows: Query<&Surface, With<UiWindow>>, mut viewport: ResMut<Viewport>) {
+    if let Some(surface) = windows.iter_mut().next() {
+        let size = Viewport { width: surface.width as f32, height: surface.height as f32 };
+        if *viewport != size {
+            *viewport = size;
+        }
     }
 }
-/// The character a key types, US layout, or `None`.
-pub fn key_text(key: Key, shift: bool) -> Option<char> {
-    match key {
-        Key::Space => Some(' '),
-        Key::Char(c) if !shift => Some(c),
-        Key::Char(c) => Some(match c {
-            'a'..='z' => c.to_ascii_uppercase(),
-            '1' => '!',
-            '2' => '@',
-            '3' => '#',
-            '4' => '$',
-            '5' => '%',
-            '6' => '^',
-            '7' => '&',
-            '8' => '*',
-            '9' => '(',
-            '0' => ')',
-            '-' => '_',
-            '=' => '+',
-            '[' => '{',
-            ']' => '}',
-            ';' => ':',
-            '\'' => '"',
-            '`' => '~',
-            '\\' => '|',
-            ',' => '<',
-            '.' => '>',
-            '/' => '?',
-            other => other,
-        }),
-        _ => None,
-    }
+
+/// Keep the UI window drawing frames while `animating`, and only then.
+pub(crate) fn set_animating<S: Storage>(windows: &mut Query<(Entity, Has<Animating>), With<UiWindow>>, commands: &mut Commands<S>, animating: bool) {
+    windows.each(|(window, has)| match (animating, has) {
+        (true, false) => commands.insert(window, (Animating,)),
+        (false, true) => commands.remove::<(Animating,)>(window),
+        _ => {}
+    });
 }

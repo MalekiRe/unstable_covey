@@ -1,10 +1,14 @@
-//! Clay's README example, the sidebar, on static-ui. Opens a window, or with
-//! `--png <path>` renders one frame offscreen and saves it.
+//! Clay's README example, the sidebar, on static-ui. Opens a window (closing
+//! after `--run-for <seconds>` if given), or with `--png <path>` renders
+//! one frame offscreen and saves it.
 //!
-//! cargo run --release -p static-ui-wayland --example sidebar
+//! cargo run --release -p static-ui-raster --example sidebar
+use std::time::{Duration, Instant};
+
 use static_ecs::prelude::*;
 use static_ui::*;
-use static_ui_wayland::{Atlas, Canvas, Fonts, WindowOptions, paint, run};
+use static_ui_raster::{Atlas, Canvas, Fonts, RasterPlugin, paint, run, ui_window};
+use static_window::{Step, WakeAt, Window, WindowPlugin};
 
 const COLOR_LIGHT: Color = Color::rgb(224, 215, 210);
 const COLOR_RED: Color = Color::rgb(168, 66, 28);
@@ -22,7 +26,21 @@ fn sidebar_item(label: &'static str) -> Item {
 }
 
 fn main() {
-    let mut app = App::new().add_plugins(UiPlugin::<Fonts>::default()).build();
+    let args: Vec<String> = std::env::args().collect();
+    let run_for = args.iter().position(|a| a == "--run-for").and_then(|i| args.get(i + 1)).map(|s| Duration::from_secs_f64(s.parse().expect("seconds")));
+    let mut app = App::new()
+        .add_plugins((WindowPlugin, UiPlugin::<Fonts>::default(), RasterPlugin))
+        // With `--run-for`, close the window when the time is up.
+        .add_systems(Step, move |mut until: Local<Option<Instant>>, mut wake: ResMut<WakeAt>, mut windows: Query<Entity, With<Window>>, mut commands: Commands<_>| {
+            let Some(run_for) = run_for else { return };
+            let until = *until.get_or_insert_with(|| Instant::now() + run_for);
+            if Instant::now() >= until {
+                windows.each(|window| commands.despawn(window));
+            } else {
+                wake.request(until);
+            }
+        })
+        .build();
     app.world.spawn_ui(el((OUTER, Background(Color::rgb(250, 250, 255)))).children((
         el((SIDEBAR, Background(COLOR_LIGHT))).children((
             el((PROFILE, Background(COLOR_RED), Radius::all(8.0))).children((
@@ -41,12 +59,10 @@ fn main() {
         }))
         .children((el((Text::new("Main content: text wraps to the box it is given, as Clay's does.", 18),)),)),
     )));
-    let args: Vec<String> = std::env::args().collect();
     if let Some(path) = args.iter().position(|a| a == "--png").and_then(|i| args.get(i + 1)) {
         let (width, height) = (1024usize, 640usize);
         app.world.insert_resource(Viewport { width: width as f32, height: height as f32 });
         app.emit(&UiFrame);
-        let damage = app.world.resource_mut::<RenderList>().unwrap().take_damage();
         let mut pixels = vec![0u32; width * height];
         let mut canvas = Canvas { pixels: &mut pixels, width, height, stride: width, touched: 0 };
         let world = &app.world;
@@ -57,7 +73,8 @@ fn main() {
             world.resource::<Fonts>().unwrap(),
             &mut Atlas::default(),
             world.resource::<ClearColor>().unwrap().0,
-            &damage,
+            1.0,
+            [static_ui::layout::Rect::new(0.0, 0.0, width as f32, height as f32)],
         );
         let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
         for p in &pixels {
@@ -67,11 +84,9 @@ fn main() {
         eprintln!("{painted:?}");
         return;
     }
-    let run_for = args
-        .iter()
-        .position(|a| a == "--run-for")
-        .and_then(|i| args.get(i + 1))
-        .map(|s| std::time::Duration::from_secs_f64(s.parse().expect("seconds")));
-    let stats = run(&mut app, WindowOptions { title: "Clay sidebar (static-ui)".into(), width: 1024, height: 640, run_for, ..WindowOptions::default() });
-    eprintln!("{stats:?}");
+    app.world.spawn_bundle(ui_window(Window::new("Clay sidebar (static-ui)").size(1024, 640).app_id("static-ui.sidebar")));
+    match run(&mut app) {
+        Ok(stats) => eprintln!("{stats:?}"),
+        Err(e) => eprintln!("{e}"),
+    }
 }

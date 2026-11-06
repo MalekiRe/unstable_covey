@@ -101,9 +101,18 @@ pub struct Framebuffer {
     /// new): a frame is due. Each buffer's pending list says what to repaint
     /// when it is the one drawn.
     pub(crate) wanted: bool,
+    /// Draw at this scale whatever the display's, and let the compositor
+    /// stretch the result.
+    pub(crate) fixed_scale: Option<Scale>,
 }
 
 impl Framebuffer {
+    /// A framebuffer drawn at `scale` (`Scale::ONE`: one pixel per logical
+    /// unit) whatever the display's: for content with a fixed resolution,
+    /// such as a game's, which the compositor then scales.
+    pub fn at_scale(scale: Scale) -> Self {
+        Self { fixed_scale: Some(scale), ..Self::default() }
+    }
     /// Repaint `rect` (buffer pixels) at the next frame.
     pub fn request(&mut self, rect: PixelRect) {
         if !rect.is_empty() {

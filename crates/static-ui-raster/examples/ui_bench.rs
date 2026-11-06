@@ -2,14 +2,15 @@
 //! at 1k and 10k elements, open/close by subtree size, an idle frame with
 //! 10,000 behaviors, and hit testing. Text is measured with the real fonts.
 //!
-//! cargo run --release -p static-ui-wayland --example ui_bench
+//! cargo run --release -p static-ui-raster --example ui_bench
 use std::hint::black_box;
 use std::time::Instant;
 
 use static_ecs::prelude::*;
 use static_ecs::{Behavior, Cx, behavior};
 use static_ui::*;
-use static_ui_wayland::Fonts;
+use static_ui_raster::Fonts;
+use static_window::PointerMoved;
 
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(f64::total_cmp);
@@ -159,7 +160,7 @@ fn main() {
         let mut y = 0.0;
         let us = time(2000, || {
             y = (y + 7.0) % 800.0;
-            app.emit(black_box(&Input::PointerMoved { x: 400.0, y }));
+            app.emit(black_box(&PointerMoved { window: Entity::PLACEHOLDER, x: 400.0, y }));
         });
         println!("| {} | {us:.2} µs |", app.world.resource::<UiLayout>().unwrap().tree().len());
     }

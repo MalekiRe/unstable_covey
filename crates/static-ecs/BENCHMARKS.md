@@ -244,6 +244,11 @@ the fresh 1.3 MB buffer (pre-populating both buffers with `MAP_POPULATE` moved
 frame about 55 ms after its commit, against about two refreshes for later
 frames.
 
+These are the numbers of flappy's own hand-written Wayland loop. flappy now
+runs on `crates/static-window` (libwayland through `dlopen`, so no static
+build); its launch with that loop is in
+[WINDOW_BENCHMARKS.md](../../WINDOW_BENCHMARKS.md).
+
 ## Query caches allocate once (`22a6108` → current)
 
 A query parameter's cache of matching tables now keeps its first four tables

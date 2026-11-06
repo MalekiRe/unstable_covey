@@ -27,6 +27,9 @@ pub struct Entity {
     generation: u32,
 }
 impl Entity {
+    /// An entity no world holds: a stand-in where an `Entity` is required
+    /// but none applies (a synthetic event in a test, a default value).
+    pub const PLACEHOLDER: Entity = Entity { world: u64::MAX, slot: u32::MAX, generation: u32::MAX };
     /// Its slot in the world's entity index.
     pub fn index(self) -> u32 {
         self.slot

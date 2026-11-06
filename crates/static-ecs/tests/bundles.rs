@@ -93,3 +93,15 @@ fn many_bundle_transitions_stay_exact_while_the_cache_grows() {
     }
     assert_eq!(world.query::<&u32>().iter_mut().count(), 3 * 6);
 }
+
+#[test]
+fn the_placeholder_entity_is_in_no_world() {
+    struct Hp(u32);
+    let mut world = App::new().register::<Hp>().build().world;
+    let real = world.spawn_bundle((Hp(1),));
+    assert!(!world.contains(Entity::PLACEHOLDER));
+    assert!(world.get::<Hp>(Entity::PLACEHOLDER).is_none());
+    assert!(!world.despawn(Entity::PLACEHOLDER));
+    assert_ne!(real, Entity::PLACEHOLDER);
+    assert!(world.contains(real));
+}

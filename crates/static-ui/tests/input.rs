@@ -7,6 +7,10 @@ use std::task::Poll;
 use static_ecs::prelude::*;
 use static_ecs::{Behavior, Cx, behavior};
 use static_ui::*;
+use static_window::{Key, Modifiers, MouseButton};
+
+mod support;
+use support::{Input, send};
 
 /// Every event an entity's behavior heard, in order.
 #[derive(Default)]
@@ -76,26 +80,26 @@ fn hover_press_and_click_update_interaction_and_deliver_click() {
     let a = app.world.spawn_ui_under(column, el((BUTTON, Interaction::default(), Recorder, Log::default())));
     let b = app.world.spawn_ui_under(column, el((BUTTON, Interaction::default(), Recorder, Log::default())));
     app.emit(&UiFrame);
-    app.emit(&Input::PointerMoved { x: 50.0, y: 20.0 });
+    send(&mut app, Input::PointerMoved { x: 50.0, y: 20.0 });
     assert!(app.world.get::<Interaction>(a).unwrap().hovered);
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
     assert!(app.world.get::<Interaction>(a).unwrap().pressed);
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     assert!(!app.world.get::<Interaction>(a).unwrap().pressed);
     app.emit(&UiFrame);
     assert_eq!(log(&app.world, a), ["click Left"]);
     // Moving onto b moves the hover.
-    app.emit(&Input::PointerMoved { x: 50.0, y: 60.0 });
+    send(&mut app, Input::PointerMoved { x: 50.0, y: 60.0 });
     assert!(!app.world.get::<Interaction>(a).unwrap().hovered);
     assert!(app.world.get::<Interaction>(b).unwrap().hovered);
     // Pressing on b and releasing on a is no click: it was a drag of b.
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-    app.emit(&Input::PointerMoved { x: 50.0, y: 20.0 });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::PointerMoved { x: 50.0, y: 20.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     app.emit(&UiFrame);
     assert_eq!(log(&app.world, a), ["click Left"]);
     assert_eq!(log(&app.world, b), ["drag start 50,60", "drag 0,-40", "drag end"]);
-    app.emit(&Input::PointerLeft);
+    send(&mut app, Input::PointerLeft);
     assert!(!app.world.get::<Interaction>(b).unwrap().hovered);
 }
 
@@ -110,9 +114,9 @@ fn events_bubble_to_the_nearest_listener_and_inert_ignores_input() {
     app.emit(&UiFrame);
     app.emit(&UiFrame);
     for (x, y) in [(50.0, 30.0), (50.0, 70.0)] {
-        app.emit(&Input::PointerMoved { x, y });
-        app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-        app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+        send(&mut app, Input::PointerMoved { x, y });
+        send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
+        send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
         app.emit(&UiFrame);
     }
     // The child has no listener: its click reached the card. The inert
@@ -128,15 +132,15 @@ fn dragging_delivers_start_deltas_and_end_to_the_taker() {
     let thumb = app.world.spawn_ui(el((BUTTON, Recorder, Log::default())));
     app.emit(&UiFrame);
     app.emit(&UiFrame);
-    app.emit(&Input::PointerMoved { x: 10.0, y: 10.0 });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-    app.emit(&Input::PointerMoved { x: 11.0, y: 10.0 }); // under the threshold
+    send(&mut app, Input::PointerMoved { x: 10.0, y: 10.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::PointerMoved { x: 11.0, y: 10.0 }); // under the threshold
     app.emit(&UiFrame);
-    app.emit(&Input::PointerMoved { x: 20.0, y: 10.0 });
+    send(&mut app, Input::PointerMoved { x: 20.0, y: 10.0 });
     app.emit(&UiFrame);
-    app.emit(&Input::PointerMoved { x: 25.0, y: 12.0 });
+    send(&mut app, Input::PointerMoved { x: 25.0, y: 12.0 });
     app.emit(&UiFrame);
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     app.emit(&UiFrame);
     assert_eq!(log(&app.world, thumb), ["drag start 10,10", "drag 9,0", "drag 5,2", "drag end"]);
 }
@@ -151,18 +155,18 @@ fn wheel_and_drag_scroll_containers_within_their_content() {
     )));
     let rows: Vec<Entity> = (0..10).map(|_| app.world.spawn_ui_under(list, el((BUTTON,)))).collect();
     app.emit(&UiFrame);
-    app.emit(&Input::PointerMoved { x: 50.0, y: 50.0 });
-    app.emit(&Input::Scroll { dx: 0.0, dy: 30.0 });
+    send(&mut app, Input::PointerMoved { x: 50.0, y: 50.0 });
+    send(&mut app, Input::Scroll { dx: 0.0, dy: 30.0 });
     app.emit(&UiFrame);
     assert_eq!(app.world.get::<Scroll>(list).unwrap().offset.y, 30.0);
     assert_eq!(app.world.get::<static_ui::Rect>(rows[1]).unwrap().0.y, 10.0, "rows moved up");
-    app.emit(&Input::Scroll { dx: 0.0, dy: 1000.0 });
+    send(&mut app, Input::Scroll { dx: 0.0, dy: 1000.0 });
     assert_eq!(app.world.get::<Scroll>(list).unwrap().offset.y, 300.0, "clamped: 400 of content in 100");
     // Drag to scroll: no behavior took the drag.
     app.emit(&UiFrame);
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-    app.emit(&Input::PointerMoved { x: 50.0, y: 90.0 });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::PointerMoved { x: 50.0, y: 90.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     assert_eq!(app.world.get::<Scroll>(list).unwrap().offset.y, 260.0);
 }
 
@@ -174,25 +178,25 @@ fn focus_follows_clicks_and_tab_and_receives_text() {
     let second = app.world.spawn_ui_under(form, el((BUTTON, Focusable, Interaction::default(), Recorder, Log::default())));
     app.emit(&UiFrame);
     app.emit(&UiFrame);
-    app.emit(&Input::PointerMoved { x: 10.0, y: 60.0 });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::PointerMoved { x: 10.0, y: 60.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     assert_eq!(app.world.resource::<Focus>().unwrap().0, Some(second));
     assert!(app.world.get::<Interaction>(second).unwrap().focused);
-    app.emit(&Input::Text('h'));
-    app.emit(&Input::Text('i'));
+    send(&mut app, Input::Text('h'));
+    send(&mut app, Input::Text('i'));
     app.emit(&UiFrame);
-    app.emit(&Input::Key { key: Key::Tab, pressed: true, modifiers: Modifiers::default() });
+    send(&mut app, Input::Key { key: Key::Tab, pressed: true, modifiers: Modifiers::default() });
     assert_eq!(app.world.resource::<Focus>().unwrap().0, Some(first), "Tab wraps around");
-    app.emit(&Input::Text('!'));
+    send(&mut app, Input::Text('!'));
     app.emit(&UiFrame);
     // Within one wakeup the recorder takes clicks and text before focus (its
     // select order); each kind arrives in order.
     assert_eq!(log(&app.world, second), ["click Left", "text h", "text i", "focus in", "focus out"]);
     assert_eq!(log(&app.world, first), ["text !", "focus in"]);
     // Clicking outside every element clears focus.
-    app.emit(&Input::PointerMoved { x: 500.0, y: 500.0 });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::PointerMoved { x: 500.0, y: 500.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
     assert_eq!(app.world.resource::<Focus>().unwrap().0, None);
 }
 

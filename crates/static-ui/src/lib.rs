@@ -33,7 +33,7 @@ pub mod widgets;
 
 pub use behave::{Either, FrameTick, InScope, Scope, Timers, UiClock, UiUpdate, animate, scoped, select, select_all, sleep};
 pub use flatten::{UiLayout, layout_system};
-pub use input::{Input, Key, Modifiers, MouseButton, Redraw};
+pub use input::UiWindow;
 pub use interact::{
     Click, Drag, DragEnd, DragStart, Focus, FocusIn, FocusOut, Focusable, InputPlugin, Interaction, KeyPress, Pointer,
     PointerEnter, PointerLeave, Press, Release, TextInput, Wheel, bubble, hit_test, DRAG_THRESHOLD,
@@ -296,8 +296,10 @@ impl<M: Measure> Plugin for UiPlugin<M> {
         UiLayout,
         RenderList,
         ClearColor,
-        Redraw,
-        static_ecs::Wakeup,
+        UiWindow,
+        static_window::Surface,
+        static_window::Animating,
+        static_window::WakeAt,
         Timers,
         UiClock,
         transition::ActiveTransitions,

@@ -7,6 +7,8 @@ description = "A retained, async, ECS-native UI on static-ecs: Clay layout, Disa
 [dependencies]
 static-ecs = { path = "../static-ecs" }
 static-ui-layout = { path = "../static-ui-layout" }
+# Input events, the window the UI fills, and when to wake.
+static-window = { path = "../static-window" }
 
 [dev-dependencies]
 static-ui-clay-oracle = { path = "../static-ui-clay-oracle" }

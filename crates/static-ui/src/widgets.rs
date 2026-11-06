@@ -24,7 +24,7 @@ use static_ecs::{Behaving, Behavior, Components, Cx, Inbox, Wakeup, behavior};
 use static_ui_layout::Vec2;
 
 use crate::behave::{self, Scope, UiUpdate, select, select_all, sleep};
-use crate::input::Key;
+use static_window::Key;
 use crate::interact::{Click, Drag, DragEnd, DragStart, FocusIn, FocusOut, Focusable, Interaction, KeyPress, PointerEnter, PointerLeave, Press, Release, TextInput};
 use crate::{
     AlignX, AlignY, Attach, AttachPoint, Background, Border, BorderWidth, ChildOf, Clip, Closed, Color, El, Floating, Measure, Monospace, Node,
@@ -129,7 +129,7 @@ impl Behavior for Button {
                     if click.as_mut().poll(c).is_ready() {
                         return Poll::Ready(ButtonEvent::Activate);
                     }
-                    if let Poll::Ready(KeyPress { key: Key::Enter | Key::Space, .. }) = key.as_mut().poll(c) {
+                    if let Poll::Ready(KeyPress { key: Key::Enter | Key::Char(' '), .. }) = key.as_mut().poll(c) {
                         return Poll::Ready(ButtonEvent::Activate);
                     }
                     Poll::Pending
@@ -204,7 +204,7 @@ impl Behavior for Checkbox {
         show(checked);
         loop {
             match select(cx.on::<Click>(me), cx.on::<KeyPress>(me)).await {
-                behave::Either::Left(_) | behave::Either::Right(KeyPress { key: Key::Space, .. }) => {}
+                behave::Either::Left(_) | behave::Either::Right(KeyPress { key: Key::Char(' '), .. }) => {}
                 behave::Either::Right(_) => continue,
             }
             let checked = cx

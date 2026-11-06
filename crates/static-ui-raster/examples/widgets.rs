@@ -1,12 +1,14 @@
+#![recursion_limit = "256"]
 //! Every widget in one window. With `--png <path>`, renders one frame
 //! offscreen (with the dropdown open and the text field focused) and saves
 //! it as PPM.
 //!
-//! cargo run --release -p static-ui-wayland --example widgets
+//! cargo run --release -p static-ui-raster --example widgets
 use static_ecs::prelude::*;
 use static_ui::widgets::*;
 use static_ui::*;
-use static_ui_wayland::{Atlas, Canvas, Fonts, WindowOptions, paint, run};
+use static_ui_raster::{Atlas, Canvas, Fonts, RasterPlugin, paint, run, ui_window};
+use static_window::{Key, KeyInput, MouseButton, PointerButton, PointerMoved, Window, WindowPlugin};
 
 fn heading(text: &str) -> El<(Text,)> {
     el((Text::new(text, 14).color(Color::rgb(110, 110, 120)),))
@@ -14,7 +16,7 @@ fn heading(text: &str) -> El<(Text,)> {
 
 fn main() {
     let mut app = App::new()
-        .add_plugins((UiPlugin::<Fonts>::default(), InputPlugin, widgets::<Fonts>()))
+        .add_plugins((WindowPlugin, UiPlugin::<Fonts>::default(), InputPlugin, widgets::<Fonts>(), RasterPlugin))
         // Rows show their index: a plain system over `Changed<RowIndex>`.
         .add_systems(UiUpdate, |mut rows: Query<(&RowIndex, &Sources<ChildOf>), Changed<RowIndex>>, mut texts: Query<&mut Text>| {
             rows.each(|(index, children)| {
@@ -24,8 +26,8 @@ fn main() {
             })
         })
         // F12 cycles the debug overlay: boxes, damage, timings, off.
-        .add_systems(Input::FocusLost, |input: &Input, mut overlay: ResMut<DebugOverlay>| {
-            if let Input::Key { key: Key::Other(88), pressed: true, .. } = input {
+        .add_systems(label::<KeyInput>(), |e: &KeyInput, mut overlay: ResMut<DebugOverlay>| {
+            if let KeyInput { key: Key::F(12), pressed: true, .. } = e {
                 *overlay = match (overlay.boxes, overlay.damage, overlay.timings) {
                     (false, false, false) => DebugOverlay { boxes: true, ..DebugOverlay::default() },
                     (true, false, false) => DebugOverlay { damage: true, ..DebugOverlay::default() },
@@ -91,9 +93,10 @@ fn main() {
         // Open the dropdown and focus the field, as a user would.
         for target in [dropdown, field] {
             let r = app.world.get::<static_ui::Rect>(target).unwrap().0;
-            app.emit(&Input::PointerMoved { x: r.x + 10.0, y: r.y + r.height / 2.0 });
-            app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-            app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+            let window = Entity::PLACEHOLDER;
+            app.emit(&PointerMoved { window, x: r.x + 10.0, y: r.y + r.height / 2.0 });
+            app.emit(&PointerButton { window, button: MouseButton::Left, pressed: true });
+            app.emit(&PointerButton { window, button: MouseButton::Left, pressed: false });
             app.emit(&UiUpdate);
             app.emit(&UiFrame);
         }
@@ -110,7 +113,8 @@ fn main() {
             world.resource::<Fonts>().unwrap(),
             &mut Atlas::default(),
             world.resource::<ClearColor>().unwrap().0,
-            &whole,
+            1.0,
+            whole,
         );
         let mut ppm = format!("P6\n{width} {height}\n255\n").into_bytes();
         for p in &pixels {
@@ -119,6 +123,9 @@ fn main() {
         std::fs::write(path, ppm).expect("write");
         return;
     }
-    let stats = run(&mut app, WindowOptions { title: "static-ui widgets".into(), width: 1024, height: 640, ..WindowOptions::default() });
-    eprintln!("{stats:?}");
+    app.world.spawn_bundle(ui_window(Window::new("static-ui widgets").size(1024, 640).app_id("static-ui.widgets")));
+    match run(&mut app) {
+        Ok(stats) => eprintln!("{stats:?}"),
+        Err(e) => eprintln!("{e}"),
+    }
 }

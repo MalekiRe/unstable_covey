@@ -128,8 +128,7 @@ version = "0.1.0"
 dependencies = [
  "rustix",
  "static-ecs",
- "wayland-client",
- "wayland-protocols",
+ "static-window",
 ]
 
 [[package]]
@@ -396,6 +395,7 @@ dependencies = [
  "static-ecs",
  "static-ui-clay-oracle",
  "static-ui-layout",
+ "static-window",
 ]
 
 [[package]]
@@ -411,15 +411,14 @@ name = "static-ui-layout"
 version = "0.1.0"
 
 [[package]]
-name = "static-ui-wayland"
+name = "static-ui-raster"
 version = "0.1.0"
 dependencies = [
  "rustix",
  "static-ecs",
  "static-ui",
+ "static-window",
  "ttf-parser",
- "wayland-client",
- "wayland-protocols",
 ]
 
 [[package]]

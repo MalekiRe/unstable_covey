@@ -6,7 +6,9 @@ use static_ecs::prelude::*;
 use static_ecs::{Components, Inbox};
 use static_ui_layout::{PointerCapture, Rect as Box2, Vec2};
 
-use crate::input::{Input, Key, Modifiers, MouseButton};
+use static_window::{FocusChanged, Key, KeyInput, Modifiers, MouseButton, PointerButton, PointerLeft, PointerMoved};
+
+use crate::input::Input;
 use crate::{ChildOf, Clip, Inert, Scroll, UiLayout};
 
 /// Hover, press and focus, updated in place (it never moves the entity).
@@ -141,8 +143,34 @@ impl Plugin for InputPlugin {
     type Relations = (ChildOf,);
     type Storage = (Components<Interaction, true>,);
     fn systems<S: Storage>(self) -> impl Systems<S> {
-        // Any `Input` value names the label.
-        schedule(Input::PointerLeft, exclusive(|input: &Input, world: &mut World<S>| handle(world, input)))
+        (
+            schedule(label::<PointerMoved>(), exclusive(|e: &PointerMoved, world: &mut World<S>| handle(world, &Input::PointerMoved { x: e.x, y: e.y }))),
+            schedule(label::<PointerLeft>(), exclusive(|_: &PointerLeft, world: &mut World<S>| handle(world, &Input::PointerLeft))),
+            schedule(
+                label::<PointerButton>(),
+                exclusive(|e: &PointerButton, world: &mut World<S>| handle(world, &Input::Button { button: e.button, pressed: e.pressed })),
+            ),
+            schedule(
+                label::<static_window::Scroll>(),
+                exclusive(|e: &static_window::Scroll, world: &mut World<S>| handle(world, &Input::Scroll { dx: e.dx, dy: e.dy })),
+            ),
+            schedule(
+                label::<KeyInput>(),
+                exclusive(|e: &KeyInput, world: &mut World<S>| handle(world, &Input::Key { key: e.key, pressed: e.pressed, modifiers: e.modifiers })),
+            ),
+            schedule(
+                label::<static_window::TextInput>(),
+                exclusive(|e: &static_window::TextInput, world: &mut World<S>| e.text().chars().for_each(|ch| handle(world, &Input::Text(ch)))),
+            ),
+            schedule(
+                label::<FocusChanged>(),
+                exclusive(|e: &FocusChanged, world: &mut World<S>| {
+                    if !e.focused {
+                        handle(world, &Input::FocusLost);
+                    }
+                }),
+            ),
+        )
     }
 }
 
@@ -276,7 +304,7 @@ fn scroll_container<S: Storage>(world: &World<S>, from: Entity) -> Option<Entity
 }
 
 /// Handle one input event.
-pub fn handle<S: Storage>(world: &mut World<S>, input: &Input) {
+pub(crate) fn handle<S: Storage>(world: &mut World<S>, input: &Input) {
     if world.resource::<Pointer>().is_none() {
         world.init_resource::<Pointer>();
     }

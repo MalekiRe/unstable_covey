@@ -27,6 +27,9 @@ pub struct Window {
     /// window after [`CloseRequested`](crate::CloseRequested) is emitted;
     /// off, the app decides.
     pub close_on_request: bool,
+    /// On, the pointer passes through the window to whatever is below (an
+    /// overlay, a window measured while idle).
+    pub passthrough: bool,
 }
 impl Window {
     pub fn new(title: impl Into<String>) -> Self {
@@ -40,6 +43,7 @@ impl Window {
             resizable: true,
             decorated: true,
             close_on_request: true,
+            passthrough: false,
         }
     }
     pub fn size(mut self, width: u32, height: u32) -> Self {
@@ -69,6 +73,10 @@ impl Window {
     }
     pub fn close_on_request(mut self, close: bool) -> Self {
         self.close_on_request = close;
+        self
+    }
+    pub fn passthrough(mut self, passthrough: bool) -> Self {
+        self.passthrough = passthrough;
         self
     }
     /// The size limits to send: the fixed size when not resizable.

@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use static_ecs::prelude::*;
 use static_ui::transition::{BackgroundColor, Transition, Width, close_animated, open_animated, transitions};
 use static_ui::*;
+use static_window::Animating;
 
 fn frame<S: Storage, L>(app: &mut App<S, L>)
 where
@@ -26,10 +27,11 @@ fn color_transitions_ease_to_the_target_and_stop_requesting_frames() {
     let mut app = app!();
     app.world.insert_resource(UiClock::Manual(Instant::now()));
     let panel = app.world.spawn_ui(el((Node::row().width(Sizing::fixed(10.0)).height(Sizing::fixed(10.0)), Background(Color::BLACK))));
+    let window = app.world.spawn_bundle((UiWindow,));
     frame(&mut app);
     app.world.insert(panel, Transition::<BackgroundColor>::new(Color::BLACK, Color::rgb(200, 100, 0), Duration::from_millis(100), behave::linear));
     frame(&mut app); // starts at t = 0
-    assert!(app.world.resource::<Redraw>().unwrap().animating);
+    assert!(app.world.get::<Animating>(window).is_some());
     advance(&mut app, 50);
     frame(&mut app);
     assert_eq!(app.world.get::<Background>(panel).unwrap().0, Color::rgb(100, 50, 0));
@@ -38,7 +40,7 @@ fn color_transitions_ease_to_the_target_and_stop_requesting_frames() {
     assert_eq!(app.world.get::<Background>(panel).unwrap().0, Color::rgb(200, 100, 0), "the end value, exactly");
     frame(&mut app);
     assert!(app.world.get::<Transition<BackgroundColor>>(panel).is_none());
-    assert!(!app.world.resource::<Redraw>().unwrap().animating);
+    assert!(app.world.get::<Animating>(window).is_none());
 }
 
 #[test]

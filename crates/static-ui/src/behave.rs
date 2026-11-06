@@ -9,7 +9,9 @@ use std::time::{Duration, Instant};
 use static_ecs::prelude::*;
 use static_ecs::{Cx, Inbox};
 
-use crate::{ChildOf, Closed, Redraw, SpawnTree};
+use crate::input::UiWindow;
+use crate::{ChildOf, Closed, SpawnTree};
+use static_window::{Animating, WakeAt};
 
 /// The app's update: input is in, behaviors and app logic run; layout and
 /// rendering follow under `UiFrame`. Emit it before `UiFrame`.
@@ -123,7 +125,8 @@ pub fn ease_out(t: f32) -> f32 {
 }
 /// Call `step` once per frame for `duration` with eased progress; the
 /// progress never decreases and the last call sees exactly `1.0`. Frames
-/// keep coming while it runs ([`Redraw::animating`]), and stop after.
+/// keep coming while it runs (the [`UiWindow`] holds `Animating`), and stop
+/// after.
 /// `me` is the entity the behavior runs for.
 pub async fn animate<S: Storage>(cx: Cx<S>, me: Entity, duration: Duration, ease: Ease, mut step: impl FnMut(f32)) {
     let start = cx.on::<FrameTick>(me).await.now;
@@ -241,18 +244,20 @@ pub fn frame_start(clock: Option<Res<UiClock>>, mut timers: ResMut<Timers>, mut 
     });
     ticks.deliver_to_waiting(FrameTick { now });
 }
-/// `UiFrame`, last: keep frames coming while something animates, and wake
-/// for the earliest timer.
-pub fn frame_end(
+/// `UiFrame`, last: keep the UI window drawing while something animates,
+/// and wake the loop for the earliest timer.
+pub fn frame_end<S: Storage>(
     timers: Res<Timers>,
     ticks: Res<Inbox<FrameTick>>,
     transitions: Option<Res<crate::transition::ActiveTransitions>>,
-    mut redraw: ResMut<Redraw>,
+    wake: Option<ResMut<WakeAt>>,
+    mut windows: Query<(Entity, Has<Animating>), With<UiWindow>>,
+    mut commands: Commands<S>,
 ) {
     let animating = ticks.any_waiting() || transitions.is_some_and(|t| t.0 > 0);
-    let next = Redraw { animating, deadline: timers.next() };
-    if *redraw != next {
-        *redraw = next;
+    crate::input::set_animating(&mut windows, &mut commands, animating);
+    if let (Some(mut wake), Some(at)) = (wake, timers.next()) {
+        wake.request(at);
     }
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "static-ui-raster"
+version = "0.1.0"
+edition = "2024"
+description = "static-ui rastered on the CPU into a static-window framebuffer: damaged rectangles only, TrueType glyphs, any display scale"
+
+[dependencies]
+static-ecs = { path = "../static-ecs" }
+static-ui = { path = "../static-ui" }
+static-window = { path = "../static-window" }
+ttf-parser = { version = "0.25", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+rustix = { version = "1", features = ["time"] }

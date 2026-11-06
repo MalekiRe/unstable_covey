@@ -208,6 +208,26 @@ fn a_scale_change_reallocates_at_the_pixel_size() {
 }
 
 #[test]
+fn a_fixed_scale_framebuffer_keeps_its_pixels_and_the_viewport_stretches_them() {
+    let (compositor, socket) = Compositor::spawn(Globals::default());
+    let mut lp = WindowLoop::from_socket(socket).unwrap();
+    let mut app = test_app!();
+    app.world.spawn_bundle((Window::new("fixed").size(64, 32), Framebuffer::at_scale(Scale::ONE)));
+    lp.step(&mut app, NOW);
+    compositor.with(|s, _| {
+        s.configure(0, 0, 0, &[]);
+        s.preferred_scale(0, 240);
+    });
+    lp.step(&mut app, NOW);
+    compositor.with(|s, _| {
+        let surface = s.surface_of(0);
+        let buffer = surface.buffer.unwrap();
+        assert_eq!((s.buffers[buffer].width, s.buffers[buffer].height), (64, 32), "drawn at its own scale");
+        assert_eq!(surface.viewport_destination, Some((64, 32)));
+    });
+}
+
+#[test]
 fn an_unchanged_framebuffer_commits_nothing() {
     let (compositor, mut lp, mut app, _) = mapped!(Globals::default());
     let commits = compositor.with(|s, _| s.surface_of(0).commits.len());

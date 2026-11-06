@@ -1,6 +1,7 @@
 //! Flappy bird as a plugin: physics, pipes, scoring, and a CPU rasterizer
-//! drawing into whatever pixel buffer the window hands it.
+//! drawing into the window's framebuffer.
 use static_ecs::prelude::*;
+use static_window::{Framebuffer, Redraw};
 
 pub const WIDTH: usize = 432;
 pub const HEIGHT: usize = 768;
@@ -19,9 +20,6 @@ pub struct Tick(pub f32);
 impl Schedule for Tick {
     type In = Ref<Self>;
 }
-/// Rasterize the current state into the canvas.
-pub struct Draw;
-impl Schedule for Draw {}
 
 pub struct Bird;
 pub struct Pipe {
@@ -47,41 +45,9 @@ pub struct Game {
     rng: u64,
 }
 
-/// The window's pixel buffer (XRGB8888) for the frame being drawn.
-pub struct Canvas {
-    pixels: *mut u32,
-    width: usize,
-    height: usize,
-}
-// SAFETY: the pointer is the mapped buffer the window points it at before
-// every `Draw`; only the render system touches it, while the window waits.
-unsafe impl Send for Canvas {}
-unsafe impl Sync for Canvas {}
-impl Canvas {
-    pub fn new() -> Self {
-        Self {
-            pixels: std::ptr::null_mut(),
-            width: 0,
-            height: 0,
-        }
-    }
-    /// # Safety
-    /// `pixels` holds `width * height` writable pixels until the next call.
-    pub unsafe fn target(&mut self, pixels: *mut u32, width: usize, height: usize) {
-        (self.pixels, self.width, self.height) = (pixels, width, height);
-    }
-    fn pixels(&mut self) -> &mut [u32] {
-        if self.pixels.is_null() {
-            return &mut [];
-        }
-        // SAFETY: `target`'s contract.
-        unsafe { std::slice::from_raw_parts_mut(self.pixels, self.width * self.height) }
-    }
-}
-
 pub struct Flappy;
 impl Plugin for Flappy {
-    type Components = (Bird, Pipe, Pos, Vel, Gap, Game, Canvas);
+    type Components = (Bird, Pipe, Pos, Vel, Gap, Game, Framebuffer);
     fn systems<S: Storage>(self) -> impl Systems<S> {
         (
             schedule(
@@ -94,27 +60,30 @@ impl Plugin for Flappy {
                     cull::<S>,
                     score,
                     collide,
+                    repaint,
                 )
                     .chain(),
             ),
-            schedule(Draw, render),
+            schedule(label::<Redraw>(), render),
         )
     }
 }
 
-/// The world's starting entities: the bird, the game, and its canvas.
+/// Everything moves: the whole frame is drawn each tick.
+fn repaint(_: &Tick, mut windows: Query<&mut Framebuffer>) {
+    windows.each(|mut fb| fb.request_all());
+}
+
+/// The world's starting entities: the bird and the game.
 pub fn spawn<S: Storage>(world: &mut World<S>, seed: u64) {
     world.spawn_bundle((Bird, Pos(BIRD_X, GROUND * 0.45), Vel(0.0, 0.0)));
-    world.spawn_bundle((
-        Game {
-            state: State::Ready,
-            score: 0,
-            best: 0,
-            flap: false,
-            rng: seed | 1,
-        },
-        Canvas::new(),
-    ));
+    world.spawn_bundle((Game {
+        state: State::Ready,
+        score: 0,
+        best: 0,
+        flap: false,
+        rng: seed | 1,
+    },));
 }
 
 fn flap<S: Storage>(
@@ -251,16 +220,20 @@ const BLACK: u32 = 0x202020;
 const RED: u32 = 0xd23c3c;
 
 fn render(
-    mut canvas: Single<&mut Canvas>,
+    redraw: &Redraw,
+    mut windows: Query<&mut Framebuffer>,
     game: Single<&Game>,
     bird: Single<&Pos, With<Bird>>,
     mut pipes: Query<(&Pos, &Gap), With<Pipe>>,
 ) {
-    let (w, h) = (canvas.width, canvas.height);
-    let px = canvas.pixels();
-    if px.is_empty() {
-        return;
-    }
+    let Some(mut fb) = windows.get_mut(redraw.window) else { return };
+    let Some(target) = fb.target() else { return };
+    let (w, h) = (target.width as usize, target.height as usize);
+    draw(target.pixels, w, h, &game, &bird, pipes.iter_mut());
+}
+
+/// The whole scene into `w * h` pixels.
+fn draw<'a>(px: &mut [u32], w: usize, h: usize, game: &Game, bird: &Pos, pipes: impl Iterator<Item = (&'a Pos, &'a Gap)>) {
     let mut paint = Painter { px, w, h };
     // Sky: one gradient color per row.
     let ground = GROUND as usize;
@@ -268,7 +241,7 @@ fn render(
         let color = lerp(SKY_TOP, SKY_BOTTOM, y as f32 / ground as f32);
         paint.px[y * w..(y + 1) * w].fill(color);
     }
-    for (pos, gap) in pipes.iter_mut() {
+    for (pos, gap) in pipes {
         let x = pos.0 as i32;
         let top = (gap.0 - PIPE_GAP / 2.0) as i32;
         let bottom = (gap.0 + PIPE_GAP / 2.0) as i32;
@@ -440,16 +413,9 @@ mod tests {
 
     #[test]
     fn drawing_paints_sky_ground_and_bird() {
-        let mut app = App::new().add_plugins(Flappy).build();
-        spawn(&mut app.world, 7);
         let mut pixels = vec![0u32; WIDTH * HEIGHT];
-        unsafe {
-            app.world
-                .single::<&mut Canvas>()
-                .unwrap()
-                .target(pixels.as_mut_ptr(), WIDTH, HEIGHT)
-        };
-        app.emit(&Draw);
+        let game = Game { state: State::Ready, score: 0, best: 0, flap: false, rng: 7 };
+        draw(&mut pixels, WIDTH, HEIGHT, &game, &Pos(BIRD_X, GROUND * 0.45), std::iter::empty());
         let at = |x: usize, y: usize| pixels[y * WIDTH + x];
         assert_eq!(at(WIDTH - 1, 0), SKY_TOP);
         assert_eq!(at(0, HEIGHT - 1), DIRT);

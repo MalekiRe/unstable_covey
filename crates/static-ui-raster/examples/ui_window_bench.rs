@@ -1,4 +1,4 @@
-//! Window measurements for UI_BENCHMARKS.md (needs a Wayland compositor):
+#![recursion_limit = "512"]
 //!
 //! - `--launch N`: spawn this example N times; each reports when its first
 //!   frame was committed, in ms after the spawn (CLOCK_MONOTONIC).
@@ -7,20 +7,30 @@
 //! - `--latency SECONDS`: a thread wakes a behavior every 100 ms, which
 //!   recolors a button; report wakeup-to-scanout times (`wp_presentation`).
 //!
-//! cargo run --release -p static-ui-wayland --example ui_window_bench -- --idle 60
+//! cargo run --release -p static-ui-raster --example ui_window_bench -- --idle 60
 use std::sync::{Arc, Mutex};
 use std::task::{Poll, Waker};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use static_ecs::prelude::*;
 use static_ecs::{Behavior, Cx, behavior};
 use static_ui::widgets::*;
 use static_ui::*;
-use static_ui_wayland::{Fonts, WindowOptions, run};
+use static_ui_raster::{Fonts, RasterPlugin, UiLabels, ui_frame, ui_window};
+use static_window::{Flow, Window, WindowLoop, WindowPlugin, WindowWorld};
 
 fn now_ns() -> u64 {
     let t = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     t.tv_sec as u64 * 1_000_000_000 + t.tv_nsec as u64
+}
+/// Step the window loop (with the UI's frames) until `until`, or until it
+/// ends.
+fn run_until<S: WindowWorld, L: UiLabels<S>>(window_loop: &mut WindowLoop, app: &mut App<S, L>, until: Instant) {
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        if window_loop.step_with(app, Some(left), ui_frame) != Flow::Continue {
+            break;
+        }
+    }
 }
 /// (CPU seconds, voluntary context switches, peak RSS KiB) of this process.
 fn usage() -> (f64, u64, u64) {
@@ -78,7 +88,7 @@ fn main() {
     }
 
     let mut app = App::new()
-        .add_plugins((UiPlugin::<Fonts>::default(), InputPlugin, widgets::<Fonts>(), behavior::<Pulsing, _>(UiUpdate)))
+        .add_plugins((WindowPlugin, UiPlugin::<Fonts>::default(), InputPlugin, widgets::<Fonts>(), behavior::<Pulsing, _>(UiUpdate), RasterPlugin))
         .register::<PulseSlot>()
         .build();
     let world = &mut app.world;
@@ -96,10 +106,14 @@ fn main() {
         el((Node::row().width(Sizing::GROW).height(Sizing::fixed(24.0)).padding(Padding::xy(8, 4)),)).children((el((Text::new("row", 14),)),))
     });
 
+    let mut window_loop = WindowLoop::connect().expect("a Wayland compositor");
     if args.iter().any(|a| a == "--first-frame") {
-        let launched_ns = std::env::var("UI_T0_NS").ok().and_then(|t| t.parse().ok());
-        let stats = run(&mut app, WindowOptions { max_frames: Some(1), launched_ns, ..WindowOptions::default() });
-        println!("{:.3}", stats.first_commit_ns as f64 / 1e6);
+        app.world.spawn_bundle(ui_window(Window::new("ui_window_bench").size(800, 600)));
+        if let Some(t0) = std::env::var("UI_T0_NS").ok().and_then(|t| t.parse().ok()) {
+            window_loop.launched_at(t0);
+        }
+        while window_loop.stats().first_commit_ns == 0 && window_loop.step_with(&mut app, None, ui_frame) == Flow::Continue {}
+        println!("{:.3}", window_loop.stats().first_commit_ns as f64 / 1e6);
         return;
     }
     if let Some(seconds) = arg("--latency") {
@@ -119,7 +133,10 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
-        let stats = run(&mut app, WindowOptions { run_for: Some(Duration::from_secs_f64(seconds)), ..WindowOptions::default() });
+        app.world.spawn_bundle(ui_window(Window::new("ui_window_bench").size(800, 600)));
+        window_loop.record_latency(true);
+        run_until(&mut window_loop, &mut app, Instant::now() + Duration::from_secs_f64(seconds));
+        let stats = window_loop.stats().clone();
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         pacer.join().unwrap();
         let mut ms: Vec<f64> = stats.input_to_present_ns.iter().map(|&n| n as f64 / 1e6).collect();
@@ -130,14 +147,13 @@ fn main() {
             let mut ours: Vec<f64> = stats.input_to_commit_ns.iter().map(|&n| n as f64 / 1e6).collect();
             ours.sort_by(f64::total_cmp);
             println!(
-                "wakeup to scanout over {} frames: median {:.2} ms, p90 {:.2} ms, min {:.2} ms; wakeup to commit sent: median {:.3} ms, max {:.3} ms; {} pixels rastered per frame on average",
+                "wakeup to scanout over {} frames: median {:.2} ms, p90 {:.2} ms, min {:.2} ms; wakeup to commit sent: median {:.3} ms, max {:.3} ms",
                 ms.len(),
                 ms[ms.len() / 2],
                 ms[ms.len() * 9 / 10],
                 ms[0],
                 ours[ours.len() / 2],
-                ours[ours.len() - 1],
-                stats.pixels / stats.commits.max(1)
+                ours[ours.len() - 1]
             );
         }
         return;
@@ -149,17 +165,21 @@ fn main() {
         usage()
     });
     // Input-transparent: a pointer crossing the window must not count.
-    let stats = run(&mut app, WindowOptions { run_for: Some(Duration::from_secs_f64(seconds)), input: false, ..WindowOptions::default() });
+    app.world.spawn_bundle(ui_window(Window::new("ui_window_bench").size(800, 600).passthrough(true)));
+    let start = Instant::now();
+    run_until(&mut window_loop, &mut app, start + Duration::from_secs(1));
+    let first = (window_loop.stats.wakeups, window_loop.stats.commits);
+    run_until(&mut window_loop, &mut app, start + Duration::from_secs_f64(seconds));
     let (cpu0, switches0, _) = settled.join().unwrap();
     let (cpu1, switches1, rss) = usage();
-    let after = |times: &[Duration]| times.iter().filter(|&&t| t >= Duration::from_secs(1)).count();
+    let stats = &window_loop.stats;
     println!(
         "{} wakeups and {} commits in the first second; in the next {:.0} s: {} wakeups, {} commits, {:.3} s CPU, {} voluntary context switches (1 is the sampling thread's); peak RSS {:.1} MiB",
-        stats.wakeups - after(&stats.wakeups_at) as u64,
-        stats.commits - after(&stats.commits_at) as u64,
+        first.0,
+        first.1,
         seconds - 1.0,
-        after(&stats.wakeups_at),
-        after(&stats.commits_at),
+        stats.wakeups - first.0,
+        stats.commits - first.1,
         cpu1 - cpu0,
         switches1 - switches0,
         rss as f64 / 1024.0

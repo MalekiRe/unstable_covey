@@ -2,8 +2,8 @@
 use static_ecs::prelude::*;
 use static_ui::layout::Rect;
 use static_ui::*;
-use static_ui_wayland::glyph::{Point, Rasterizer};
-use static_ui_wayland::{Atlas, Canvas, Fonts, paint};
+use static_ui_raster::glyph::{Point, Rasterizer};
+use static_ui_raster::{Atlas, Canvas, Fonts, paint};
 
 const ITEM: Node = Node::row().width(Sizing::GROW).height(Sizing::fixed(50.0)).padding(Padding::xy(16, 0));
 
@@ -30,7 +30,8 @@ fn restyling_one_button_rasters_only_its_box() {
             world.resource::<Fonts>().unwrap(),
             &mut atlas,
             Color::WHITE,
-            &damage,
+            1.0,
+            damage.iter().copied(),
         );
         (damage, painted)
     };
@@ -111,4 +112,29 @@ fn layout_measures_text_with_the_advances_drawing_uses() {
     let drawn: f32 = "Hello".chars().map(|c| fonts.advance(0, 20, c) + 1.0).sum();
     assert_eq!(measured, drawn);
     assert!(measured > 40.0 && measured < 70.0, "{measured}");
+}
+
+#[test]
+fn painting_at_a_scale_covers_the_logical_box_in_device_pixels() {
+    let mut app = App::new().add_plugins(UiPlugin::<Fonts>::default()).build();
+    app.world.spawn_ui(el((Node::row().width(Sizing::fixed(10.0)).height(Sizing::fixed(5.0)), Background(Color::rgb(255, 0, 0)))));
+    app.world.insert_resource(Viewport { width: 40.0, height: 20.0 });
+    app.emit(&UiFrame);
+    let (width, height) = (80usize, 40usize);
+    let mut pixels = vec![0u32; width * height];
+    let mut canvas = Canvas { pixels: &mut pixels, width, height, stride: width, touched: 0 };
+    let world = &app.world;
+    paint(
+        &mut canvas,
+        world.resource::<RenderList>().unwrap(),
+        world.resource::<UiLayout>().unwrap(),
+        world.resource::<Fonts>().unwrap(),
+        &mut Atlas::default(),
+        Color::WHITE,
+        2.0,
+        [Rect::new(0.0, 0.0, width as f32, height as f32)],
+    );
+    let red = |x: usize, y: usize| pixels[y * width + x] & 0xFF_FFFF == 0xFF_0000;
+    assert!(red(0, 0) && red(19, 9), "10×5 logical units: 20×10 pixels");
+    assert!(!red(20, 0) && !red(0, 10));
 }

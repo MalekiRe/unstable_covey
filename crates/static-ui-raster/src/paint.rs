@@ -2,7 +2,7 @@
 //! each damaged area is cleared and every command that reaches it is drawn
 //! again in paint order, clipped to it.
 use static_ui::layout::Rect;
-use static_ui::{Color, Draw, RenderList, UiLayout};
+use static_ui::{BorderWidth, Color, Draw, Radius, RenderList, UiLayout};
 
 use crate::canvas::Canvas;
 use crate::font::{Atlas, Fonts};
@@ -16,7 +16,9 @@ pub struct Painted {
     pub pixels: u64,
 }
 
-/// Redraw `damage` (window coordinates) from `list`.
+/// Redraw `damage` (buffer pixels) from `list`, whose coordinates are
+/// logical: `scale` pixels per unit (1 on an unscaled display, 1.5 at 150%).
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     canvas: &mut Canvas,
     list: &RenderList,
@@ -24,11 +26,14 @@ pub fn paint(
     fonts: &Fonts,
     atlas: &mut Atlas,
     clear: Color,
-    damage: &[Rect],
+    scale: f32,
+    damage: impl IntoIterator<Item = Rect>,
 ) -> Painted {
+    let s = scale;
+    let px = |r: Rect| Rect::new(r.x * s, r.y * s, r.width * s, r.height * s);
     let before = canvas.touched;
     let mut painted = Painted::default();
-    for &area in damage {
+    for area in damage {
         // Whole pixels: partially covered edge pixels are redrawn whole.
         let span = canvas.span(area, area);
         let area = Rect::new(span.x0 as f32, span.y0 as f32, (span.x1 - span.x0) as f32, (span.y1 - span.y0) as f32);
@@ -37,26 +42,28 @@ pub fn paint(
         }
         canvas.clear(span, clear);
         for command in list.commands() {
-            let clip = command.clip.intersect(area);
-            if command.rect.intersect(clip).is_empty() {
+            let (rect, clip) = (px(command.rect), px(command.clip).intersect(area));
+            if rect.intersect(clip).is_empty() {
                 continue;
             }
             painted.commands += 1;
             match command.draw {
-                Draw::Rect { color, radius } => canvas.fill(command.rect, color, &radius, clip),
-                Draw::Border { color, width, radius } => canvas.border(command.rect, &width, color, &radius, clip),
-                Draw::Overlay { color } => canvas.fill(command.rect, color, &Default::default(), clip),
+                Draw::Rect { color, radius } => canvas.fill(rect, color, &scaled_radius(&radius, s), clip),
+                Draw::Border { color, width, radius } => canvas.border(rect, &scaled_width(&width, s), color, &scaled_radius(&radius, s), clip),
+                Draw::Overlay { color } => canvas.fill(rect, color, &Default::default(), clip),
                 Draw::Text { line, color, config } => {
                     let text = ui.tree().text_of(command.element);
                     let text = &text[line.start as usize..(line.start + line.len) as usize];
-                    let ascent = fonts.ascent(config.font, config.size);
-                    let natural = fonts.line_height(config.font, config.size);
-                    let baseline = (command.rect.y + (command.rect.height - natural) / 2.0 + ascent).round() as i32;
-                    let mut pen = command.rect.x;
+                    // Glyphs rastered at the pixel size, not scaled up.
+                    let size = (config.size as f32 * s).round() as u16;
+                    let ascent = fonts.ascent(config.font, size);
+                    let natural = fonts.line_height(config.font, size);
+                    let baseline = (rect.y + (rect.height - natural) / 2.0 + ascent).round() as i32;
+                    let mut pen = rect.x;
                     for ch in text.chars() {
-                        let advance = fonts.advance(config.font, config.size, ch);
+                        let advance = fonts.advance(config.font, size, ch);
                         let x = pen.floor();
-                        let (glyph, coverage) = atlas.glyph(fonts, config.font, config.size, ch, pen - x);
+                        let (glyph, coverage) = atlas.glyph(fonts, config.font, size, ch, pen - x);
                         if glyph.width > 0 {
                             canvas.glyph(
                                 coverage,
@@ -68,7 +75,7 @@ pub fn paint(
                                 clip,
                             );
                         }
-                        pen += advance + config.letter_spacing as f32;
+                        pen += advance + config.letter_spacing as f32 * s;
                     }
                 }
             }
@@ -76,4 +83,12 @@ pub fn paint(
     }
     painted.pixels = canvas.touched - before;
     painted
+}
+
+fn scaled_radius(r: &Radius, s: f32) -> Radius {
+    Radius { top_left: r.top_left * s, top_right: r.top_right * s, bottom_left: r.bottom_left * s, bottom_right: r.bottom_right * s }
+}
+fn scaled_width(w: &BorderWidth, s: f32) -> BorderWidth {
+    let px = |v: u16| (v as f32 * s).round() as u16;
+    BorderWidth { left: px(w.left), right: px(w.right), top: px(w.top), bottom: px(w.bottom), between: px(w.between) }
 }

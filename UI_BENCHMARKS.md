@@ -4,7 +4,10 @@ static-ui (static-ecs, Clay layout, CPU raster on Wayland) measured against
 the budgets of [UI_PLAN.md](UI_PLAN.md), against clay.h, and against the same
 UI in Bevy UI 0.19.1. Ryzen 9 5900X, Arch Linux, COSMIC (cosmic-comp) at
 120 Hz; release builds (`lto = "thin"`, `codegen-units = 1`); timings are
-medians, headless ones pinned to one core (`taskset -c 2`).
+medians, headless ones pinned to one core (`taskset -c 2`). The window
+numbers (startup, idle, latency) were taken with the window loop phase 3
+built, since replaced by `crates/static-window`; current ones are in
+[WINDOW_BENCHMARKS.md](WINDOW_BENCHMARKS.md).
 
 ## Summary
 
@@ -47,7 +50,7 @@ them.
 
 ## Layout in the ECS (settings list, real fonts)
 
-`examples/ui_bench.rs` (static-ui-wayland): a scrolling panel of rows, five
+`examples/ui_bench.rs` (static-ui-raster): a scrolling panel of rows, five
 elements per row, text measured with the bundled Liberation Sans.
 
 | elements | flatten + layout frame | relayout frame (one width changed) | layout system | Clay passes | unchanged frame |
@@ -115,7 +118,7 @@ first commit.
 
 ## Window
 
-`examples/ui_window_bench.rs` (static-ui-wayland), a window with a button,
+`examples/ui_window_bench.rs` (static-ui-raster), a window with a button,
 checkbox, slider, text field, dropdown and a 10,000-row virtual list:
 
 - **Startup**: first frame committed 3.23 ms after spawn (median of 20; min
@@ -141,7 +144,7 @@ font:
 | | unstripped | stripped |
 |---|---:|---:|
 | dynamic | 3.2 MiB | 1.93 MiB |
-| static (`+crt-static`) | 4.1 MiB | 2.76 MiB |
+| static (`+crt-static`, before static-window loaded libwayland with `dlopen`) | 4.1 MiB | 2.76 MiB |
 
 ## Fonts: our rasterizer or fontdue
 
@@ -162,9 +165,9 @@ Coverage differs by at most 39/255 at a few edge pixels (total ink within
 ```sh
 cargo test -p static-ui-clay-oracle --release                     # 100,000 trees
 cargo run --release -p static-ui-clay-oracle --example bench      # vs clay.h
-cargo run --release -p static-ui-wayland --example ui_bench       # headless
-cargo run --release -p static-ui-wayland --example ui_window_bench -- --launch 20
-cargo run --release -p static-ui-wayland --example ui_window_bench -- --idle 60
-cargo run --release -p static-ui-wayland --example ui_window_bench -- --latency 10
-cd crates/static-ui-wayland/bench/bevy_ui && cargo run --release -- --layout 10000
+cargo run --release -p static-ui-raster --example ui_bench       # headless
+cargo run --release -p static-ui-raster --example ui_window_bench -- --launch 20
+cargo run --release -p static-ui-raster --example ui_window_bench -- --idle 60
+cargo run --release -p static-ui-raster --example ui_window_bench -- --latency 10
+cd crates/static-ui-raster/bench/bevy_ui && cargo run --release -- --layout 10000
 ```

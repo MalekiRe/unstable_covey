@@ -433,6 +433,7 @@ impl Dispatch<WlBuffer, ()> for State {
 }
 
 delegate_noop!(State: WlCompositor);
+delegate_noop!(State: wayland_client::protocol::wl_region::WlRegion);
 delegate_noop!(State: ignore WlShm);
 delegate_noop!(State: WlShmPool);
 delegate_noop!(State: WpViewporter);

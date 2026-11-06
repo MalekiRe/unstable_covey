@@ -349,7 +349,7 @@ fn init<S: Storage, M: Measure>(world: &mut World<S>) {
     if world.resource::<crate::ClearColor>().is_none() {
         world.init_resource::<crate::ClearColor>();
     }
-    world.init_resource::<crate::Redraw>();
+    world.init_resource::<static_window::WakeAt>();
     world.init_resource::<crate::Timers>();
     world.init_resource::<static_ecs::Inbox<crate::FrameTick>>();
     world.init_resource::<crate::transition::ActiveTransitions>();
@@ -379,11 +379,12 @@ pub(crate) fn systems<S: Storage, M: Measure>() -> impl Systems<S> {
         ),
         schedule(crate::UiUpdate, exclusive(init::<S, M>)),
         schedule(UiFrame, exclusive(init::<S, M>)),
+        schedule(crate::UiUpdate, crate::input::follow_window),
         schedule(crate::UiUpdate, crate::behave::frame_start),
         schedule(crate::UiUpdate, crate::transition::reset_active),
         schedule(crate::UiUpdate, crate::render::debug_timings_system::<S>),
         schedule(UiFrame, layout_system::<M>),
         schedule(UiFrame, crate::render_system),
-        schedule(UiFrame, crate::behave::frame_end),
+        schedule(UiFrame, crate::behave::frame_end::<S>),
     )
 }

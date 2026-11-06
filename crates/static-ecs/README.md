@@ -307,7 +307,9 @@ assert!(world.remove::<Active>(entity).is_some());
 assert!(world.despawn(entity));
 ```
 
-Entities are generational handles; tables hold dense columns. Tuple bundles of
+Entities are generational handles; tables hold dense columns.
+`Entity::PLACEHOLDER` belongs to no world, for a field that needs an entity
+where none applies (a synthetic event in a test). Tuple bundles of
 1–16 components need no declaration. Components and resources must be
 `Send + Sync`, since parallel branches run on worker threads; storing an `Rc`
 does not compile.

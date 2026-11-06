@@ -27,9 +27,13 @@ target API; where the implementation differs, this list says how:
 
 - **Crates**: `crates/static-ui-layout` (Clay port), `crates/static-ui`
   (components, flattening, input, behaviors helpers, widgets, transitions,
-  debug overlay), `crates/static-ui-wayland` (fonts, CPU raster, window
-  loop), `crates/static-ui-clay-oracle` (clay.h differential test, layout
-  benchmark). The ECS work (phase 0) is in `crates/static-ecs`.
+  debug overlay), `crates/static-ui-raster` (fonts, CPU raster into a
+  framebuffer), `crates/static-ui-clay-oracle` (clay.h differential test,
+  layout benchmark). The ECS work (phase 0) is in `crates/static-ecs`. The
+  window, its loop and its input are `crates/static-window`
+  ([WINDOW_PLAN.md](WINDOW_PLAN.md)), which replaced the window loop phase 3
+  built: static-ui takes its input events as static-window's labels and
+  fills the window marked `UiWindow`.
 - **Phase 0.1**: worlds reject non-`Send + Sync` components at compile time
   (`Storage: Send + Sync` kept; the markers carry `T`'s auto traits).
 - **Behaviors** (0.4, 5): `impl Behavior for Slider { async fn start<S:

@@ -5,6 +5,10 @@ use std::time::{Duration, Instant};
 use static_ecs::prelude::*;
 use static_ui::widgets::*;
 use static_ui::*;
+use static_window::{Key, Modifiers, MouseButton};
+
+mod support;
+use support::{Input, send};
 
 macro_rules! app {
     () => {
@@ -26,9 +30,9 @@ fn center<S: Storage>(world: &World<S>, entity: Entity) -> (f32, f32) {
 }
 macro_rules! click_at {
     ($app:expr, $x:expr, $y:expr) => {{
-        $app.emit(&Input::PointerMoved { x: $x, y: $y });
-        $app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-        $app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+        send(&mut $app, Input::PointerMoved { x: $x, y: $y });
+        send(&mut $app, Input::Button { button: MouseButton::Left, pressed: true });
+        send(&mut $app, Input::Button { button: MouseButton::Left, pressed: false });
         frame(&mut $app);
     }};
 }
@@ -52,21 +56,21 @@ fn buttons_restyle_on_hover_and_press_and_count_activations() {
     frame(&mut app);
     let (x, y) = center(&app.world, b);
     let color = |app: &App<_, _>| app.world.get::<Background>(b).unwrap().0;
-    app.emit(&Input::PointerMoved { x, y });
+    send(&mut app, Input::PointerMoved { x, y });
     frame(&mut app);
     assert_eq!(color(&app), theme::BUTTON_HOVER);
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
     frame(&mut app);
     assert_eq!(color(&app), theme::BUTTON_PRESSED);
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     frame(&mut app);
     assert_eq!(color(&app), theme::BUTTON_HOVER);
     assert_eq!(app.world.get::<Clicks>(b).unwrap().0, 1);
     // Focused (the click focused it), Enter activates too.
-    app.emit(&key(Key::Enter));
+    send(&mut app, key(Key::Enter));
     frame(&mut app);
     assert_eq!(app.world.get::<Clicks>(b).unwrap().0, 2);
-    app.emit(&Input::PointerMoved { x: 500.0, y: 500.0 });
+    send(&mut app, Input::PointerMoved { x: 500.0, y: 500.0 });
     frame(&mut app);
     assert_eq!(color(&app), theme::BUTTON);
 }
@@ -101,12 +105,12 @@ fn sliders_follow_clicks_and_drags_within_range() {
     click_at!(app, rect.x + THUMB / 2.0 + travel / 2.0, rect.y + 10.0);
     assert_eq!(value(&app), 50.0);
     // Drag from there to a quarter, then past the end.
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: true });
-    app.emit(&Input::PointerMoved { x: rect.x + THUMB / 2.0 + travel / 4.0, y: rect.y + 10.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: true });
+    send(&mut app, Input::PointerMoved { x: rect.x + THUMB / 2.0 + travel / 4.0, y: rect.y + 10.0 });
     frame(&mut app);
     assert_eq!(value(&app), 25.0);
-    app.emit(&Input::PointerMoved { x: rect.x + 1000.0, y: rect.y + 10.0 });
-    app.emit(&Input::Button { button: MouseButton::Left, pressed: false });
+    send(&mut app, Input::PointerMoved { x: rect.x + 1000.0, y: rect.y + 10.0 });
+    send(&mut app, Input::Button { button: MouseButton::Left, pressed: false });
     frame(&mut app);
     assert_eq!(value(&app), 100.0);
     // The filled part spans the travel.
@@ -154,18 +158,18 @@ fn text_fields_edit_with_cursor_and_selection() {
     frame(&mut app);
     assert!(visible(&app.world, caret));
     for ch in "hello".chars() {
-        app.emit(&Input::Text(ch));
+        send(&mut app, Input::Text(ch));
     }
     frame(&mut app);
     assert_eq!(app.world.get::<TextValue>(field).unwrap().0, "hello");
-    app.emit(&key(Key::Left));
-    app.emit(&key(Key::Backspace));
+    send(&mut app, key(Key::Left));
+    send(&mut app, key(Key::Backspace));
     frame(&mut app);
     assert_eq!(app.world.get::<TextValue>(field).unwrap().0, "helo");
     assert_eq!(app.world.get::<Cursor>(field), Some(&Cursor { position: 3, anchor: 3 }));
     // Shift+Home selects to the start; typing replaces the selection.
-    app.emit(&Input::Key { key: Key::Home, pressed: true, modifiers: Modifiers { shift: true, ..Modifiers::default() } });
-    app.emit(&Input::Text('J'));
+    send(&mut app, Input::Key { key: Key::Home, pressed: true, modifiers: Modifiers { shift: true, ..Modifiers::default() } });
+    send(&mut app, Input::Text('J'));
     frame(&mut app);
     frame(&mut app);
     assert_eq!(app.world.get::<TextValue>(field).unwrap().0, "Jo");
@@ -193,15 +197,15 @@ fn virtual_lists_recycle_a_pool_of_rows_while_scrolling() {
     let rows = || app.world.sources::<ChildOf>(list).skip(1).take(6).collect::<Vec<_>>();
     let rows: Vec<Entity> = rows();
     assert_eq!(rows.len(), 6, "a 100-pixel view of 20-pixel rows pools 6");
-    app.emit(&Input::PointerMoved { x: 50.0, y: 50.0 });
-    app.emit(&Input::Scroll { dx: 0.0, dy: 410.0 });
+    send(&mut app, Input::PointerMoved { x: 50.0, y: 50.0 });
+    send(&mut app, Input::Scroll { dx: 0.0, dy: 410.0 });
     frame(&mut app);
     frame(&mut app);
     let indices: Vec<usize> = rows.iter().map(|&r| app.world.get::<RowIndex>(r).unwrap().0).collect();
     assert_eq!(indices, [20, 21, 22, 23, 24, 25]);
     // Row 20 is drawn at its place in the 20,000-pixel content: 400 - 410.
     assert_eq!(app.world.get::<static_ui::Rect>(rows[0]).unwrap().0.y, -10.0);
-    app.emit(&Input::Scroll { dx: 0.0, dy: 1e9 });
+    send(&mut app, Input::Scroll { dx: 0.0, dy: 1e9 });
     frame(&mut app);
     frame(&mut app);
     assert_eq!(app.world.get::<RowIndex>(rows[5]).unwrap().0, 999);
@@ -245,7 +249,7 @@ fn tooltips_appear_after_a_rest_and_go_with_the_pointer() {
     let target = app.world.spawn_ui(el((Node::row().width(Sizing::fixed(80.0)).height(Sizing::fixed(30.0)), Tooltip("Saves the file".into()))));
     frame(&mut app);
     let tips = |app: &mut App<_, _>| app.world.query_filtered::<Entity, With<widgets::TooltipBox>>().iter_mut().count();
-    app.emit(&Input::PointerMoved { x: 10.0, y: 10.0 });
+    send(&mut app, Input::PointerMoved { x: 10.0, y: 10.0 });
     frame(&mut app);
     app.world.resource_mut::<UiClock>().unwrap().advance(Duration::from_millis(200));
     frame(&mut app);
@@ -259,7 +263,7 @@ fn tooltips_appear_after_a_rest_and_go_with_the_pointer() {
     let (target_rect, tip_rect) = (app.world.get::<static_ui::Rect>(target).unwrap().0, app.world.get::<static_ui::Rect>(tip).unwrap().0);
     assert_eq!(tip_rect.y, target_rect.y + target_rect.height + 6.0);
     assert_eq!(tip_rect.x + tip_rect.width / 2.0, target_rect.x + target_rect.width / 2.0);
-    app.emit(&Input::PointerMoved { x: 500.0, y: 500.0 });
+    send(&mut app, Input::PointerMoved { x: 500.0, y: 500.0 });
     frame(&mut app);
     assert_eq!(tips(&mut app), 0);
 }
@@ -294,7 +298,7 @@ fn modals_close_on_backdrop_clicks_and_escape_but_not_inside() {
     frame(&mut app);
     app.world.enable_subtree::<Closed, ChildOf>(modal);
     frame(&mut app);
-    app.emit(&key(Key::Escape));
+    send(&mut app, key(Key::Escape));
     frame(&mut app);
     assert!(!visible(&app.world, modal));
 }

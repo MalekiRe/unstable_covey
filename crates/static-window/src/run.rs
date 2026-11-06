@@ -332,8 +332,14 @@ impl WindowLoop {
     }
 
     /// Run until no windows remain or the compositor goes away.
-    pub fn run<S: WindowWorld, L: WindowLabels<S>>(mut self, app: &mut App<S, L>) -> Stats {
-        while self.step(app, None) == Flow::Continue {}
+    pub fn run<S: WindowWorld, L: WindowLabels<S>>(self, app: &mut App<S, L>) -> Stats {
+        self.run_with(app, |_| {})
+    }
+    /// [`run`](Self::run), calling `frame` after each [`Step`]: where a
+    /// layer on top emits its own labels (a UI's update and layout) before
+    /// windows are drawn.
+    pub fn run_with<S: WindowWorld, L: WindowLabels<S>>(mut self, app: &mut App<S, L>, mut frame: impl FnMut(&mut App<S, L>)) -> Stats {
+        while self.step_with(app, None, &mut frame) == Flow::Continue {}
         self.stats();
         self.stats
     }
@@ -342,6 +348,15 @@ impl WindowLoop {
     /// doing) unless work is pending, then apply events, emit [`Step`], and
     /// send the world's requests.
     pub fn step<S: WindowWorld, L: WindowLabels<S>>(&mut self, app: &mut App<S, L>, timeout: Option<Duration>) -> Flow {
+        self.step_with(app, timeout, |_| {})
+    }
+    /// [`step`](Self::step), calling `frame` after [`Step`].
+    pub fn step_with<S: WindowWorld, L: WindowLabels<S>>(
+        &mut self,
+        app: &mut App<S, L>,
+        timeout: Option<Duration>,
+        mut frame: impl FnMut(&mut App<S, L>),
+    ) -> Flow {
         if !self.started {
             self.started = true;
             self.attach(&mut app.world);
@@ -383,6 +398,7 @@ impl WindowLoop {
         let dt = if paced.dt_ns > 0 { paced.dt_ns as f32 / 1e9 } else { wall };
         app.world.insert_resource(FrameTime { now_ns, display_ns: paced.display_ns, dt });
         app.emit(&Step);
+        frame(app);
         self.sync(&mut app.world);
         self.present(app);
         if self.conn.flush().is_err() {
@@ -682,7 +698,7 @@ impl WindowLoop {
             let Some(fb) = app.world.get_mut::<Framebuffer>(entity).map(Mut::into_inner) else { continue };
             // Before the first configure, the size asked for: the first
             // frame is drawn while the compositor answers.
-            let scale = window.scale(&self.state.outputs);
+            let scale = fb.fixed_scale.unwrap_or_else(|| window.scale(&self.state.outputs));
             let (w, h) = if window.configured { window.size } else { (window.sent.width.max(1), window.sent.height.max(1)) };
             let pixels = (scale.to_pixels(w), scale.to_pixels(h));
             if fb.shm.as_ref().is_none_or(|s| (s.width, s.height, s.scale) != (pixels.0, pixels.1, scale)) {
@@ -821,6 +837,9 @@ impl WindowLoop {
                 && *wanted != window.sent
             {
                 let wanted = wanted.clone();
+                if wanted.passthrough != window.sent.passthrough {
+                    set_passthrough(&self.globals, &self.queue.handle(), &window.surface, wanted.passthrough);
+                }
                 update(window, wanted);
             }
             let mode = world.get::<WindowMode>(entity).copied().unwrap_or_default();
@@ -946,6 +965,9 @@ impl WindowLoop {
             }
         };
         let viewport = g.viewporter.as_ref().map(|v| v.get_viewport(&surface, &qh, ()));
+        if window.passthrough {
+            set_passthrough(g, &qh, &surface, true);
+        }
         let fractional = match (&g.fractional, &viewport) {
             (Some(manager), Some(_)) => Some(manager.get_fractional_scale(&surface, &qh, entity)),
             _ => None,
@@ -992,6 +1014,18 @@ impl WindowLoop {
 
 pub(crate) fn app_id(window: &Window) -> String {
     if window.app_id.is_empty() { exe_name() } else { window.app_id.clone() }
+}
+
+/// An empty input region lets the pointer through; none restores the
+/// whole surface.
+fn set_passthrough(globals: &Globals, qh: &wayland_client::QueueHandle<State>, surface: &wayland_client::protocol::wl_surface::WlSurface, on: bool) {
+    if on {
+        let region = globals.compositor.create_region(qh, ());
+        surface.set_input_region(Some(&region));
+        region.destroy();
+    } else {
+        surface.set_input_region(None);
+    }
 }
 
 /// Send what differs between `window.sent` and `wanted`.

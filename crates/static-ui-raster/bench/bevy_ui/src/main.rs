@@ -1,4 +1,4 @@
-//! The settings list of static-ui-wayland's `examples/ui_bench.rs`, in Bevy
+//! The settings list of static-ui-raster's `examples/ui_bench.rs`, in Bevy
 //! UI (5 elements per row: row, icon, column, two texts).
 //!
 //! - `--layout N`: N elements; each frame toggles one row's width and times
